@@ -15,7 +15,7 @@ import hashlib
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Any
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -31,6 +31,45 @@ _db = None
 def _name_regex(name: str) -> dict:
     """Case-insensitive exact match for product names, escaping regex metacharacters."""
     return {"$regex": f"^{re.escape(name.strip())}$", "$options": "i"}
+
+
+def normalize_approved_stock_item(item: Any) -> str:
+    """Normalize stock text for owner-approved pool matching.
+
+    Leading/trailing spaces around the whole item and around each line are
+    ignored so harmless copy/paste spaces do not reject otherwise valid stock.
+    Other characters must still match exactly.
+    """
+    text = str(item or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    return "\n".join(line.strip() for line in text.split("\n")).strip()
+
+
+def approved_stock_pool_items(product: dict | None) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in ((product or {}).get("approved_stock_pool") or []):
+        clean = normalize_approved_stock_item(item)
+        if clean and clean not in seen:
+            items.append(clean)
+            seen.add(clean)
+    return items
+
+
+def filter_stock_against_approved_pool(product: dict, items: list[str]) -> tuple[list[str], list[str]]:
+    approved = set(approved_stock_pool_items(product))
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for item in items:
+        clean = normalize_approved_stock_item(item)
+        if not clean:
+            continue
+        if clean in approved:
+            accepted.append(clean)
+        else:
+            rejected.append(clean)
+    return accepted, rejected
 
 
 def get_db():
@@ -367,6 +406,45 @@ async def set_low_stock_alert_sent(product_name: str, sent: bool) -> bool:
         {"$set": {"low_stock_alert_sent": bool(sent)}},
     )
     return res.matched_count > 0
+
+
+async def record_stock_upload_rejection(
+    product_name: str,
+    rejected_items: list[str],
+    *,
+    accepted_count: int = 0,
+    duplicate_count: int = 0,
+    upload_kind: str = "normal",
+    source: str = "telegram",
+    username: str = "",
+    role: str = "telegram_admin",
+    user_id: int | None = None,
+) -> dict | None:
+    rejected = [normalize_approved_stock_item(item) for item in rejected_items if normalize_approved_stock_item(item)]
+    if not rejected:
+        return None
+    doc = {
+        "product_name": str(product_name or "").strip(),
+        "username": str(username or "").strip(),
+        "username_key": str(username or "").strip().lower(),
+        "role": str(role or "telegram_admin").strip(),
+        "source": str(source or "telegram").strip(),
+        "upload_kind": "replacement" if str(upload_kind or "").strip().lower() == "replacement" else "normal",
+        "accepted_count": int(accepted_count or 0),
+        "duplicate_count": int(duplicate_count or 0),
+        "rejected_count": len(rejected),
+        "rejected_items": rejected[:200],
+        "rejected_preview": rejected[:5],
+        "reason": "Not in owner-approved stock pool",
+        "created_at": datetime.now(timezone.utc),
+    }
+    if user_id is not None:
+        doc["user_id"] = int(user_id)
+    try:
+        await get_db().stock_upload_rejections.insert_one(doc)
+    except Exception:
+        pass
+    return doc
 
 
 async def add_stock(product_name: str, items: list[str]) -> int:

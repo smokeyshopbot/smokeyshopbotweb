@@ -45,6 +45,7 @@ from utils.wallet_history import (
 
 import database as db
 from config import (
+    ADMIN_ID,
     ADMIN_IDS,
     LOW_STOCK_ALERT_THRESHOLD,
     RESTOCK_HIGH_STOCK_THRESHOLD,
@@ -117,6 +118,23 @@ async def _get_admin_id_set() -> set[int]:
     except Exception:
         pass
     return ids
+
+
+def _is_primary_owner_admin(user_id: int | None) -> bool:
+    try:
+        return bool(ADMIN_ID) and int(user_id or 0) == int(ADMIN_ID)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _notify_owner_stock_upload_rejection(bot, *, product_name: str, admin_user, accepted_count: int, rejected_items: list[str]) -> int:
+    """Keep rejected stock-manager uploads inside WebAdmin.
+
+    The upload rejection itself is already saved in ``stock_upload_rejections``.
+    WebAdmin live notifications watch that collection and alert the owner there,
+    so the user-facing Telegram bot should not DM admin/owner accounts.
+    """
+    return 1 if rejected_items else 0
 
 
 async def _notify_active_users(
@@ -1565,9 +1583,41 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No valid items found. Try again or send `/cancel`.", parse_mode="Markdown")
         return True
 
+    approved_pool_rejected_blocks: list[str] = []
+    product = await db.get_product(product_name)
+    if product and bool(product.get("approved_stock_restriction_enabled")) and not _is_primary_owner_admin(user_id):
+        approved_blocks, approved_pool_rejected_blocks = db.filter_stock_against_approved_pool(product, blocks)
+        if approved_pool_rejected_blocks:
+            username = (update.effective_user.username or "") if update.effective_user else ""
+            await db.record_stock_upload_rejection(
+                product_name,
+                approved_pool_rejected_blocks,
+                accepted_count=len(approved_blocks),
+                source="telegram",
+                username=username,
+                role="telegram_admin",
+                user_id=user_id,
+            )
+            await _notify_owner_stock_upload_rejection(
+                context.bot,
+                product_name=product_name,
+                admin_user=update.effective_user,
+                accepted_count=len(approved_blocks),
+                rejected_items=approved_pool_rejected_blocks,
+            )
+        blocks = approved_blocks
+        if not blocks:
+            _awaiting_stock.pop(user_id, None)
+            await update.message.reply_text(
+                "❌ No stock added. All submitted item(s) were rejected because they are not in the owner-approved stock pool.",
+                parse_mode="Markdown",
+            )
+            return True
+
     previous_available = await db.get_available_stock_count(product_name)
     count = await db.add_stock(product_name, blocks)
     skipped_count = max(0, len(blocks) - count)
+    rejected_by_pool_count = len(approved_pool_rejected_blocks)
 
     # Paid orders that were waiting for this product must be fulfilled before
     # newly available stock is shown/used for new buyers.
@@ -1597,9 +1647,11 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await notify_users_new_stock(context.bot, product_name, available)
 
     skipped_line = f"↩️ Skipped duplicate item(s): *{skipped_count}*\n" if skipped_count else ""
+    rejected_line = f"🚫 Rejected not in owner-approved pool: *{rejected_by_pool_count}* item(s).\n" if rejected_by_pool_count else ""
     await update.message.reply_text(
         f"✅ Added *{count}* fresh item(s) to *{product_name}*\n"
         f"{skipped_line}"
+        f"{rejected_line}"
         f"🚚 Auto-delivered pending orders: *{delivered_orders}* order(s), *{delivered_items}* item(s)\n"
         f"⏳ Still pending stock quantity: *{pending_qty}*\n"
         f"📦 Total stock now: *{total}*\n"

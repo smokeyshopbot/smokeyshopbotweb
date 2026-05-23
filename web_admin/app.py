@@ -711,6 +711,7 @@ def create_app() -> Flask:
             "pending_payout_request_count": 0,
             "pending_replacement_report_count": 0,
             "product_stock_alert": {"count": 0, "low_stock": 0, "out_of_stock": 0, "severity": ""},
+            "stock_upload_rejection_count": 0,
             "active_payment_currencies": set(),
             "admin_ids": [],
             "bot_token_configured": False,
@@ -723,6 +724,7 @@ def create_app() -> Flask:
                 "pending_payout_request_count": count_pending_stock_manager_payout_requests(app.db),
                 "pending_replacement_report_count": count_pending_replacement_reports(app.db),
                 "product_stock_alert": get_product_stock_alert_summary(app.db),
+                "stock_upload_rejection_count": count_stock_upload_rejections(app.db),
                 "active_payment_currencies": get_active_payment_currencies(app.db),
                 "admin_ids": get_admin_ids(app.db),
                 "bot_token_configured": bool(get_bot_token(app.db)),
@@ -791,6 +793,7 @@ def create_app() -> Flask:
             "pending_payout_request_count": int(sidebar_state.get("pending_payout_request_count") or 0),
             "pending_replacement_report_count": int(sidebar_state.get("pending_replacement_report_count") or 0),
             "product_stock_alert": sidebar_state.get("product_stock_alert") or {"count": 0, "low_stock": 0, "out_of_stock": 0, "severity": ""},
+            "stock_upload_rejection_count": int(sidebar_state.get("stock_upload_rejection_count") or 0),
             "active_payment_currencies": sidebar_state.get("active_payment_currencies") or set(),
             "live_state_refresh_ms": ADMIN_LIVE_STATE_REFRESH_MS,
             "live_full_refresh_enabled": ADMIN_LIVE_FULL_REFRESH,
@@ -855,6 +858,8 @@ def ensure_admin_indexes(db) -> None:
     db.replacement_reports.create_index([("items.item_hash", 1), ("status", 1)])
     db.stock_manager_payment_requests.create_index([("status", 1), ("requested_at", -1)])
     db.stock_manager_stock_events.create_index([("username_key", 1), ("created_at", -1)])
+    db.stock_upload_rejections.create_index([("product_name", 1), ("created_at", -1)])
+    db.stock_upload_rejections.create_index([("username_key", 1), ("created_at", -1)])
     db.stock_manager_replacement_obligations.create_index([("username_key", 1), ("status", 1)])
     db.stock_manager_replacement_obligations.create_index([("stock_added_by_username_key", 1), ("product_name", 1), ("fulfilled_at", 1)])
     db.stock_manager_replacement_obligations.create_index([("source_order_id", 1), ("item_hash", 1)])
@@ -2021,6 +2026,9 @@ def register_routes(app: Flask) -> None:
                 product["pending_replacement_report_ids"] = list(pending_replacement_row.get("report_ids") or [])[:4]
 
         rows, total_pages = paginate(products, page, PAGE_SIZE)
+        if is_owner_role():
+            for product_row in rows:
+                product_row["rejected_upload_count"] = app.db.stock_upload_rejections.count_documents({"product_name": name_regex(product_row.get("name", ""))})
 
         payment_currencies = get_active_payment_currencies(app.db)
         return render_template(
@@ -2075,6 +2083,12 @@ def register_routes(app: Flask) -> None:
         visible_stock_text = [row["text"] for row in stock_view_items if row.get("can_view") and row.get("text")]
         visible_stock_count = len(visible_stock_text)
         hidden_stock_count = sum(1 for row in stock_view_items if not row.get("can_view"))
+        approved_pool_stats = approved_stock_pool_stats(app.db, product) if is_owner_role() else {"total": 0, "current": 0, "sold_or_used": 0, "remaining": 0}
+        recent_rejected_stock_uploads = []
+        if is_owner_role():
+            recent_rejected_stock_uploads = list(
+                app.db.stock_upload_rejections.find({"product_name": name_regex(product["name"])}).sort("created_at", -1).limit(5)
+            )
         return render_template(
             "product_manage.html",
             product=product,
@@ -2084,7 +2098,101 @@ def register_routes(app: Flask) -> None:
             visible_stock_text=visible_stock_text,
             visible_stock_count=visible_stock_count,
             hidden_stock_count=hidden_stock_count,
+            approved_pool_stats=approved_pool_stats,
+            recent_rejected_stock_uploads=recent_rejected_stock_uploads,
         )
+
+    @app.post("/products/<path:name>/approved-stock")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_approved_stock_pool(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+
+        action = str(request.form.get("pool_action") or "settings").strip().lower()
+        restrict_enabled = request.form.get("restrict_stock_managers") == "1"
+        raw_items = request.form.get("approved_stock_items", "")
+        submitted_items = []
+        seen_submitted: set[str] = set()
+        for item in split_stock(raw_items):
+            clean = normalize_approved_stock_item(item)
+            if clean and clean not in seen_submitted:
+                submitted_items.append(clean)
+                seen_submitted.add(clean)
+
+        existing_items = approved_stock_pool_items(product)
+        existing_seen = set(existing_items)
+        new_pool = list(existing_items)
+
+        if action == "append":
+            added = 0
+            for item in submitted_items:
+                if item not in existing_seen:
+                    new_pool.append(item)
+                    existing_seen.add(item)
+                    added += 1
+            if submitted_items:
+                flash(f"Added {added} approved stock item(s) to the pool. Skipped {len(submitted_items) - added} duplicate pool item(s).", "success")
+            else:
+                flash("Approved stock pool settings saved. No new approved stock items were submitted.", "info")
+        elif action == "replace":
+            if not submitted_items:
+                flash("Paste at least one approved stock item to replace the pool.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+            new_pool = submitted_items
+            flash(f"Approved stock pool replaced with {len(new_pool)} item(s).", "success")
+        elif action == "clear":
+            new_pool = []
+            flash("Approved stock pool cleared.", "success")
+        else:
+            flash("Approved stock restriction setting saved.", "success")
+
+        app.db.products.update_one(
+            {"_id": product["_id"]},
+            {
+                "$set": {
+                    "approved_stock_restriction_enabled": bool(restrict_enabled),
+                    "approved_stock_pool": new_pool,
+                    "approved_stock_pool_updated_at": utcnow(),
+                    "approved_stock_pool_updated_by": current_admin_username() or "owner",
+                }
+            },
+        )
+        if restrict_enabled and not new_pool:
+            flash("Warning: restriction is enabled but the approved stock pool is empty, so stock managers cannot add stock for this product yet.", "warning")
+        log_admin_action(
+            app.db,
+            "approved_stock_pool_saved",
+            f"{product['name']}: restrict={restrict_enabled} action={action} pool={len(new_pool)}",
+        )
+        return redirect(url_for("product_manage", name=product["name"]))
+
+    @app.post("/products/<path:name>/rejected-stock-uploads/clear")
+    @login_required
+    @owner_required
+    @csrf_required
+    def clear_rejected_stock_uploads(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+        try:
+            result = app.db.stock_upload_rejections.delete_many({"product_name": name_regex(product["name"])})
+            deleted = int(getattr(result, "deleted_count", 0) or 0)
+        except Exception:
+            deleted = 0
+            flash("Unable to clear rejected stock upload logs right now.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        log_admin_action(
+            app.db,
+            "approved_stock_rejections_cleared",
+            f"{product['name']}: cleared={deleted} by={current_admin_username() or 'owner'}",
+        )
+        flash(f"Cleared {deleted} rejected stock upload log(s) for this product.", "success")
+        return redirect(url_for("product_manage", name=product["name"]))
 
     @app.post("/products/add")
     @login_required
@@ -2417,12 +2525,38 @@ def register_routes(app: Flask) -> None:
             flash("You can add stock only to products assigned to your stock-manager account.", "error")
             return redirect(url_for("products"))
 
+        approved_pool_rejected_blocks: list[str] = []
+        if is_stock_manager_role() and bool(product.get("approved_stock_restriction_enabled")):
+            approved_blocks, approved_pool_rejected_blocks = filter_stock_against_approved_pool(product, blocks)
+            if approved_pool_rejected_blocks:
+                rejection_doc = record_rejected_stock_upload(
+                    app.db,
+                    product["name"],
+                    approved_pool_rejected_blocks,
+                    accepted_count=len(approved_blocks),
+                    upload_kind="replacement" if is_replacement_upload else "normal",
+                    source="webadmin",
+                    username=current_admin_username(),
+                    role=current_admin_role(),
+                )
+                webpanel_notified = notify_owner_stock_upload_rejection(app.db, rejection_doc)
+                log_admin_action(
+                    app.db,
+                    "stock_upload_rejected_lines",
+                    f"{product['name']}: by={current_admin_username()} accepted={len(approved_blocks)} rejected={len(approved_pool_rejected_blocks)} webpanel_notified={webpanel_notified}",
+                )
+            blocks = approved_blocks
+            if not blocks:
+                flash("No stock added. All submitted item(s) were rejected because they are not in the owner-approved stock pool.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+
         previous_available = get_available_stock_count(app.db, product["name"])
 
         protected_stock = list(product.get("stock", []) or []) + get_used_stock_items(app.db, product["name"])
         fresh_blocks, duplicate_blocks = filter_fresh_stock_items(protected_stock, blocks)
         if not fresh_blocks:
-            flash(f"No fresh stock added. Skipped {len(duplicate_blocks)} duplicate item(s).", "error")
+            rejected_text = f" Rejected by approved-stock pool: {len(approved_pool_rejected_blocks)}." if approved_pool_rejected_blocks else ""
+            flash(f"No fresh stock added. Skipped {len(duplicate_blocks)} duplicate item(s).{rejected_text}", "error")
             return redirect(url_for("product_manage", name=product["name"]))
 
         earning_rate_for_upload = 0.0 if is_replacement_upload else safe_float(product.get("stock_manager_earning_rate_usdt"), 0.0)
@@ -2462,7 +2596,9 @@ def register_routes(app: Flask) -> None:
         total = get_stock_count(app.db, product["name"])
         available = get_available_stock_count(app.db, product["name"])
         skipped = len(duplicate_blocks)
+        rejected_by_pool = len(approved_pool_rejected_blocks)
         skipped_text = f" Skipped {skipped} duplicate item(s)." if skipped else ""
+        rejected_text = f" Rejected {rejected_by_pool} item(s) not in owner-approved stock pool." if rejected_by_pool else ""
         should_notify_restock = (
             not is_replacement_upload
             and claim_restock_notification_slot(
@@ -2477,12 +2613,12 @@ def register_routes(app: Flask) -> None:
         )
         notified = notify_users_new_stock(app.db, product["name"], available) if should_notify_restock else 0
         log_action_name = "replacement_stock_added" if is_replacement_upload else "stock_added"
-        log_admin_action(app.db, log_action_name, f"{product['name']}: added={len(fresh_blocks)} skipped={skipped} notified={notified} replacement_sent={replacement_summary['replacements_sent']}")
+        log_admin_action(app.db, log_action_name, f"{product['name']}: added={len(fresh_blocks)} skipped={skipped} rejected_by_pool={rejected_by_pool} notified={notified} replacement_sent={replacement_summary['replacements_sent']}")
         replacement_text = f" Sent {replacement_summary['replacements_sent']} pending replacement(s)." if replacement_summary.get("replacements_sent") else ""
         notify_text = " Users were not notified for replacement stock." if is_replacement_upload else ""
         fulfilled_text = f" Cleared {fulfilled_replacement_owed_count} pending replacement obligation(s)." if fulfilled_replacement_owed_count else ""
         flash(
-            f"Added {len(fresh_blocks)} {'replacement ' if is_replacement_upload else ''}fresh stock item(s).{skipped_text}{replacement_text}{notify_text}{fulfilled_text} Auto-delivered {summary['orders_delivered']} pending order(s). Total stock: {total}, available: {available}.",
+            f"Added {len(fresh_blocks)} {'replacement ' if is_replacement_upload else ''}fresh stock item(s).{skipped_text}{rejected_text}{replacement_text}{notify_text}{fulfilled_text} Auto-delivered {summary['orders_delivered']} pending order(s). Total stock: {total}, available: {available}.",
             "success",
         )
         return redirect(url_for("product_manage", name=product["name"]))
@@ -4028,6 +4164,10 @@ def _dt_or_number_signature(value) -> str:
     return str(value or "")
 
 
+def count_stock_upload_rejections(db) -> int:
+    return _count_safe(db, "stock_upload_rejections", {})
+
+
 def get_live_admin_state(db) -> dict:
     review_query = {"status": {"$in": ["upi_submitted", "binance_submitted", "usdt_manual_submitted"]}}
     pending_stock_query = {"status": "pending_stock"}
@@ -4046,6 +4186,7 @@ def get_live_admin_state(db) -> dict:
     latest_payment_confirmed = _max_mongo_value(db, "pending_payments", "confirmed_at", {"confirmed_at": {"$exists": True}})
     latest_payout_request = _max_mongo_value(db, "stock_manager_payment_requests", "requested_at", {"status": "pending"})
     latest_replacement_report = _max_mongo_value(db, "replacement_reports", "created_at", {"status": {"$in": ["pending", "reviewing", "approved", "replacement_ready"]}})
+    latest_stock_upload_rejection = _max_mongo_value(db, "stock_upload_rejections", "created_at")
 
     stock_alert = get_product_stock_alert_summary(db)
     counts = {
@@ -4062,6 +4203,7 @@ def get_live_admin_state(db) -> dict:
         "products_low_stock": int(stock_alert.get("low_stock", 0) or 0),
         "products_out_of_stock": int(stock_alert.get("out_of_stock", 0) or 0),
         "product_stock_alerts": int(stock_alert.get("count", 0) or 0),
+        "stock_upload_rejections": count_stock_upload_rejections(db),
     }
     latest = {
         "order_created": _dt_or_number_signature(latest_order_created),
@@ -4071,6 +4213,7 @@ def get_live_admin_state(db) -> dict:
         "payment_confirmed": _dt_or_number_signature(latest_payment_confirmed),
         "stock_manager_payout_request": _dt_or_number_signature(latest_payout_request),
         "replacement_report": _dt_or_number_signature(latest_replacement_report),
+        "stock_upload_rejection": _dt_or_number_signature(latest_stock_upload_rejection),
     }
     signature = "|".join([f"{k}:{counts[k]}" for k in sorted(counts)] + [f"{k}:{latest[k]}" for k in sorted(latest)])
     return {
@@ -4165,6 +4308,115 @@ def filter_fresh_stock_items(existing_stock: list[str], new_items: list[str]) ->
         fresh.append(clean)
         seen_in_upload.add(clean)
     return fresh, duplicates
+
+
+def normalize_approved_stock_item(item: Any) -> str:
+    """Normalize stock text for owner-approved pool matching.
+
+    Leading/trailing spaces around the whole item and around each line are
+    ignored so harmless copy/paste spaces do not reject otherwise valid stock.
+    Other characters must still match exactly.
+    """
+    text = str(item or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    return "\n".join(line.strip() for line in text.split("\n")).strip()
+
+
+def approved_stock_pool_items(product: dict | None) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in ((product or {}).get("approved_stock_pool") or []):
+        clean = normalize_approved_stock_item(item)
+        if clean and clean not in seen:
+            items.append(clean)
+            seen.add(clean)
+    return items
+
+
+def filter_stock_against_approved_pool(product: dict, items: list[str]) -> tuple[list[str], list[str]]:
+    approved = set(approved_stock_pool_items(product))
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for item in items:
+        clean = normalize_approved_stock_item(item)
+        if not clean:
+            continue
+        if clean in approved:
+            accepted.append(clean)
+        else:
+            rejected.append(clean)
+    return accepted, rejected
+
+
+def approved_stock_pool_stats(db, product: dict) -> dict[str, int]:
+    pool = approved_stock_pool_items(product)
+    pool_set = set(pool)
+    current = {normalize_approved_stock_item(item) for item in (product.get("stock", []) or []) if normalize_approved_stock_item(item)}
+    used = {normalize_approved_stock_item(item) for item in get_used_stock_items(db, product.get("name", "")) if normalize_approved_stock_item(item)}
+    blocked = current | used
+    return {
+        "total": len(pool),
+        "current": len(pool_set & current),
+        "sold_or_used": len(pool_set & used),
+        "remaining": len(pool_set - blocked),
+    }
+
+
+def record_rejected_stock_upload(
+    db,
+    product_name: str,
+    rejected_items: list[str],
+    *,
+    accepted_count: int,
+    duplicate_count: int = 0,
+    upload_kind: str = "normal",
+    source: str = "webadmin",
+    username: str | None = None,
+    role: str | None = None,
+) -> dict | None:
+    rejected = [normalize_approved_stock_item(item) for item in rejected_items if normalize_approved_stock_item(item)]
+    if not rejected:
+        return None
+    doc = {
+        "product_name": str(product_name or "").strip(),
+        "username": str(username or current_admin_username() or "").strip(),
+        "username_key": normalize_admin_username(username or current_admin_username()),
+        "role": normalize_admin_role(role or current_admin_role()),
+        "source": str(source or "webadmin").strip(),
+        "upload_kind": "replacement" if str(upload_kind or "").strip().lower() == "replacement" else "normal",
+        "accepted_count": int(accepted_count or 0),
+        "duplicate_count": int(duplicate_count or 0),
+        "rejected_count": len(rejected),
+        "rejected_items": rejected[:200],
+        "rejected_preview": rejected[:5],
+        "reason": "Not in owner-approved stock pool",
+        "created_at": utcnow(),
+    }
+    try:
+        db.stock_upload_rejections.insert_one(doc)
+    except Exception:
+        pass
+    return doc
+
+
+def notify_owner_stock_upload_rejection(db, rejection_doc: dict | None) -> int:
+    """Mark a rejected stock-manager upload for WebAdmin live notification.
+
+    Admin Telegram DMs are intentionally not sent from here because WebAdmin is
+    the admin surface. The owner sees a sidebar badge/live toast, and the
+    product manage page shows the rejected upload details.
+    """
+    if not rejection_doc:
+        return 0
+    try:
+        db.stock_upload_rejections.update_one(
+            {"_id": rejection_doc.get("_id")},
+            {"$set": {"webadmin_notification_created_at": utcnow()}},
+        )
+    except Exception:
+        pass
+    return 1
 
 
 def stock_item_hash(item: str) -> str:

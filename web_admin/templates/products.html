@@ -120,7 +120,13 @@
       <tr>
         <td>
           <div class="product-title">
-            <span class="product-name-stack"><strong>{{ p.name }}</strong><small class="date-pill">{{ fmt_dt(p.created_at) }}</small></span>
+            <span class="product-name-stack">
+              <strong>{{ p.name }}</strong>
+              <span class="product-row-meta">
+                <small class="date-pill">{{ fmt_dt(p.created_at) }}</small>
+                {% if current_admin_role == 'owner' and p.rejected_upload_count %}<small class="date-pill stock-rejection-row-badge">R{{ p.rejected_upload_count }} rejected upload log(s)</small>{% endif %}
+              </span>
+            </span>
           </div>
         </td>
         {% if show_prices %}

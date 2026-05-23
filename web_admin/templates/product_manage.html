@@ -152,11 +152,181 @@
   {% endif %}
 </section>
 
-<section class="panel current-stock-panel">
+{% if current_admin_role == 'owner' %}
+<section class="panel approved-stock-pool-panel approved-stock-pool-panel-v2">
+  <div class="approved-pool-hero">
+    <div class="approved-pool-heading">
+      <span class="section-eyebrow">Owner control</span>
+      <h2>Owner-approved stock pool</h2>
+      <p>Use this when stock managers should only add stock that you already approved. Start/end spaces are ignored; every other character must match.</p>
+    </div>
+    <div class="approved-pool-status {{ 'is-enabled' if product.approved_stock_restriction_enabled else 'is-disabled' }}">
+      <span>{{ 'Restriction enabled' if product.approved_stock_restriction_enabled else 'Restriction off' }}</span>
+      <strong>{{ 'Locked' if product.approved_stock_restriction_enabled else 'Open' }}</strong>
+    </div>
+  </div>
+
+  <div class="approved-pool-stats">
+    <article class="approved-pool-stat-card">
+      <span>Pool items</span>
+      <strong>{{ approved_pool_stats.total or 0 }}</strong>
+    </article>
+    <article class="approved-pool-stat-card">
+      <span>Remaining approved</span>
+      <strong>{{ approved_pool_stats.remaining or 0 }}</strong>
+    </article>
+    <article class="approved-pool-stat-card">
+      <span>Already live/used</span>
+      <strong>{{ (approved_pool_stats.current or 0) + (approved_pool_stats.sold_or_used or 0) }}</strong>
+    </article>
+  </div>
+
+  <form method="post" action="{{ url_for('update_approved_stock_pool', name=product.name) }}" class="approved-pool-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <label class="approved-pool-toggle-card">
+      <span class="approved-toggle-switch">
+        <input type="checkbox" name="restrict_stock_managers" value="1" {% if product.approved_stock_restriction_enabled %}checked{% endif %}>
+        <span></span>
+      </span>
+      <span class="approved-toggle-copy">
+        <strong>Only allow stock managers to add stock from this approved pool</strong>
+        <small>Valid matching stock is added. Wrong lines are skipped and reported to you.</small>
+      </span>
+    </label>
+
+    <div class="approved-pool-editor-grid">
+      <label class="approved-pool-editor">Approved stock items
+        <span class="approved-pool-editor-help">Paste ready stock here. For email products, use the same mail/pass format that stock managers will upload.</span>
+        <textarea id="approved-stock-items" name="approved_stock_items" rows="9" placeholder="Mail:- user1@example.com&#10;Pass:- accountpass&#10;Mail Pass:- mailpass&#10;---&#10;Mail:- user2@example.com&#10;Pass:- accountpass&#10;Mail Pass:- mailpass"></textarea>
+      </label>
+
+      <aside class="approved-pool-side-card approved-pool-mailpass-card">
+        <h3>Mail/pass helper</h3>
+        <p class="muted">Use this if you want to approve many emails with the same account password and mail password.</p>
+        <label>Emails, one per line
+          <textarea id="approved-formatter-mails" rows="4" placeholder="user1@example.com&#10;user2@example.com"></textarea>
+        </label>
+        <div class="approved-pool-pass-grid">
+          <label>Account pass
+            <input id="approved-formatter-account-pass" type="text" placeholder="Account password">
+          </label>
+          <label>Mail pass
+            <input id="approved-formatter-mail-pass" type="text" placeholder="Mail password">
+          </label>
+        </div>
+        <div class="approved-pool-mini-actions">
+          <button type="button" data-generate-approved-stock-format>Generate</button>
+          <button type="button" class="primary" data-use-approved-stock-format>Add to approved box</button>
+        </div>
+        <textarea id="approved-formatted-output" rows="4" readonly placeholder="Generated mail/pass stock will appear here."></textarea>
+        <p class="approved-formatter-status muted" data-approved-stock-format-status>0 item(s) generated.</p>
+      </aside>
+    </div>
+
+    <div class="approved-pool-help-card">
+      <h3>How matching works</h3>
+      <ul>
+        <li>Start/end spaces are ignored.</li>
+        <li>Every other character must match exactly.</li>
+        <li>Only incorrect stock is skipped; valid stock still gets added.</li>
+        <li>Rejected attempts appear below and in Activity Log.</li>
+      </ul>
+    </div>
+
+    <div class="approved-pool-actions">
+      <button class="primary" type="submit" name="pool_action" value="append" data-confirm-title="Add to approved pool?" data-confirm-message="This will add the pasted approved stock item(s) to this product's pool. Duplicate pool items will be skipped." data-confirm-button="Add to pool">Add to pool</button>
+      <button type="submit" name="pool_action" value="replace" data-confirm-title="Replace approved stock pool?" data-confirm-message="This will replace the approved pool for this product with only the pasted item(s)." data-confirm-button="Replace pool">Replace pool</button>
+      <button type="submit" name="pool_action" value="settings" data-confirm-title="Save approved-pool setting?" data-confirm-message="This will save whether stock managers must use the owner-approved stock pool for this product." data-confirm-button="Save setting">Save setting only</button>
+      <button class="danger" type="submit" name="pool_action" value="clear" data-confirm-title="Clear approved stock pool?" data-confirm-message="This will clear the approved pool for this product. If restriction remains enabled, stock managers cannot add stock until you add approved items again." data-confirm-button="Clear pool">Clear pool</button>
+    </div>
+  </form>
+
+  {% set approved_pool_items = product.approved_stock_pool or [] %}
+  <details class="approved-pool-current-card stock-pool-details stock-section-details" open>
+    <summary class="stock-section-summary">
+      <span class="stock-section-summary-title"><span class="stock-section-caret" aria-hidden="true">›</span>Current approved pool</span>
+      <small>{{ approved_pool_items|length }} item(s)</small>
+    </summary>
+    {% if approved_pool_items %}
+      <div class="approved-pool-current-tools">
+        <button type="button" data-copy-target="approved-stock-pool-current">Copy current pool</button>
+        <span class="muted">Click the panel heading to collapse/expand. Items are separated by <code>---</code> when copied.</span>
+      </div>
+      <textarea id="approved-stock-pool-current" class="copy-source" readonly>{{ approved_pool_items|join('\n---\n') }}</textarea>
+      <div class="current-stock-list approved-pool-stock-list">
+        {% for approved_item in approved_pool_items %}
+          <article class="current-stock-item approved-pool-stock-item">
+            <div class="current-stock-item-header">
+              <strong>Approved #{{ loop.index }}</strong>
+              <button type="button" class="copy-mini-button" data-copy-target="approved-stock-pool-item-{{ loop.index }}">Copy</button>
+            </div>
+            <pre id="approved-stock-pool-item-{{ loop.index }}" class="current-stock-text">{{ approved_item }}</pre>
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="approved-empty-state approved-pool-empty-state">
+        <strong>No approved pool items yet</strong>
+        <p class="muted">Add approved stock above, then stock managers can only add matching items when the restriction is enabled.</p>
+      </div>
+    {% endif %}
+  </details>
+
+  <div class="recent-rejected-stock approved-rejected-card">
+    <div class="approved-rejected-header">
+      <div>
+        <span class="section-eyebrow">Security review</span>
+        <h3>Recent rejected stock-manager uploads</h3>
+      </div>
+      <div class="approved-rejected-header-actions">
+        <span class="badge badge-warning">{{ recent_rejected_stock_uploads|length if recent_rejected_stock_uploads else 0 }} recent</span>
+        {% if recent_rejected_stock_uploads %}
+        <form method="post" action="{{ url_for('clear_rejected_stock_uploads', name=product.name) }}" class="inline-form" data-product-danger-confirm data-confirm-title="Clear rejected upload logs?" data-confirm-action="Clear rejected logs" data-confirm-message="This will remove the rejected stock-manager upload records shown for this product. It will not change product stock or the approved pool." data-confirm-button="Clear logs">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="danger small-button">Clear logs</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% if recent_rejected_stock_uploads %}
+      <div class="table-wrap approved-rejected-table-wrap">
+        <table class="approved-rejected-table">
+          <thead><tr><th>Date</th><th>Admin</th><th>Accepted</th><th>Rejected</th><th>Rejected preview</th></tr></thead>
+          <tbody>
+          {% for row in recent_rejected_stock_uploads %}
+            <tr>
+              <td>{{ fmt_dt(row.created_at) }}</td>
+              <td>{{ row.username or 'N/A' }}</td>
+              <td><span class="success-badge badge">{{ row.accepted_count or 0 }}</span></td>
+              <td><span class="badge badge-warning">{{ row.rejected_count or 0 }}</span></td>
+              <td>
+                {% if row.rejected_preview %}
+                  <pre class="compact-pre">{{ row.rejected_preview|join('\n---\n') }}</pre>
+                {% else %}
+                  <span class="muted">No preview</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="approved-empty-state">
+        <strong>No rejected uploads yet</strong>
+        <p class="muted">If a stock manager uploads non-approved stock, the skipped lines will appear here.</p>
+      </div>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
+<details class="panel current-stock-panel stock-section-details" open>
   {% set current_stock = product.stock or [] %}
-  <div class="current-stock-header">
+  <summary class="current-stock-header stock-section-summary">
     <div>
-      <h2>Current stock</h2>
+      <h2><span class="stock-section-caret" aria-hidden="true">›</span>Current stock</h2>
       {% if is_stock_manager_role %}
         <p>You can view and copy only the stock items added by your admin account. Other stock is hidden.</p>
       {% else %}
@@ -168,13 +338,14 @@
     {% else %}
       <span class="badge">{{ current_stock|length }} item(s)</span>
     {% endif %}
-  </div>
+  </summary>
 
+  <div class="stock-section-body">
   {% if current_stock %}
     {% if visible_stock_text %}
     <div class="stock-actions-row">
       <button type="button" data-copy-target="current-stock-all">Copy visible stock</button>
-      <small class="muted">Only stock you can view is copied. Items are separated by <code>---</code>.</small>
+      <small class="muted">Click the panel heading to collapse/expand. Only stock you can view is copied. Items are separated by <code>---</code>.</small>
     </div>
     <textarea id="current-stock-all" class="copy-source" readonly>{{ visible_stock_text|join('\n---\n') }}</textarea>
     {% elif is_stock_manager_role %}
@@ -202,7 +373,8 @@
   {% else %}
     <p class="muted">No current stock items saved for this product.</p>
   {% endif %}
-</section>
+  </div>
+</details>
 
 {% if can_access('update_stock_manager_rates') %}
 <section class="panel stock-manager-rates-panel">
@@ -283,7 +455,7 @@
 </section>
 {% endif %}
 
-{% if can_access('clear_stock') or can_access('delete_product') or can_access('resend_fresh_stock_notification') %}
+{% if current_admin_role == 'owner' or can_access('clear_stock') or can_access('delete_product') or can_access('resend_fresh_stock_notification') %}
 <div id="product-danger-confirm-modal" class="action-confirm-shell" hidden>
   <div class="action-confirm-backdrop" data-close-product-danger-confirm></div>
   <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="product-danger-confirm-title">
@@ -371,6 +543,33 @@
     return formatted;
   }
 
+
+  function getApprovedFormattedStock() {
+    const emailsInput = document.getElementById('approved-formatter-mails');
+    const accountPassInput = document.getElementById('approved-formatter-account-pass');
+    const mailPassInput = document.getElementById('approved-formatter-mail-pass');
+    const preview = document.getElementById('approved-formatted-output');
+    const status = document.querySelector('[data-approved-stock-format-status]');
+    if (!emailsInput || !preview) {
+      return '';
+    }
+
+    const emails = uniqueNonEmptyLines(emailsInput.value);
+    const accountPass = (accountPassInput?.value || '').trim();
+    const mailPass = (mailPassInput?.value || '').trim();
+    const missingPasses = Boolean(emails.length && (!accountPass || !mailPass));
+    const formatted = emails.map(function (mail) {
+      return 'Mail:- ' + mail + '\nPass:- ' + accountPass + '\nMail Pass:- ' + mailPass;
+    }).join('\n---\n');
+
+    preview.value = formatted;
+    if (status) {
+      status.textContent = emails.length + ' item(s) generated.' + (missingPasses ? ' Add both passwords before adding.' : '');
+      status.classList.toggle('warning', missingPasses);
+    }
+    return formatted;
+  }
+
   function flashButton(button, text) {
     const oldText = button.textContent;
     if (!button.dataset.originalMinWidth) {
@@ -394,6 +593,9 @@
       updateFormatterModeUI();
       getFormattedStock();
     }
+    if (event.target.closest('.approved-pool-mailpass-card')) {
+      getApprovedFormattedStock();
+    }
   });
 
   document.addEventListener('change', function (event) {
@@ -403,29 +605,34 @@
     }
   });
 
+
   let pendingProductDangerForm = null;
+  let pendingProductDangerSubmitter = null;
 
   function closeProductDangerConfirm() {
     const modal = document.getElementById('product-danger-confirm-modal');
     if (modal) modal.hidden = true;
     document.body.classList.remove('modal-open');
     pendingProductDangerForm = null;
+    pendingProductDangerSubmitter = null;
   }
 
-  function openProductDangerConfirm(form) {
+  function openProductDangerConfirm(form, submitter) {
     const modal = document.getElementById('product-danger-confirm-modal');
     if (!modal) return false;
     pendingProductDangerForm = form;
+    pendingProductDangerSubmitter = submitter || null;
+    const source = submitter && submitter.dataset ? submitter : form;
     const title = document.getElementById('product-danger-confirm-title');
     const message = document.getElementById('product-danger-confirm-message');
     const action = document.getElementById('product-danger-confirm-action');
     const submit = document.getElementById('product-danger-confirm-submit');
-    if (title) title.textContent = form.dataset.confirmTitle || 'Confirm product action';
-    if (message) message.textContent = form.dataset.confirmMessage || 'Please confirm this product action.';
-    if (action) action.textContent = form.dataset.confirmAction || 'Product action';
+    if (title) title.textContent = source.dataset.confirmTitle || 'Confirm product action';
+    if (message) message.textContent = source.dataset.confirmMessage || 'Please confirm this product action.';
+    if (action) action.textContent = source.dataset.confirmAction || source.dataset.confirmButton || 'Product action';
     if (submit) {
-      submit.textContent = form.dataset.confirmButton || 'Confirm';
-      const tone = form.dataset.confirmTone === 'primary' ? 'primary' : 'danger';
+      submit.textContent = source.dataset.confirmButton || 'Confirm';
+      const tone = source.dataset.confirmTone === 'primary' || submitter?.classList?.contains('primary') ? 'primary' : 'danger';
       submit.className = 'action-button ' + tone;
     }
     modal.hidden = false;
@@ -434,10 +641,15 @@
   }
 
   document.addEventListener('submit', function (event) {
-    const form = event.target.closest('[data-product-danger-confirm]');
+    const submittedForm = event.target;
+    const submitter = event.submitter || document.activeElement;
+    let form = submittedForm.closest('[data-product-danger-confirm]');
+    if (!form && submittedForm.matches('.approved-pool-form') && submitter?.matches?.('button[type="submit"][data-confirm-title]')) {
+      form = submittedForm;
+    }
     if (!form || form.dataset.confirmed === '1') return;
     event.preventDefault();
-    openProductDangerConfirm(form);
+    openProductDangerConfirm(form, submitter && submitter.form === form ? submitter : null);
   });
 
   document.addEventListener('keydown', function (event) {
@@ -455,9 +667,14 @@
 
     if (event.target.closest && event.target.closest('#product-danger-confirm-submit') && pendingProductDangerForm) {
       const form = pendingProductDangerForm;
+      const submitter = pendingProductDangerSubmitter;
       form.dataset.confirmed = '1';
       closeProductDangerConfirm();
-      form.submit();
+      if (submitter && typeof form.requestSubmit === 'function') {
+        form.requestSubmit(submitter);
+      } else {
+        form.submit();
+      }
       return;
     }
 
@@ -491,12 +708,46 @@
       return;
     }
 
+
+    const generateApprovedButton = event.target.closest('[data-generate-approved-stock-format]');
+    if (generateApprovedButton) {
+      getApprovedFormattedStock();
+      flashButton(generateApprovedButton, 'Generated');
+      return;
+    }
+
+    const useApprovedButton = event.target.closest('[data-use-approved-stock-format]');
+    if (useApprovedButton) {
+      const formatted = getApprovedFormattedStock();
+      const approvedBox = document.getElementById('approved-stock-items');
+      const accountPass = (document.getElementById('approved-formatter-account-pass')?.value || '').trim();
+      const mailPass = (document.getElementById('approved-formatter-mail-pass')?.value || '').trim();
+      if (!approvedBox || !formatted) {
+        flashButton(useApprovedButton, 'Nothing to add');
+        return;
+      }
+      if (!accountPass || !mailPass) {
+        flashButton(useApprovedButton, 'Add passes');
+        return;
+      }
+      const existing = approvedBox.value.trim();
+      approvedBox.value = existing ? existing + '\n---\n' + formatted : formatted;
+      approvedBox.focus();
+      flashButton(useApprovedButton, 'Added');
+      return;
+    }
+
     const button = event.target.closest('[data-copy-target]');
     if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
     const target = document.getElementById(button.getAttribute('data-copy-target'));
     if (!target) return;
     if (target.id === 'formatted-stock-output') {
       getFormattedStock();
+    }
+    if (target.id === 'approved-formatted-output') {
+      getApprovedFormattedStock();
     }
     const value = target.tagName === 'TEXTAREA' ? target.value : target.textContent;
     try {
