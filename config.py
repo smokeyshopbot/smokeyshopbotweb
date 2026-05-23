@@ -202,8 +202,13 @@ if PAYMENT_REMINDER_MINUTES >= PAYMENT_TIMEOUT_MINUTES:
 USDT_VERIFY_INTERVAL: int = _secret_int("usdt_verify_interval_seconds", 30)
 USDT_MANUAL_VERIFY_DELAY_MINUTES: int = _secret_int("usdt_manual_verify_delay_minutes", 5)
 LOW_STOCK_ALERT_THRESHOLD: int = _secret_int("low_stock_alert_threshold", 10)
+RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES: int = _secret_int("restock_back_in_stock_cooldown_minutes", 30)
 RESTOCK_NOTIFICATION_COOLDOWN_MINUTES: int = _secret_int("restock_notification_cooldown_minutes", 60)
 RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES: int = _secret_int("restock_long_notification_cooldown_minutes", 360)
-RESTOCK_HIGH_STOCK_THRESHOLD: int = _secret_int("restock_high_stock_threshold", 20)
+RESTOCK_BIG_ADDITION_THRESHOLD: int = _secret_int(
+    "restock_big_addition_threshold",
+    _secret_int("restock_high_stock_threshold", 20),
+)
+RESTOCK_HIGH_STOCK_THRESHOLD: int = RESTOCK_BIG_ADDITION_THRESHOLD  # Backwards-compatible alias.
 MIN_ORDER_QUANTITY: int = max(1, _secret_int("min_order_quantity", 1))
 MAX_ORDER_QUANTITY: int = max(MIN_ORDER_QUANTITY, _secret_int("max_order_quantity", 100))

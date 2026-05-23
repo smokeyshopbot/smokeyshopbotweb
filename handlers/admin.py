@@ -48,7 +48,8 @@ from config import (
     ADMIN_ID,
     ADMIN_IDS,
     LOW_STOCK_ALERT_THRESHOLD,
-    RESTOCK_HIGH_STOCK_THRESHOLD,
+    RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES,
+    RESTOCK_BIG_ADDITION_THRESHOLD,
     RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES,
     RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
     is_admin_id,
@@ -1638,9 +1639,11 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             previous_available,
             available,
             cooldown_minutes=RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
+            back_in_stock_cooldown_minutes=RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES,
             long_cooldown_minutes=RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES,
-            high_stock_threshold=RESTOCK_HIGH_STOCK_THRESHOLD,
+            big_restock_quantity=RESTOCK_BIG_ADDITION_THRESHOLD,
             default_threshold=LOW_STOCK_ALERT_THRESHOLD,
+            added_stock_count=count,
         )
     )
     if should_notify_restock:

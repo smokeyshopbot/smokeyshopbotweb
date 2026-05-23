@@ -49,9 +49,11 @@ load_dotenv()
 
 PAGE_SIZE = 10
 LOW_STOCK_ALERT_THRESHOLD = int(os.getenv("LOW_STOCK_ALERT_THRESHOLD", "10") or 10)
+RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES = int(os.getenv("RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES", "30") or 30)
 RESTOCK_NOTIFICATION_COOLDOWN_MINUTES = int(os.getenv("RESTOCK_NOTIFICATION_COOLDOWN_MINUTES", "60") or 60)
 RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES = int(os.getenv("RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES", "360") or 360)
-RESTOCK_HIGH_STOCK_THRESHOLD = int(os.getenv("RESTOCK_HIGH_STOCK_THRESHOLD", "20") or 20)
+RESTOCK_BIG_ADDITION_THRESHOLD = int(os.getenv("RESTOCK_BIG_ADDITION_THRESHOLD", os.getenv("RESTOCK_HIGH_STOCK_THRESHOLD", "20")) or 20)
+RESTOCK_HIGH_STOCK_THRESHOLD = RESTOCK_BIG_ADDITION_THRESHOLD  # Backwards-compatible alias.
 PAYMENT_TIMEOUT_MINUTES = int(os.getenv("PAYMENT_TIMEOUT_MINUTES", "30") or 30)
 STOCK_MANAGER_MIN_PAYOUT_USDT = 10.0
 LOGIN_ATTEMPT_LIMIT = 5
@@ -313,9 +315,11 @@ SECRET_DEFAULTS: dict[str, Any] = {
     "polygon_required_confirmations": "20",
     "usdt_manual_verify_delay_minutes": "5",
     "low_stock_alert_threshold": "10",
+    "restock_back_in_stock_cooldown_minutes": "30",
     "restock_notification_cooldown_minutes": "60",
     "restock_long_notification_cooldown_minutes": "360",
-    "restock_high_stock_threshold": "20",
+    "restock_big_addition_threshold": "20",
+    "restock_high_stock_threshold": "20",  # legacy name; kept for older saved settings
     "admin_panel_username": "",
     "admin_panel_password_hash": "",
     "admin_panel_secret_key": "",
@@ -1334,7 +1338,8 @@ def register_routes(app: Flask) -> None:
             "binance_api_base_url", "binance_recv_window_ms", "binance_pay_history_lookback_seconds",
             "payment_timeout_minutes", "payment_reminder_minutes", "usdt_verify_interval_seconds",
             "bep20_required_confirmations", "polygon_required_confirmations", "usdt_manual_verify_delay_minutes", "low_stock_alert_threshold",
-            "restock_notification_cooldown_minutes", "admin_panel_username",
+            "restock_back_in_stock_cooldown_minutes", "restock_notification_cooldown_minutes",
+            "restock_long_notification_cooldown_minutes", "restock_big_addition_threshold", "admin_panel_username",
         ]
         for key in plain_secret_form_keys:
             settings[key] = request.form.get(key, "").strip()
@@ -1355,7 +1360,10 @@ def register_routes(app: Flask) -> None:
             ("polygon_required_confirmations", "Polygon required confirmations", 1),
             ("usdt_manual_verify_delay_minutes", "Manual verification delay minutes", 0),
             ("low_stock_alert_threshold", "Low stock alert threshold", 1),
-            ("restock_notification_cooldown_minutes", "Restock notification cooldown minutes", 1),
+            ("restock_back_in_stock_cooldown_minutes", "Back-in-stock notification cooldown minutes", 1),
+            ("restock_notification_cooldown_minutes", "Low-stock recovery notification cooldown minutes", 1),
+            ("restock_long_notification_cooldown_minutes", "Big restock notification cooldown minutes", 1),
+            ("restock_big_addition_threshold", "Big restock minimum added items", 1),
         ]:
             try:
                 value = int(str(settings.get(int_key) or "").strip())
@@ -2607,8 +2615,10 @@ def register_routes(app: Flask) -> None:
                 previous_available,
                 available,
                 cooldown_minutes=get_runtime_int(app.db, "restock_notification_cooldown_minutes", RESTOCK_NOTIFICATION_COOLDOWN_MINUTES),
+                back_in_stock_cooldown_minutes=get_runtime_int(app.db, "restock_back_in_stock_cooldown_minutes", RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES),
                 long_cooldown_minutes=get_runtime_int(app.db, "restock_long_notification_cooldown_minutes", RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES),
-                high_stock_threshold=get_runtime_int(app.db, "restock_high_stock_threshold", RESTOCK_HIGH_STOCK_THRESHOLD),
+                big_restock_quantity=get_runtime_int(app.db, "restock_big_addition_threshold", get_runtime_int(app.db, "restock_high_stock_threshold", RESTOCK_BIG_ADDITION_THRESHOLD)),
+                added_stock_count=len(fresh_blocks),
             )
         )
         notified = notify_users_new_stock(app.db, product["name"], available) if should_notify_restock else 0
@@ -6339,18 +6349,20 @@ def claim_restock_notification_slot(
     current_available_stock: int,
     *,
     cooldown_minutes: int = RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
+    back_in_stock_cooldown_minutes: int = RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES,
     long_cooldown_minutes: int = RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES,
-    high_stock_threshold: int = RESTOCK_HIGH_STOCK_THRESHOLD,
+    big_restock_quantity: int = RESTOCK_BIG_ADDITION_THRESHOLD,
+    high_stock_threshold: int | None = None,
+    added_stock_count: int | None = None,
 ) -> bool:
-    """Return True when a safe fresh-stock notification may be sent.
+    """Return True when a fresh-stock notification should be sent.
 
-    Normal rule: notify when available stock recovers from below the product's
-    low-stock threshold to the threshold or higher, using the normal cooldown.
-
-    Long reminder rule: after the long cooldown, any real stock addition can
-    trigger the same fresh-stock notification as long as stock is now available.
-    This also covers products that already have healthy/high stock. Updating the
-    same per-product timestamp prevents a second notification immediately after.
+    Rules:
+    - 0 available -> product threshold or higher: notify after the shorter
+      back-in-stock cooldown. Small 0 -> 1/4/9 additions stay silent.
+    - low stock -> product threshold or higher: notify after the normal cooldown.
+    - already available -> only notify after the long cooldown for a big restock
+      (added at least ``big_restock_quantity`` items, or available stock doubled).
     """
     product = db.products.find_one({"name": name_regex(product_name)}, {
         "_id": 1,
@@ -6361,27 +6373,38 @@ def claim_restock_notification_slot(
     if not product or product.get("enabled", True) is False:
         return False
     try:
-        previous_available_stock = int(previous_available_stock or 0)
-        current_available_stock = int(current_available_stock or 0)
+        previous_available_stock = max(0, int(previous_available_stock or 0))
+        current_available_stock = max(0, int(current_available_stock or 0))
     except Exception:
         return False
     if current_available_stock <= 0:
         return False
 
     threshold = get_product_restock_threshold(db, product)
-    low_stock_recovered = previous_available_stock < threshold <= current_available_stock
-
+    available_increase = max(0, current_available_stock - previous_available_stock)
     try:
-        high_threshold = max(1, int(high_stock_threshold or RESTOCK_HIGH_STOCK_THRESHOLD))
+        uploaded_count = max(0, int(added_stock_count if added_stock_count is not None else available_increase))
     except Exception:
-        high_threshold = RESTOCK_HIGH_STOCK_THRESHOLD
-    high_stock_reminder = current_available_stock > high_threshold
-    any_stock_after_long_cooldown = current_available_stock > 0
-    long_reminder_allowed = high_stock_reminder or any_stock_after_long_cooldown
+        uploaded_count = available_increase
+    try:
+        big_quantity = max(1, int(big_restock_quantity if big_restock_quantity is not None else high_stock_threshold or RESTOCK_BIG_ADDITION_THRESHOLD))
+    except Exception:
+        big_quantity = RESTOCK_BIG_ADDITION_THRESHOLD
 
-    if not low_stock_recovered and not long_reminder_allowed:
+    back_in_stock = previous_available_stock <= 0 and current_available_stock >= threshold
+    low_stock_recovered = 0 < previous_available_stock < threshold <= current_available_stock
+    stock_doubled = previous_available_stock > 0 and current_available_stock >= previous_available_stock * 2 and available_increase > 0
+    big_restock = previous_available_stock >= threshold and current_available_stock >= threshold and available_increase > 0 and (
+        uploaded_count >= big_quantity or stock_doubled
+    )
+
+    if not back_in_stock and not low_stock_recovered and not big_restock:
         return False
 
+    try:
+        back_in_stock_cooldown = max(1, int(back_in_stock_cooldown_minutes or RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES))
+    except Exception:
+        back_in_stock_cooldown = RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES
     try:
         normal_cooldown = max(1, int(cooldown_minutes or RESTOCK_NOTIFICATION_COOLDOWN_MINUTES))
     except Exception:
@@ -6391,7 +6414,13 @@ def claim_restock_notification_slot(
     except Exception:
         long_cooldown = max(normal_cooldown, RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES)
 
-    required_cooldown = normal_cooldown if low_stock_recovered else long_cooldown
+    if back_in_stock:
+        required_cooldown = back_in_stock_cooldown
+    elif low_stock_recovered:
+        required_cooldown = normal_cooldown
+    else:
+        required_cooldown = long_cooldown
+
     now = utcnow()
     cutoff = now - timedelta(minutes=required_cooldown)
     result = db.products.update_one(

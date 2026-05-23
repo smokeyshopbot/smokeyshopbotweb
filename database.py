@@ -611,19 +611,21 @@ async def claim_restock_notification_slot(
     current_available_stock: int,
     *,
     cooldown_minutes: int = 60,
+    back_in_stock_cooldown_minutes: int = 30,
     long_cooldown_minutes: int = 360,
-    high_stock_threshold: int = 20,
+    big_restock_quantity: int = 20,
+    high_stock_threshold: int | None = None,
     default_threshold: int = 10,
+    added_stock_count: int | None = None,
 ) -> bool:
-    """Return True when a safe fresh-stock notification may be sent.
+    """Return True when a fresh-stock notification should be sent.
 
-    Normal rule: notify when available stock recovers from below the product's
-    low-stock threshold to the threshold or higher, using the normal cooldown.
-
-    Long reminder rule: after the long cooldown, any real stock addition can
-    trigger the same fresh-stock notification as long as stock is now available.
-    This also covers products that already have healthy/high stock. Updating the
-    same per-product timestamp prevents a second notification immediately after.
+    Rules:
+    - 0 available -> product threshold or higher: notify after the shorter
+      back-in-stock cooldown. Small 0 -> 1/4/9 additions stay silent.
+    - low stock -> product threshold or higher: notify after the normal cooldown.
+    - already available -> only notify after the long cooldown for a big restock
+      (added at least ``big_restock_quantity`` items, or available stock doubled).
     """
     product = await get_db().products.find_one(
         {"name": _name_regex(product_name)},
@@ -632,27 +634,38 @@ async def claim_restock_notification_slot(
     if not product or product.get("enabled", True) is False:
         return False
     try:
-        previous_available_stock = int(previous_available_stock or 0)
-        current_available_stock = int(current_available_stock or 0)
+        previous_available_stock = max(0, int(previous_available_stock or 0))
+        current_available_stock = max(0, int(current_available_stock or 0))
     except Exception:
         return False
     if current_available_stock <= 0:
         return False
 
     threshold = get_product_restock_threshold(product, default_threshold)
-    low_stock_recovered = previous_available_stock < threshold <= current_available_stock
-
+    available_increase = max(0, current_available_stock - previous_available_stock)
     try:
-        high_threshold = max(1, int(high_stock_threshold or 20))
+        uploaded_count = max(0, int(added_stock_count if added_stock_count is not None else available_increase))
     except Exception:
-        high_threshold = 20
-    high_stock_reminder = current_available_stock > high_threshold
-    any_stock_after_long_cooldown = current_available_stock > 0
-    long_reminder_allowed = high_stock_reminder or any_stock_after_long_cooldown
+        uploaded_count = available_increase
+    try:
+        big_quantity = max(1, int(big_restock_quantity if big_restock_quantity is not None else high_stock_threshold or 20))
+    except Exception:
+        big_quantity = 20
 
-    if not low_stock_recovered and not long_reminder_allowed:
+    back_in_stock = previous_available_stock <= 0 and current_available_stock >= threshold
+    low_stock_recovered = 0 < previous_available_stock < threshold <= current_available_stock
+    stock_doubled = previous_available_stock > 0 and current_available_stock >= previous_available_stock * 2 and available_increase > 0
+    big_restock = previous_available_stock >= threshold and current_available_stock >= threshold and available_increase > 0 and (
+        uploaded_count >= big_quantity or stock_doubled
+    )
+
+    if not back_in_stock and not low_stock_recovered and not big_restock:
         return False
 
+    try:
+        back_in_stock_cooldown = max(1, int(back_in_stock_cooldown_minutes or 30))
+    except Exception:
+        back_in_stock_cooldown = 30
     try:
         normal_cooldown = max(1, int(cooldown_minutes or 60))
     except Exception:
@@ -662,9 +675,13 @@ async def claim_restock_notification_slot(
     except Exception:
         long_cooldown = max(normal_cooldown, 360)
 
-    # Low-stock recovery is allowed after the shorter normal cooldown. Other
-    # additions/reminders must wait for the longer cooldown.
-    required_cooldown = normal_cooldown if low_stock_recovered else long_cooldown
+    if back_in_stock:
+        required_cooldown = back_in_stock_cooldown
+    elif low_stock_recovered:
+        required_cooldown = normal_cooldown
+    else:
+        required_cooldown = long_cooldown
+
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=required_cooldown)
     result = await get_db().products.update_one(
