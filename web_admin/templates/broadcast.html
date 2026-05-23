@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Broadcast{% endblock %}
+{% block content %}
+{% set spanish_enabled = 'es' in language_settings.enabled_languages %}
+<div class="page-header"><div><h1>Broadcast</h1><p>Send a Telegram message to unblocked users in their selected language.</p></div></div>
+<section class="panel">
+  <p class="muted">
+    Target users: {{ active_users }} active user(s).
+    English/default: {{ active_users_by_language.en or 0 }}{% if spanish_enabled %}, Spanish: {{ active_users_by_language.es or 0 }}{% endif %}.
+  </p>
+  <form method="post" action="{{ url_for('broadcast_submit') }}" class="stacked-form" id="broadcast-send-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="bilingual-field-grid">
+      <label>English message
+        <textarea name="message_en" rows="7" placeholder="Write the English broadcast message..."></textarea>
+        <span class="muted">English/default users receive this text. Leave empty to skip English/default users.</span>
+      </label>
+      {% if spanish_enabled %}
+      <label>Spanish message
+        <textarea name="message_es" rows="7" placeholder="Write the Spanish broadcast message..."></textarea>
+        <span class="muted">Spanish users receive this text. Leave empty to skip Spanish users.</span>
+      </label>
+      {% endif %}
+    </div>
+    <button class="primary" type="submit">Send broadcast</button>
+  </form>
+  {% if not bot_token_configured %}<p class="warning">BOT_TOKEN is not configured, so Telegram messages cannot be sent from the panel.</p>{% endif %}
+</section>
+<div class="action-confirm-shell" id="broadcast-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-broadcast-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="broadcast-confirm-title">
+    <h3 id="broadcast-confirm-title">Send broadcast?</h3>
+    <p class="muted">Send this broadcast only to users whose selected-language message field is filled?</p>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-broadcast-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="broadcast-confirm-submit">Send</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const form = document.getElementById('broadcast-send-form');
+  const modal = document.getElementById('broadcast-confirm-modal');
+  const sendButton = document.getElementById('broadcast-confirm-submit');
+  if (!form || !modal || !sendButton) return;
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!form.reportValidity || form.reportValidity()) {
+      modal.hidden = false;
+      document.body.classList.add('modal-open');
+    }
+  });
+
+  sendButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-broadcast-confirm')) {
+      closeModal();
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) closeModal();
+  });
+})();
+</script>
+{% endblock %}

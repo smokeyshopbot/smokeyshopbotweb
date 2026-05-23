@@ -1,0 +1,710 @@
+{% extends "base.html" %}
+{% block title %}User {{ telegram_user_label(user.user_id, user.username) }}{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>User {{ telegram_user_label(user.user_id, user.username) }}</h1><p><a href="{{ url_for('users') }}">← Back to users</a></p><p><span class="{{ user_status_badge_class(user.blocked) }}">{{ 'Blocked' if user.blocked else 'Active' }}</span></p></div></div>
+<section class="grid cards">
+  {% if 'usdt' in active_payment_currencies %}
+    <div class="card"><span>Wallet USDT</span><strong>{{ money_usdt(user.wallet_usdt) }}</strong></div>
+  {% endif %}
+  {% if 'inr' in active_payment_currencies %}
+    <div class="card"><span>Wallet INR</span><strong>{{ money_inr(user.wallet_inr) }}</strong></div>
+  {% endif %}
+  {% if not active_payment_currencies %}
+    <div class="card"><span>Wallet</span><strong>Hidden</strong><small>No active payment currency</small></div>
+  {% endif %}
+  <div class="card"><span>Total orders</span><strong>{{ stats.total_orders }}</strong><small>{{ stats.delivered }} delivered</small></div>
+  <div class="card"><span>Paid value</span>
+    {% if 'usdt' in active_payment_currencies %}<strong>{{ money_usdt(stats.total_usdt) }}</strong>{% endif %}
+    {% if 'inr' in active_payment_currencies %}<strong>{{ money_inr(stats.total_inr) }}</strong>{% endif %}
+    {% if not active_payment_currencies %}<strong>Hidden</strong><small>No active payment currency</small>{% endif %}
+  </div>
+</section>
+
+<div class="two-col">
+  <section class="panel">
+    <h2>Adjust wallet</h2>
+    {% if active_payment_currencies %}
+      <form method="post" action="{{ url_for('adjust_balance', user_id=user.user_id) }}" class="stacked-form" id="wallet-adjust-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Action<select name="action"><option value="add">Add balance</option><option value="remove">Remove balance</option></select></label>
+        <label>Currency<select name="currency">
+          {% if 'usdt' in active_payment_currencies %}<option value="usdt">USDT</option>{% endif %}
+          {% if 'inr' in active_payment_currencies %}<option value="inr">INR</option>{% endif %}
+        </select></label>
+        <label>Amount<input name="amount" type="number" step="0.01" min="0" required></label>
+        <label>Note<input name="note" placeholder="optional note"></label>
+        <button class="primary" type="submit">Apply</button>
+      </form>
+    {% else %}
+      <p class="muted">Enable a payment method in Payment Settings before adjusting wallet balances.</p>
+    {% endif %}
+  </section>
+  <section class="panel">
+    <h2>Account control</h2>
+    <form method="post" action="{{ url_for('block_user', user_id=user.user_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="blocked" value="{{ 0 if user.blocked else 1 }}">
+      <button class="{{ 'success' if user.blocked else 'danger' }}" type="submit">{{ 'Unblock user' if user.blocked else 'Block user' }}</button>
+    </form>
+    <p class="muted">Joined: {{ fmt_dt(user.joined_at) }}</p>
+  </section>
+</div>
+
+<div class="user-delivery-grid">
+  <section class="panel">
+    <h2>Send stock to this user</h2>
+    <p class="muted">Use this to send inventory stock or paste custom stock manually. The delivery is saved in their order history.</p>
+    {% if products_for_send %}
+      <form method="post" action="{{ url_for('send_stock_to_user', user_id=user.user_id) }}" class="stacked-form" id="user-stock-send-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Product
+          <select name="product_name" required>
+            <option value="">Select product</option>
+            {% for product in products_for_send %}
+              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.available_stock or 0 }} available</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        <div class="inline-choice-group" role="radiogroup" aria-label="Stock send source">
+          <label class="choice-pill"><input type="radio" name="stock_source" value="inventory" checked> Send from product stock</label>
+          <label class="choice-pill"><input type="radio" name="stock_source" value="manual"> Enter manually</label>
+        </div>
+
+        <div id="user-stock-inventory-fields">
+          <label>Quantity from stock
+            <input name="stock_quantity" type="number" min="1" max="1000" step="1" value="1">
+          </label>
+          <small class="muted">This removes the selected quantity from available product stock. Paid pending-stock orders stay reserved first.</small>
+        </div>
+
+        <div id="user-stock-manual-fields" hidden>
+          <label>Stock items / accounts
+            <textarea name="stock_items" rows="8" placeholder="item1&#10;---&#10;item2&#10;---&#10;username&#10;password"></textarea>
+          </label>
+          <small class="muted">Each block between <code>---</code> is sent as one stock item/account, same as Add stock and Remove stock. Manual sends do not remove product inventory.</small>
+        </div>
+
+        <label>Admin note <small class="muted">optional</small>
+          <input name="stock_note" maxlength="1000" placeholder="Optional note for this order">
+        </label>
+
+        <button class="primary" type="submit">Send stock</button>
+      </form>
+    {% else %}
+      <p class="muted">Add a product first before sending stock to a user.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Send replacement to this user</h2>
+    <p class="muted">Use this when a user reported an issue outside the bot. The delivery is saved in their replacement history.</p>
+    {% if products_for_send %}
+      <form method="post" action="{{ url_for('send_replacement_to_user', user_id=user.user_id) }}" class="stacked-form" id="user-replacement-send-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Product
+          <select name="product_name" required>
+            <option value="">Select product</option>
+            {% for product in products_for_send %}
+              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.available_stock or 0 }} available</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        <div class="inline-choice-group" role="radiogroup" aria-label="Replacement send source">
+          <label class="choice-pill"><input type="radio" name="replacement_source" value="inventory" checked> Send from product stock</label>
+          <label class="choice-pill"><input type="radio" name="replacement_source" value="manual"> Enter manually</label>
+        </div>
+
+        <div id="user-replacement-inventory-fields">
+          <label>Quantity from stock
+            <input name="replacement_quantity" type="number" min="1" max="1000" step="1" value="1">
+          </label>
+          <small class="muted">This removes the selected quantity from available product stock and sends it as a replacement.</small>
+        </div>
+
+        <div id="user-replacement-manual-fields" hidden>
+          <label>Replacement items / accounts
+            <textarea name="replacement_items" rows="8" placeholder="replacement item 1&#10;---&#10;replacement item 2&#10;---&#10;username&#10;password"></textarea>
+          </label>
+          <small class="muted">Each block between <code>---</code> is sent as one replacement item/account. Manual replacements do not remove product inventory.</small>
+        </div>
+
+        <label>Admin note <small class="muted">optional</small>
+          <input name="replacement_note" maxlength="1000" placeholder="Reason or Telegram report note">
+        </label>
+
+        <button class="primary" type="submit">Send replacement</button>
+      </form>
+    {% else %}
+      <p class="muted">Add a product first before sending a replacement to a user.</p>
+    {% endif %}
+  </section>
+</div>
+
+<section class="panel">
+  <h2>Send message to this user</h2>
+  <p class="muted">This sends a Telegram bot message only to user {{ telegram_user_label(user.user_id, user.username) }}. It is not a broadcast. User language: {{ language_names.get(user_language, 'English') }}.</p>
+  <form method="post" action="{{ url_for('message_user', user_id=user.user_id) }}" class="stacked-form" id="user-message-send-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% if user_language == 'es' %}
+      <label>Spanish message
+        <textarea name="message" rows="4" placeholder="Write the Spanish message" required></textarea>
+      </label>
+    {% else %}
+      <label>English message
+        <textarea name="message" rows="4" placeholder="Write the English message" required></textarea>
+      </label>
+    {% endif %}
+    <button class="primary" type="submit">Send to this user only</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Recent orders</h2>
+  {% if orders %}
+  <div class="table-wrap"><table class="orders-table"><thead><tr><th>Order</th><th>Date</th><th>Product</th><th class="center-cell status-col">Status</th><th>Amount</th></tr></thead><tbody>
+  {% for order in orders %}
+    {% set display_status = 'revoked' if order.get('delivery_revoked') else order.status %}
+    <tr><td><a href="{{ url_for('order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td><td>{{ fmt_dt(order.created_at) }}</td><td>{{ order.product_name }} × {{ order.quantity }}</td><td class="center-cell status-cell"><span class="{{ status_badge_class(display_status) }}">{{ status_label(display_status) }}</span></td><td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td></tr>
+  {% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="muted">No orders for this user.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Recent replacements</h2>
+  {% if recent_replacements %}
+  <div class="table-wrap"><table class="orders-table"><thead><tr><th>Replacement</th><th>Date</th><th>Product</th><th class="center-cell status-col">Status</th><th>Report</th></tr></thead><tbody>
+  {% for replacement in recent_replacements %}
+    <tr>
+      <td><a href="{{ url_for('order_detail', order_id=replacement.order_id) }}">{{ replacement.order_id }}</a></td>
+      <td>{{ fmt_dt(replacement.created_at) }}</td>
+      <td>{{ replacement.product_name }} × {{ replacement.quantity }}</td>
+      {% set replacement_display_status = 'revoked' if replacement.get('delivery_revoked') else replacement.status %}
+      <td class="center-cell status-cell"><span class="{{ status_badge_class(replacement_display_status) }}">{{ status_label(replacement_display_status) }}</span></td>
+      <td>{% if replacement.replacement_report_id %}<code>{{ replacement.replacement_report_id }}</code>{% else %}<span class="muted">Manual</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="muted">No replacements for this user.</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>Wallet top-up logs</h2>
+  {% if logs %}
+  <div class="table-wrap"><table class="payments-log-table"><thead><tr><th>Ref</th><th>Date</th><th>Method</th><th>Amount</th><th class="center-cell status-col">Status</th></tr></thead><tbody>
+  {% for log in logs %}
+    <tr>
+      <td>{{ log.ref_id }}{% if log.admin_wallet_adjustment and log.notes %}<br><small class="muted">{{ log.notes }}</small>{% endif %}</td>
+      <td>{{ fmt_dt(log.created_at) }}</td>
+      <td>{{ method_label(log.method) }}</td>
+      <td class="money-cell"><span class="money-text">{% if log.admin_wallet_action == 'remove' %}-{% elif log.admin_wallet_action == 'add' %}+{% endif %}{% if log.currency == 'inr' or log.method == 'upi' %}{{ money_inr(log.load_amount or log.expected_inr) }}{% else %}{{ money_usdt(log.load_amount or log.expected_usdt) }}{% endif %}</span></td>
+      <td class="center-cell status-cell"><span class="{{ payment_status_badge_class(log.status) }}">{{ payment_status_label(log.status) }}</span></td>
+    </tr>
+  {% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="muted">No wallet logs for this user.</p>{% endif %}
+</section>
+
+
+<div class="action-confirm-shell" id="wallet-adjust-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-wallet-adjust-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="wallet-adjust-confirm-title">
+    <h3 id="wallet-adjust-confirm-title">Confirm wallet change?</h3>
+    <p id="wallet-adjust-confirm-text" class="muted">Please confirm this wallet balance change.</p>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-wallet-adjust-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="wallet-adjust-confirm-submit">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="action-confirm-shell" id="user-stock-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-user-stock-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="user-stock-confirm-title">
+    <h3 id="user-stock-confirm-title">Send stock?</h3>
+    <p id="user-stock-confirm-text" class="muted">Please confirm this stock delivery.</p>
+    <pre id="user-stock-confirm-duplicates" class="stock-duplicate-preview" hidden></pre>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-user-stock-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="user-stock-confirm-submit">Send stock</button>
+    </div>
+  </div>
+</div>
+
+<div class="action-confirm-shell" id="user-replacement-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-user-replacement-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="user-replacement-confirm-title">
+    <h3 id="user-replacement-confirm-title">Send replacement?</h3>
+    <p id="user-replacement-confirm-text" class="muted">Please confirm this replacement delivery.</p>
+    <pre id="user-replacement-confirm-duplicates" class="stock-duplicate-preview" hidden></pre>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-user-replacement-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="user-replacement-confirm-submit">Send replacement</button>
+    </div>
+  </div>
+</div>
+
+{% if send_stock_duplicate_warning %}
+<div class="action-confirm-shell" id="user-stock-duplicate-modal" data-auto-open="1" hidden>
+  <div class="action-confirm-backdrop" data-close-user-stock-duplicate></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="user-stock-duplicate-title">
+    <h3 id="user-stock-duplicate-title">{{ send_stock_duplicate_warning.title or 'Send stock?' }}</h3>
+    <p class="muted">{{ send_stock_duplicate_warning.message or 'Duplicate stock detected. Nothing will be sent. Remove every duplicate block shown below and try again.' }}</p>
+    {% set duplicate_items = send_stock_duplicate_warning.duplicates or send_stock_duplicate_warning.sample %}
+    {% if duplicate_items %}
+      <pre class="stock-duplicate-preview">{% for item in duplicate_items %}{{ item }}{% if not loop.last %}
+---
+{% endif %}{% endfor %}</pre>
+    {% endif %}
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-user-stock-duplicate>Cancel</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="action-confirm-shell" id="user-message-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-user-message-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="user-message-confirm-title">
+    <h3 id="user-message-confirm-title">Send message?</h3>
+    <p class="muted">Send this Telegram message to user {{ telegram_user_label(user.user_id, user.username) }}?</p>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-user-message-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="user-message-confirm-submit">Send</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const form = document.getElementById('wallet-adjust-form');
+  const modal = document.getElementById('wallet-adjust-confirm-modal');
+  const confirmText = document.getElementById('wallet-adjust-confirm-text');
+  const confirmButton = document.getElementById('wallet-adjust-confirm-submit');
+  if (!form || !modal || !confirmText || !confirmButton) return;
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  function labelForSelect(select, fallback) {
+    if (!select) return fallback;
+    const option = select.options[select.selectedIndex];
+    return option ? option.text.trim() : fallback;
+  }
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (form.reportValidity && !form.reportValidity()) return;
+
+    const actionSelect = form.querySelector('[name="action"]');
+    const currencySelect = form.querySelector('[name="currency"]');
+    const amountInput = form.querySelector('[name="amount"]');
+    const action = actionSelect ? actionSelect.value : 'add';
+    const actionLabel = action === 'remove' ? 'remove from' : 'add to';
+    const buttonLabel = action === 'remove' ? 'Remove balance' : 'Add balance';
+    const currency = labelForSelect(currencySelect, 'wallet').toUpperCase();
+    const amount = amountInput ? amountInput.value : '';
+
+    confirmText.textContent = `Are you sure you want to ${actionLabel} user {{ telegram_user_label(user.user_id, user.username) }} wallet: ${amount} ${currency}?`;
+    confirmButton.textContent = buttonLabel;
+    confirmButton.classList.toggle('danger', action === 'remove');
+    confirmButton.classList.toggle('primary', action !== 'remove');
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+  });
+
+  confirmButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-wallet-adjust-confirm')) {
+      closeModal();
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) closeModal();
+  });
+})();
+
+(function () {
+  const form = document.getElementById('user-stock-send-form');
+  const modal = document.getElementById('user-stock-confirm-modal');
+  const confirmText = document.getElementById('user-stock-confirm-text');
+  const duplicatePreview = document.getElementById('user-stock-confirm-duplicates');
+  const sendButton = document.getElementById('user-stock-confirm-submit');
+  const userLabel = {{ telegram_user_label(user.user_id, user.username)|tojson }};
+  if (!form || !modal || !confirmText || !sendButton) return;
+
+  const inventoryFields = document.getElementById('user-stock-inventory-fields');
+  const manualFields = document.getElementById('user-stock-manual-fields');
+  const quantityInput = form.querySelector('[name="stock_quantity"]');
+  const textarea = form.querySelector('[name="stock_items"]');
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  function hideDuplicatePreview() {
+    if (!duplicatePreview) return;
+    duplicatePreview.hidden = true;
+    duplicatePreview.textContent = '';
+  }
+
+  function showDuplicatePreview(items) {
+    if (!duplicatePreview) return;
+    duplicatePreview.textContent = (items || []).join('\n---\n');
+    duplicatePreview.hidden = !(items || []).length;
+  }
+
+  function stockBlocks(value) {
+    return (value || '').split('---').map(function (block) { return block.trim(); }).filter(Boolean);
+  }
+
+  function countItems(value) {
+    return stockBlocks(value).length;
+  }
+
+  function duplicateManualItems(value) {
+    const seen = new Set();
+    const duplicates = [];
+    stockBlocks(value).forEach(function (item) {
+      if (seen.has(item) && duplicates.indexOf(item) === -1) duplicates.push(item);
+      seen.add(item);
+    });
+    return duplicates;
+  }
+
+  function selectedSource() {
+    const checked = form.querySelector('[name="stock_source"]:checked');
+    return checked ? checked.value : 'manual';
+  }
+
+  function selectedProductOption() {
+    const select = form.querySelector('[name="product_name"]');
+    if (!select) return null;
+    return select.options[select.selectedIndex] || null;
+  }
+
+  function selectedProductName() {
+    const option = selectedProductOption();
+    return option ? option.text.trim() : 'selected product';
+  }
+
+  function selectedAvailableStock() {
+    const option = selectedProductOption();
+    const raw = option ? option.getAttribute('data-available-stock') : '';
+    const parsed = parseInt(raw || '0', 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function syncSourceFields() {
+    const source = selectedSource();
+    const usingInventory = source === 'inventory';
+    if (inventoryFields) inventoryFields.hidden = !usingInventory;
+    if (manualFields) manualFields.hidden = usingInventory;
+    if (quantityInput) quantityInput.required = usingInventory;
+    if (textarea) textarea.required = !usingInventory;
+  }
+
+  form.querySelectorAll('[name="stock_source"]').forEach(function (radio) {
+    radio.addEventListener('change', syncSourceFields);
+  });
+  syncSourceFields();
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    syncSourceFields();
+    if (form.reportValidity && !form.reportValidity()) return;
+
+    const source = selectedSource();
+    let itemCount = 0;
+    let sourceText = 'manual stock';
+
+    hideDuplicatePreview();
+
+    if (source === 'inventory') {
+      itemCount = parseInt(quantityInput ? quantityInput.value : '0', 10) || 0;
+      const available = selectedAvailableStock();
+      if (itemCount < 1) {
+        if (quantityInput) quantityInput.focus();
+        return;
+      }
+      if (available > 0 && itemCount > available) {
+        confirmText.textContent = `Only ${available} available item(s) are shown for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
+        modal.hidden = false;
+        document.body.classList.add('modal-open');
+        sendButton.hidden = true;
+        return;
+      }
+      sourceText = 'product inventory';
+    } else {
+      const manualValue = textarea ? textarea.value : '';
+      itemCount = countItems(manualValue);
+      if (!itemCount) {
+        if (textarea) textarea.focus();
+        return;
+      }
+      const duplicates = duplicateManualItems(manualValue);
+      if (duplicates.length) {
+        confirmText.textContent = `Duplicate stock detected in the manual entry (${duplicates.length} duplicate item(s)). Nothing will be sent. Remove every duplicate block shown below and try again.`;
+        showDuplicatePreview(duplicates);
+        modal.hidden = false;
+        document.body.classList.add('modal-open');
+        sendButton.hidden = true;
+        return;
+      }
+    }
+
+    sendButton.hidden = false;
+    confirmText.textContent = `Send ${itemCount} item(s) of ${selectedProductName()} from ${sourceText} to user ${userLabel} and add it to their order history?`;
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+  });
+
+  sendButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-user-stock-confirm')) {
+      closeModal();
+      sendButton.hidden = false;
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) {
+      closeModal();
+      sendButton.hidden = false;
+    }
+  });
+})();
+
+(function () {
+  const form = document.getElementById('user-replacement-send-form');
+  const modal = document.getElementById('user-replacement-confirm-modal');
+  const confirmText = document.getElementById('user-replacement-confirm-text');
+  const duplicatePreview = document.getElementById('user-replacement-confirm-duplicates');
+  const sendButton = document.getElementById('user-replacement-confirm-submit');
+  const userLabel = {{ telegram_user_label(user.user_id, user.username)|tojson }};
+  if (!form || !modal || !confirmText || !sendButton) return;
+
+  const inventoryFields = document.getElementById('user-replacement-inventory-fields');
+  const manualFields = document.getElementById('user-replacement-manual-fields');
+  const quantityInput = form.querySelector('[name="replacement_quantity"]');
+  const textarea = form.querySelector('[name="replacement_items"]');
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  function hideDuplicatePreview() {
+    if (!duplicatePreview) return;
+    duplicatePreview.hidden = true;
+    duplicatePreview.textContent = '';
+  }
+
+  function showDuplicatePreview(items) {
+    if (!duplicatePreview) return;
+    duplicatePreview.textContent = (items || []).join('\n---\n');
+    duplicatePreview.hidden = !(items || []).length;
+  }
+
+  function stockBlocks(value) {
+    return (value || '').split('---').map(function (block) { return block.trim(); }).filter(Boolean);
+  }
+
+  function countItems(value) {
+    return stockBlocks(value).length;
+  }
+
+  function duplicateManualItems(value) {
+    const seen = new Set();
+    const duplicates = [];
+    stockBlocks(value).forEach(function (item) {
+      if (seen.has(item) && duplicates.indexOf(item) === -1) duplicates.push(item);
+      seen.add(item);
+    });
+    return duplicates;
+  }
+
+  function selectedSource() {
+    const checked = form.querySelector('[name="replacement_source"]:checked');
+    return checked ? checked.value : 'manual';
+  }
+
+  function selectedProductOption() {
+    const select = form.querySelector('[name="product_name"]');
+    if (!select) return null;
+    return select.options[select.selectedIndex] || null;
+  }
+
+  function selectedProductName() {
+    const option = selectedProductOption();
+    return option ? option.text.trim() : 'selected product';
+  }
+
+  function selectedAvailableStock() {
+    const option = selectedProductOption();
+    const raw = option ? option.getAttribute('data-available-stock') : '';
+    const parsed = parseInt(raw || '0', 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function syncSourceFields() {
+    const source = selectedSource();
+    const usingInventory = source === 'inventory';
+    if (inventoryFields) inventoryFields.hidden = !usingInventory;
+    if (manualFields) manualFields.hidden = usingInventory;
+    if (quantityInput) quantityInput.required = usingInventory;
+    if (textarea) textarea.required = !usingInventory;
+  }
+
+  form.querySelectorAll('[name="replacement_source"]').forEach(function (radio) {
+    radio.addEventListener('change', syncSourceFields);
+  });
+  syncSourceFields();
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    syncSourceFields();
+    if (form.reportValidity && !form.reportValidity()) return;
+
+    const source = selectedSource();
+    let itemCount = 0;
+    let sourceText = 'manual replacement stock';
+
+    hideDuplicatePreview();
+
+    if (source === 'inventory') {
+      itemCount = parseInt(quantityInput ? quantityInput.value : '0', 10) || 0;
+      const available = selectedAvailableStock();
+      if (itemCount < 1) {
+        if (quantityInput) quantityInput.focus();
+        return;
+      }
+      if (available > 0 && itemCount > available) {
+        confirmText.textContent = `Only ${available} available item(s) are shown for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
+        modal.hidden = false;
+        document.body.classList.add('modal-open');
+        sendButton.hidden = true;
+        return;
+      }
+      sourceText = 'product inventory';
+    } else {
+      const manualValue = textarea ? textarea.value : '';
+      itemCount = countItems(manualValue);
+      if (!itemCount) {
+        if (textarea) textarea.focus();
+        return;
+      }
+      const duplicates = duplicateManualItems(manualValue);
+      if (duplicates.length) {
+        confirmText.textContent = `Duplicate stock detected in the manual replacement entry (${duplicates.length} duplicate item(s)). Nothing will be sent. Remove every duplicate block shown below and try again.`;
+        showDuplicatePreview(duplicates);
+        modal.hidden = false;
+        document.body.classList.add('modal-open');
+        sendButton.hidden = true;
+        return;
+      }
+    }
+
+    sendButton.hidden = false;
+    confirmText.textContent = `Send ${itemCount} replacement item(s) of ${selectedProductName()} from ${sourceText} to user ${userLabel} and add it to their replacement history?`;
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+  });
+
+  sendButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-user-replacement-confirm')) {
+      closeModal();
+      sendButton.hidden = false;
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) {
+      closeModal();
+      sendButton.hidden = false;
+    }
+  });
+})();
+
+(function () {
+  const modal = document.getElementById('user-stock-duplicate-modal');
+  if (!modal || modal.getAttribute('data-auto-open') !== '1') return;
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+  modal.hidden = false;
+  document.body.classList.add('modal-open');
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-user-stock-duplicate')) closeModal();
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) closeModal();
+  });
+})();
+
+(function () {
+  const form = document.getElementById('user-message-send-form');
+  const modal = document.getElementById('user-message-confirm-modal');
+  const sendButton = document.getElementById('user-message-confirm-submit');
+  if (!form || !modal || !sendButton) return;
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!form.reportValidity || form.reportValidity()) {
+      modal.hidden = false;
+      document.body.classList.add('modal-open');
+    }
+  });
+
+  sendButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-user-message-confirm')) {
+      closeModal();
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) closeModal();
+  });
+})();
+</script>
+{% endblock %}

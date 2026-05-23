@@ -1,0 +1,297 @@
+{% extends "base.html" %}
+{% block title %}Manage admin{% endblock %}
+{% block content %}
+{% set replacement_summary = stats.replacement_summary if stats else {} %}
+<div class="page-header admin-detail-header">
+  <div>
+    <a class="small-button admin-back-link" href="{{ url_for('admins_panel') }}">← Back to Admins</a>
+    <h1>Manage {{ account.username }}</h1>
+    <p>{{ admin_role_labels.get(account.role, account.role) }} account details and permissions.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <h2>Account details</h2>
+  <div class="detail-grid admin-detail-grid">
+    <div><span>Username</span><strong>{{ account.username }}</strong></div>
+    <div><span>Role</span><strong>{{ admin_role_labels.get(account.role, account.role) }}</strong></div>
+    <div><span>Created</span><strong>{{ fmt_dt(account.created_at) }}</strong></div>
+  </div>
+  <p class="muted">{{ admin_role_descriptions.get(account.role, '') }}</p>
+</section>
+
+{% if account.role == 'stock_manager' %}
+<section class="grid cards stock-manager-summary-cards">
+  <div class="card"><span>Total stock added</span><strong>{{ summary.total_added }}</strong><small>Lifetime stock added by this manager.</small></div>
+  <div class="card replacement-due-card"><span>Pending replacements</span><strong>{{ summary.pending_replacement_count }}</strong><small>Replacement stock this manager still needs to submit.</small></div>
+  <div class="card"><span>Current stock</span><strong>{{ summary.current_stock }}</strong><small>Unsold stock still available from this manager.</small></div>
+  <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered items added by this manager.</small></div>
+  <div class="card"><span>Lifetime earnings</span><strong>{{ money_usdt(summary.manager_earning_usdt) }}</strong><small>Stock added × earning rate.</small></div>
+  <div class="card payout-due-card"><span>Payout due</span><strong>{{ money_usdt(summary.payable_due_usdt) }}</strong><small>{% if summary.pending_payment_request %}Request pending{% else %}No pending request{% endif %}</small></div>
+</section>
+
+<section class="panel assigned-products-panel">
+  <div class="toolbar">
+    <div>
+      <h2>Assigned products</h2>
+      <p class="muted">Choose which products this stock manager can view and add/remove stock for.</p>
+    </div>
+    <span class="badge">{{ (account.assigned_products or [])|length }} assigned</span>
+  </div>
+
+  {% if all_products %}
+  <form method="post" action="{{ url_for('assign_stock_manager_products', account_id=account.id) }}" class="assigned-products-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% set assigned_names = account.assigned_products or [] %}
+    <div class="assigned-product-options">
+      {% for product in all_products %}
+        {% set product_name = product.name or '' %}
+        <label class="assigned-product-option" title="{{ product_name }}">
+          <input type="checkbox" name="assigned_products" value="{{ product_name }}" {% if product_name in assigned_names %}checked{% endif %}>
+          <span>{{ product_name }}</span>
+        </label>
+      {% endfor %}
+    </div>
+    <div class="assigned-products-actions">
+      <button class="success" type="submit">Save assigned products</button>
+      <span class="muted">Unchecked products will be hidden from this stock manager.</span>
+    </div>
+  </form>
+  {% else %}
+    <p class="muted">No products exist yet. Create products first, then assign them to this stock manager.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Pending replacements</h2>
+      <p class="muted">Replacement stock this manager still needs to submit.</p>
+    </div>
+    {% if summary.pending_replacement_count %}<span class="badge warning">{{ summary.pending_replacement_count }} pending</span>{% endif %}
+  </div>
+  {% if replacement_summary.pending_by_product %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Product</th><th class="status-col">Needed</th><th>Replacement reports</th></tr></thead>
+      <tbody>
+      {% for row in replacement_summary.pending_by_product %}
+        <tr>
+          <td><strong>{{ row.product_name }}</strong></td>
+          <td class="center-cell"><span class="badge warning compact-badge">{{ row.count }}</span></td>
+          <td>
+            {% for report_id in row.report_ids %}
+              <a class="small-button" href="{{ url_for('replacement_detail', report_id=report_id) }}">{{ report_id }}</a>
+            {% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No pending replacement stock is due from this manager.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Payout details</h2>
+      <p class="muted">Clear due only after you have paid this stock manager.</p>
+    </div>
+    {% if summary.pending_payment_request %}<span class="badge warning">Request pending</span>{% endif %}
+  </div>
+  <div class="payout-grid payout-grid-centered">
+    <div class="payment-details-box">
+      <strong>Saved payment method: {{ payment_method_label or 'Not saved' }}</strong>
+      {% if payment_details_text %}
+        <pre>{{ payment_details_text }}</pre>
+      {% else %}
+        <p class="muted">No complete payment details saved by this stock manager.</p>
+      {% endif %}
+    </div>
+    <div class="payout-request-box payout-request-box-centered">
+      <div>
+        <h3>Clear payout due</h3>
+        <p>{% if summary.pending_payment_request %}Requested payout amount{% else %}Current payout due{% endif %}: <strong>{{ money_usdt(summary.clearable_payout_usdt) }}</strong></p>
+        {% if summary.pending_payment_request and summary.payable_due_usdt > summary.clearable_payout_usdt %}
+          <p class="muted">Newer unpaid earnings after this request will stay due: {{ money_usdt(summary.payable_due_usdt - summary.clearable_payout_usdt) }}.</p>
+        {% endif %}
+        <form method="post" action="{{ url_for('clear_stock_manager_payout', account_id=account.id) }}" class="clear-payout-form detail-clear-payout-form" data-clear-payout-form data-payout-admin="{{ account.username|e }}" data-payout-amount="{{ money_usdt(summary.clearable_payout_usdt)|e }}" data-payout-method="{{ payment_method_label|e }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>Owner note optional
+            <input name="note" placeholder="Transaction ID / paid via / notes">
+          </label>
+          <button class="success" type="submit" {% if summary.clearable_payout_usdt <= 0 %}disabled{% endif %}>Clear paid request</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Product stock summary</h2>
+  {% if stats.products %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Product</th><th>Added</th><th>Current</th><th>Sold</th><th>Earning rate</th><th>Earnings</th><th>Last activity</th></tr></thead>
+      <tbody>
+      {% for row in stats.products %}
+        <tr>
+          <td><strong>{{ row.product_name }}</strong></td>
+          <td>{{ row.added }}</td>
+          <td>{{ row.current }}</td>
+          <td>{{ row.sold }}</td>
+          <td>{{ money_usdt(row.configured_manager_rate_usdt) }}</td>
+          <td>{{ money_usdt(row.manager_earning_usdt) }}</td>
+          <td>{{ fmt_dt(row.last_activity_at) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No stock activity for assigned products yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Payment history</h2>
+  {% if payout_history %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Date</th><th>Amount</th><th>Paid by</th><th>Method</th><th>Owner note</th></tr></thead>
+      <tbody>
+      {% for payout in payout_history %}
+        <tr>
+          <td>{{ fmt_dt(payout.created_at) }}</td>
+          <td><strong>{{ money_usdt(payout.amount_usdt) }}</strong></td>
+          <td>{{ payout.paid_by or 'owner' }}</td>
+          <td>{{ payout.payment_method_label or stock_manager_payment_method_label(payout.payment_method) }}</td>
+          <td>{{ payout.note or '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No paid payout history yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Payout request history</h2>
+  {% if payout_requests %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Paid at</th><th>Payment details</th></tr></thead>
+      <tbody>
+      {% for req in payout_requests %}
+        <tr>
+          <td>{{ money_usdt(req.amount_usdt) }}</td>
+          <td>{{ req.payment_method_label or stock_manager_payment_method_label(req.payment_method) }}</td>
+          <td class="center-cell status-cell"><span class="badge {{ 'success' if req.status == 'paid' else 'warning' }}">{{ (req.status or 'pending')|title }}</span></td>
+          <td>{{ fmt_dt(req.requested_at) }}</td>
+          <td>{{ fmt_dt(req.paid_at) if req.paid_at else '—' }}</td>
+          <td><pre class="compact-pre">{{ req.payment_details }}</pre></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No payout requests from this stock manager yet.</p>
+  {% endif %}
+</section>
+
+<div id="clear-payout-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-clear-payout-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="clear-payout-confirm-title">
+    <h3 id="clear-payout-confirm-title">Clear payout due?</h3>
+    <p class="muted">Confirm only after you have paid this stock manager. This saves the paid amount in payment history. Any newer earnings added after the request stay due.</p>
+    <div class="action-confirm-summary">
+      <div><span>Stock manager</span><strong id="clear-payout-confirm-admin">-</strong></div>
+      <div><span>Amount</span><strong id="clear-payout-confirm-amount">-</strong></div>
+      <div><span>Payment method</span><strong id="clear-payout-confirm-method">-</strong></div>
+      <div><span>Owner note</span><strong id="clear-payout-confirm-note">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-clear-payout-confirm>Cancel</button>
+      <button type="button" class="action-button success" id="clear-payout-confirm-submit">Yes, mark paid</button>
+    </div>
+  </div>
+</div>
+{% else %}
+<section class="panel">
+  <h2>Role access</h2>
+  <p class="muted">This role has no stock-manager payout details.</p>
+  <div class="role-help-card">
+    <strong>{{ admin_role_labels.get(account.role, account.role) }}</strong>
+    <small>{{ admin_role_descriptions.get(account.role, '') }}</small>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if account.role == 'stock_manager' %}
+<script>
+(function () {
+  let pendingClearPayoutForm = null;
+  const modal = document.getElementById('clear-payout-confirm-modal');
+
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value || '-';
+  }
+
+  function closeClearPayoutConfirm() {
+    if (modal) modal.hidden = true;
+    pendingClearPayoutForm = null;
+    document.body.classList.remove('modal-open');
+  }
+
+  function openClearPayoutConfirm(form) {
+    if (!modal) return false;
+    pendingClearPayoutForm = form;
+    const noteInput = form.querySelector('input[name="note"]');
+    setText('clear-payout-confirm-admin', form.dataset.payoutAdmin);
+    setText('clear-payout-confirm-amount', form.dataset.payoutAmount);
+    setText('clear-payout-confirm-method', form.dataset.payoutMethod);
+    setText('clear-payout-confirm-note', noteInput && noteInput.value.trim() ? noteInput.value.trim() : 'No note');
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
+  document.addEventListener('submit', (event) => {
+    const form = event.target.closest && event.target.closest('[data-clear-payout-form]');
+    if (!form || form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!openClearPayoutConfirm(form)) {
+      form.dataset.confirmed = '1';
+      form.submit();
+    }
+  });
+
+  document.addEventListener('click', (event) => {
+    if (event.target.hasAttribute('data-close-clear-payout-confirm')) {
+      closeClearPayoutConfirm();
+      return;
+    }
+    if (event.target.closest && event.target.closest('#clear-payout-confirm-submit') && pendingClearPayoutForm) {
+      const form = pendingClearPayoutForm;
+      form.dataset.confirmed = '1';
+      closeClearPayoutConfirm();
+      form.submit();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && modal && !modal.hidden) closeClearPayoutConfirm();
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

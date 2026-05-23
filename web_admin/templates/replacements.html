@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Replacements{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Replacements</h1>
+    <p>User reports for damaged / not-working delivered stock items. Open a report to review details and send replacement stock.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="toolbar replacement-toolbar">
+    <form method="get" class="search-form replacement-filter-form">
+      <select name="status">
+        <option value="pending" {% if status == 'pending' %}selected{% endif %}>Pending</option>
+        <option value="replaced" {% if status == 'replaced' %}selected{% endif %}>Replaced</option>
+        <option value="cancelled" {% if status == 'cancelled' %}selected{% endif %}>Cancelled</option>
+      </select>
+      <button type="submit">Filter</button>
+    </form>
+    <span class="muted">{{ total }} report(s)</span>
+  </div>
+
+  {% if reports %}
+  <div class="table-wrap">
+    <table class="replacements-table clean-replacements-table">
+      <thead>
+        <tr>
+          <th>Report</th>
+          <th>Product</th>
+          <th>Order</th>
+          <th>Delivered</th>
+          <th>Stock added</th>
+          <th class="center-cell status-col">Status</th>
+          <th class="center-cell actions-col">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for report in reports %}
+        {% set report_items = replacement_report_items(report) %}
+        {% set first_item = report_items[0] if report_items else {} %}
+        <tr>
+          <td>
+            <div class="replacement-report-cell">
+              <strong><code>{{ report.report_id }}</code></strong>
+              <small class="muted">{{ fmt_dt(report.created_at) }}</small>
+              {% if report_items %}<span class="mini-chip">{{ report_items|length }} item{{ '' if report_items|length == 1 else 's' }}</span>{% endif %}
+            </div>
+          </td>
+          <td><strong>{{ replacement_products_label(report) }}</strong></td>
+          <td><code>{{ replacement_orders_label(report) }}</code></td>
+          <td>
+            <div class="mini-detail-stack clean-date-stack">
+              <strong>{{ fmt_dt(first_item.sold_at or report.sold_at) }}</strong>
+            </div>
+          </td>
+          <td>
+            <div class="mini-detail-stack clean-date-stack">
+              <strong>{{ first_item.stock_added_by_username or report.stock_added_by_username or 'Unknown' }}</strong>
+              <small class="muted">{{ fmt_dt(first_item.stock_added_at or report.stock_added_at) }}</small>
+              {% if report_items %}<small class="muted">{{ report_items|length }} item record{{ '' if report_items|length == 1 else 's' }}</small>{% endif %}
+            </div>
+          </td>
+          <td class="center-cell status-cell"><span class="badge {{ replacement_status_badge_class(report.status) }} nowrap-badge">{{ replacement_status_label(report.status) }}</span></td>
+          <td class="center-cell actions-cell"><a class="small-button primary" href="{{ url_for('replacement_detail', report_id=report.report_id) }}">Manage</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No replacement reports found for this filter.</p>
+  {% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

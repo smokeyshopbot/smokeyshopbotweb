@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Users</h1><p>Manage users, wallet balances, blocking, messages, and admin stock sends.</p></div></div>
+<section class="panel">
+  <div class="toolbar">
+    <form method="get" class="search-form">
+      <input name="q" placeholder="Search user ID or username" value="{{ q }}">
+      <button type="submit">Search</button>
+    </form>
+    <div class="toolbar-actions">
+      <a class="small-button" href="{{ url_for('export_users_csv') }}">Export users CSV</a>
+      <span class="muted">{{ total }} user(s)</span>
+    </div>
+  </div>
+  {% if users %}
+  <table class="users-table">
+    <thead><tr><th>User</th><th>Wallet</th><th class="center-cell status-col">Status</th><th>Joined</th><th class="center-cell actions-col">Actions</th></tr></thead>
+    <tbody>
+    {% for user in users %}
+      <tr>
+        <td><strong><a href="{{ url_for('user_detail', user_id=user.user_id) }}">{{ telegram_user_label(user.user_id, user.username) }}</a></strong></td>
+        <td>
+          {% if 'inr' in active_payment_currencies %}{{ money_inr(user.wallet_inr) }}{% endif %}
+          {% if 'inr' in active_payment_currencies and 'usdt' in active_payment_currencies %}<br>{% endif %}
+          {% if 'usdt' in active_payment_currencies %}{{ money_usdt(user.wallet_usdt) }}{% endif %}
+          {% if not active_payment_currencies %}<span class="muted">No active wallet currency</span>{% endif %}
+        </td>
+        <td class="center-cell status-cell"><span class="{{ user_status_badge_class(user.blocked) }}">{{ "Blocked" if user.blocked else "Active" }}</span></td>
+        <td>{{ fmt_dt(user.joined_at) }}</td>
+        <td class="center-cell actions-cell">
+          <form method="post" action="{{ url_for('block_user', user_id=user.user_id) }}" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="blocked" value="{{ 0 if user.blocked else 1 }}">
+            <button type="submit">{{ 'Unblock' if user.blocked else 'Block' }}</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No users found.</p>{% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

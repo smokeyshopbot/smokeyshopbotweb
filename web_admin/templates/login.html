@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+<section class="login-card">
+  <h1>Admin Panel Login</h1>
+  <form method="post" action="{{ url_for('login_submit') }}" class="stacked-form">
+    <label>Username<input name="username" autocomplete="username" required value="admin"></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="primary" type="submit">Login</button>
+  </form>
+</section>
+{% endblock %}

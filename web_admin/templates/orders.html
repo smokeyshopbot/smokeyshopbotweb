@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Recent Orders</h1>
+    {% if show_order_user_identity %}
+      <p>Search by order ID, user ID, username, or product.</p>
+    {% else %}
+      <p>Orders manager view: user IDs and usernames are hidden. Search by order ID or product only.</p>
+    {% endif %}
+  </div>
+</div>
+<section class="panel">
+  <div class="toolbar">
+    <form method="get" class="search-form">
+      <input name="q" placeholder="{{ 'Order, user, username or product' if show_order_user_identity else 'Order or product' }}" value="{{ q }}">
+      <select name="filter">
+        <option value="" {% if not filter_value %}selected{% endif %}>All orders</option>
+        <optgroup label="By status">
+          {% for s in ['pending','delivered','pending_stock','expired','failed'] %}<option value="status:{{ s }}" {% if filter_value == 'status:' ~ s %}selected{% endif %}>{{ status_label(s) }}</option>{% endfor %}
+        </optgroup>
+        {% if methods %}
+        <optgroup label="By payment method">
+          {% for m in methods %}<option value="method:{{ m }}" {% if filter_value == 'method:' ~ m %}selected{% endif %}>{{ method_label(m) }}</option>{% endfor %}
+        </optgroup>
+        {% endif %}
+      </select>
+      <button type="submit">Filter</button>
+    </form>
+    <div class="toolbar-actions">
+      {% if can_access('export_orders_csv') %}<a class="small-button" href="{{ url_for('export_orders_csv') }}">Export orders CSV</a>{% endif %}
+      <span class="muted">{{ total }} order(s)</span>
+    </div>
+  </div>
+  {% if orders %}
+  <div class="table-wrap"><table class="orders-table">
+    <thead>
+      <tr>
+        <th>Order</th>
+        {% if show_order_user_identity %}<th>User</th>{% endif %}
+        <th>Date</th><th>Product</th><th>Payment</th><th class="center-cell status-col">Status</th><th>Amount</th><th class="center-cell">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for order in orders %}
+      <tr>
+        <td><a href="{{ url_for('order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td>
+        {% if show_order_user_identity %}<td><a href="{{ url_for('user_detail', user_id=order.user_id) }}">{{ telegram_user_label(order.user_id, order.username) }}</a></td>{% endif %}
+        <td>{{ fmt_dt(order.created_at) }}</td>
+        <td>{{ order.product_name }} × {{ order.quantity }}</td>
+        <td>{{ method_label(order.payment_method) }}</td>
+        <td class="center-cell status-cell"><span class="{{ status_badge_class(order.display_status or order.status) }}">{{ status_label(order.display_status or order.status) }}</span></td>
+        <td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td>
+        <td class="center-cell order-action-cell">
+          {% if order.status == 'pending' and (order.display_status or order.status) == 'pending' %}
+            <form method="post" action="{{ url_for('expire_order_now', order_id=order.order_id, status=status, q=q) }}" data-confirm-order-action data-order-action="expire" data-order-ref="{{ order.order_id }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="danger small-button">Expire</button>
+            </form>
+          {% elif order.status == 'delivered' and order.get('items') and not order.get('delivery_revoked') %}
+            <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="next" value="{{ request.full_path }}">
+              <button type="submit" class="small-button">Resend</button>
+            </form>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted">No orders found.</p>{% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

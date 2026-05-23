@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Pending Stock Orders{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Pending Stock Orders</h1>
+    <p>Add stock for the product to auto-deliver oldest paid orders first.{% if not show_order_user_identity %} User IDs are hidden for orders managers.{% endif %}</p>
+  </div>
+</div>
+<section class="panel">
+{% if orders %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Order</th>{% if show_order_user_identity %}<th>User</th>{% endif %}<th>Date</th><th>Product</th><th>Quantity</th><th>Paid</th></tr></thead>
+  <tbody>
+  {% for order in orders %}
+    <tr><td><a href="{{ url_for('order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td>{% if show_order_user_identity %}<td><a href="{{ url_for('user_detail', user_id=order.user_id) }}">{{ telegram_user_label(order.user_id, order.username) }}</a></td>{% endif %}<td>{{ fmt_dt(order.created_at) }}</td><td>{{ order.product_name }}</td><td>{{ order.quantity }}</td><td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}<p class="muted">No paid orders are waiting for stock.</p>{% endif %}
+</section>
+{% endblock %}

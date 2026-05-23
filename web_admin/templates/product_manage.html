@@ -1,0 +1,512 @@
+{% extends "base.html" %}
+{% block title %}Manage Product{% endblock %}
+{% block content %}
+{% set can_edit_details = can_access('rename_product') %}
+<div class="page-header product-manage-page-header">
+  <div>
+    <h1>Manage product</h1>
+    <p><a href="{{ url_for('products') }}">← Back to products</a></p>
+  </div>
+  {% if can_access('resend_fresh_stock_notification') %}
+  <form method="post" action="{{ url_for('resend_fresh_stock_notification', name=product.name) }}" class="manual-stock-notify-form page-stock-notify-form" data-product-danger-confirm data-confirm-title="Resend fresh stock notification?" data-confirm-action="Send notification" data-confirm-message="This will send the fresh stock notification again for this product to users. Current available stock: {{ product.available_stock or 0 }}." data-confirm-button="Send notification" data-confirm-tone="primary">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="primary" type="submit" {% if (product.available_stock or 0) <= 0 or product.enabled is sameas false %}disabled{% endif %}>Resend fresh stock notification</button>
+    <small class="muted">Current available stock: <b>{{ product.available_stock or 0 }}</b></small>
+  </form>
+  {% endif %}
+</div>
+
+<section class="panel product-manage-header">
+  <div class="product-manage-title-block">
+    {% if can_edit_details %}
+    <form method="post" action="{{ url_for('rename_product', name=product.name) }}" class="product-name-inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label class="sr-only" for="product-name-inline">Product name</label>
+      <input id="product-name-inline" name="name" value="{{ product.name }}" required>
+      <button class="primary" type="submit">Save</button>
+    </form>
+    <p class="muted product-name-help">Edit the product name here. Pending stock orders and users' favorites are moved automatically.</p>
+    {% else %}
+    <h2>{{ product.name }}</h2>
+    <p class="muted product-name-help">Stock manager view: product details and prices are hidden. Only stock actions are available.</p>
+    {% endif %}
+    <p><span class="date-pill">{{ fmt_dt(product.created_at) }}</span></p>
+    {% if can_access('update_product_shop_order') %}
+    <form method="post" action="{{ url_for('update_product_shop_order', name=product.name) }}" class="display-position-inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="product-display-position">Display position</label>
+      <input id="product-display-position" name="shop_order" type="number" min="1" max="{{ product.total_product_positions or 1 }}" step="1" value="{{ product.current_shop_position or 1 }}" required>
+      <span class="position-total">of {{ product.total_product_positions or 1 }}</span>
+      <button class="primary" type="submit">Save</button>
+    </form>
+    {% endif %}
+  </div>
+  <div class="product-manage-side">
+    <div class="manage-stats">
+    {% if is_stock_manager_role %}
+    <div>
+      <span>Your visible stock</span>
+      {% if visible_stock_count <= 0 %}
+        <strong class="stock-number stock-zero">0</strong>
+      {% else %}
+        <strong class="stock-number stock-good">{{ visible_stock_count }}</strong>
+      {% endif %}
+    </div>
+    <div><span>Other stock</span><strong class="stock-hidden-summary">Hidden</strong></div>
+    <div><span>Access</span><strong>Stock only</strong></div>
+    {% else %}
+    <div>
+      <span>Available stock</span>
+      {% set stock_count = product.available_stock or 0 %}
+      {% if stock_count <= 0 %}
+        <strong class="stock-number stock-zero">0</strong>
+      {% elif stock_count < low_stock_threshold %}
+        <strong class="stock-number stock-low">{{ stock_count }}</strong>
+      {% else %}
+        <strong class="stock-number stock-good">{{ stock_count }}</strong>
+      {% endif %}
+    </div>
+    <div><span>Total stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    <div><span>Pending orders</span><strong>{{ product.pending_stock_quantity or 0 }}</strong></div>
+    {% endif %}
+  </div>
+  </div>
+</section>
+
+
+<section class="product-manage-grid">
+  {% if can_access('add_stock') %}
+  <div class="panel">
+    <h2>Add stock</h2>
+    <form method="post" action="{{ url_for('add_stock', name=product.name) }}" class="stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stock_upload_kind" value="normal">
+      <label>Stock items
+        <textarea id="normal-stock-items" name="items" rows="10" placeholder="item1&#10;---&#10;item2&#10;---&#10;username&#10;password"></textarea>
+      </label>
+      <button class="success" type="submit">Add stock</button>
+    </form>
+  </div>
+  <div class="panel replacement-stock-panel">
+    <h2>Add replacement stock</h2>
+    <form method="post" action="{{ url_for('add_stock', name=product.name) }}" class="stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="stock_upload_kind" value="replacement">
+      <label>Replacement stock items
+        <textarea name="items" rows="10" placeholder="replacement item 1&#10;---&#10;replacement item 2"></textarea>
+      </label>
+      <button class="success" type="submit">Add replacement stock</button>
+    </form>
+  </div>
+  {% endif %}
+
+  {% if can_access('remove_stock') %}
+  <div class="panel">
+    <h2>Remove stock</h2>
+    <form method="post" action="{{ url_for('remove_stock', name=product.name) }}" class="stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Exact stock item text
+        <textarea name="items" rows="10" placeholder="exact item text separated by ---"></textarea>
+      </label>
+      <button type="submit">Remove items</button>
+    </form>
+  </div>
+  {% endif %}
+
+
+  {% if can_access('add_stock') %}
+  <div class="panel stock-formatter-panel stock-formatter-wide">
+    <h2>Stock formatter</h2>
+    <p class="muted">Use mail format for email products, or simple codes/items for products that only need one code per item.</p>
+    <div class="stacked-form stock-formatter stock-formatter-layout" data-stock-formatter>
+      <label class="formatter-input-field"><span data-formatter-input-label>Emails, one per line</span>
+        <textarea id="formatter-items" rows="8" placeholder="user1@example.com&#10;user2@example.com&#10;user3@example.com"></textarea>
+      </label>
+      <div class="formatter-controls-field">
+        <label>Format type
+          <select id="formatter-mode">
+            <option value="mail">Mail + account pass + mail pass</option>
+            <option value="simple">Simple codes/items only</option>
+          </select>
+        </label>
+        <div class="formatter-pass-grid" data-formatter-pass-fields>
+          <label>Account pass
+            <input id="formatter-account-pass" type="text" placeholder="User@1234">
+          </label>
+          <label>Mail pass
+            <input id="formatter-mail-pass" type="text" placeholder="User@1234">
+          </label>
+        </div>
+        <div class="formatter-actions-row">
+          <button type="button" class="primary" data-generate-stock-format>Generate</button>
+          <button type="button" data-use-stock-format>Add to stock box</button>
+          <button type="button" data-copy-target="formatted-stock-output">Copy formatted stock</button>
+        </div>
+        <p class="formatter-status muted" data-stock-format-status>0 item(s) generated.</p>
+      </div>
+      <label class="formatter-preview-field">Formatted stock preview
+        <textarea id="formatted-stock-output" rows="8" readonly placeholder="Generated stock will appear here."></textarea>
+      </label>
+    </div>
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel current-stock-panel">
+  {% set current_stock = product.stock or [] %}
+  <div class="current-stock-header">
+    <div>
+      <h2>Current stock</h2>
+      {% if is_stock_manager_role %}
+        <p>You can view and copy only the stock items added by your admin account. Other stock is hidden.</p>
+      {% else %}
+        <p>These are the actual saved stock items/credentials/text currently available for this product.</p>
+      {% endif %}
+    </div>
+    {% if is_stock_manager_role %}
+      <span class="badge">{{ visible_stock_count }} visible{% if hidden_stock_count %} · {{ hidden_stock_count }} hidden{% endif %}</span>
+    {% else %}
+      <span class="badge">{{ current_stock|length }} item(s)</span>
+    {% endif %}
+  </div>
+
+  {% if current_stock %}
+    {% if visible_stock_text %}
+    <div class="stock-actions-row">
+      <button type="button" data-copy-target="current-stock-all">Copy visible stock</button>
+      <small class="muted">Only stock you can view is copied. Items are separated by <code>---</code>.</small>
+    </div>
+    <textarea id="current-stock-all" class="copy-source" readonly>{{ visible_stock_text|join('\n---\n') }}</textarea>
+    {% elif is_stock_manager_role %}
+      <p class="muted">No visible stock items were added by your admin account.</p>
+    {% endif %}
+    <div class="current-stock-list">
+      {% for row in stock_view_items %}
+        <article class="current-stock-item {{ 'current-stock-item-hidden' if not row.can_view else '' }}">
+          <div class="current-stock-item-header">
+            <strong>Stock #{{ row.number }}</strong>
+            {% if row.can_view %}<button type="button" class="copy-mini-button" data-copy-target="current-stock-item-{{ row.number }}">Copy</button>{% endif %}
+          </div>
+          {% if row.can_view %}
+            <pre id="current-stock-item-{{ row.number }}" class="current-stock-text">{{ row.text }}</pre>
+          {% else %}
+            <div class="current-stock-hidden-box">
+              <div class="blurred-lines" aria-hidden="true"><span></span><span></span><span></span></div>
+              <strong>Not added by you</strong>
+              <small>This stock item is hidden from stock-manager accounts.</small>
+            </div>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">No current stock items saved for this product.</p>
+  {% endif %}
+</section>
+
+{% if can_access('update_stock_manager_rates') %}
+<section class="panel stock-manager-rates-panel">
+  <h2>Stock manager settlement rates</h2>
+  <p class="muted">Owner-only rate used for the Stock Manager Dashboard. This value is saved on newly added stock items so manager earnings are calculated from stock added, not product sale price.</p>
+  <form method="post" action="{{ url_for('update_stock_manager_rates', name=product.name) }}" class="settings-grid compact-settings-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Manager earning per added stock
+      <div class="price-input-wrap"><input name="stock_manager_earning_rate_usdt" type="number" step="0.01" min="0" value="{{ '%.2f'|format(product.stock_manager_earning_rate_usdt or 0) }}"><span>USDT</span></div>
+    </label>
+    <div class="form-button-cell"><button class="primary" type="submit">Save rates</button></div>
+  </form>
+</section>
+{% endif %}
+
+{% if can_access('update_product_description') %}
+<section class="panel">
+  <h2>Product details</h2>
+  <p class="muted">These details are shown to users after they tap the product in the bot. Stock text is not changed.</p>
+  <form method="post" action="{{ url_for('update_product_description', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="product-details-warranty-row">
+      <label class="warranty-days-label" for="warranty-days-input">Warranty days</label>
+      <input id="warranty-days-input" class="warranty-days-input" name="warranty_days" type="number" min="0" step="1" value="{{ product.warranty_days or 0 }}" placeholder="28">
+      <p class="warranty-help-text muted">Set <b>0</b> to hide warranty from the bot product details. Example: <b>28 days</b>.</p>
+    </div>
+    <div class="bilingual-field-grid">
+      <label>English description
+        <textarea name="description_en" rows="6" placeholder="Write the English product details, notes, delivery info, etc.">{{ product.description_en or '' }}</textarea>
+      </label>
+      <label>Spanish description
+        <textarea name="description_es" rows="6" placeholder="Write the Spanish product details, notes, delivery info, etc.">{{ product.description_es or '' }}</textarea>
+      </label>
+    </div>
+    <button class="primary" type="submit">Save product details</button>
+  </form>
+</section>
+{% endif %}
+
+{% if can_access('update_product_limits') %}
+<section class="panel">
+  <h2>Order limits</h2>
+  <p class="muted">Set per-product order limits and the stock count that should trigger a low-stock warning. Buyers will not see order limits unless they enter a quantity outside the allowed range.</p>
+  <form method="post" action="{{ url_for('update_product_limits', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="settings-grid">
+      <label>Minimum quantity per order
+        <input name="min_order_quantity" type="number" min="1" step="1" value="{{ product.min_order_quantity or 1 }}">
+      </label>
+      <label>Maximum quantity per order
+        <input name="max_order_quantity" type="number" min="1" step="1" value="{{ product.max_order_quantity or 100 }}">
+      </label>
+      <label>Low-stock alert threshold
+        <input name="low_stock_threshold" type="number" min="1" step="1" value="{{ product.low_stock_threshold or low_stock_threshold }}">
+      </label>
+    </div>
+    <button class="primary" type="submit">Save order limits</button>
+  </form>
+</section>
+{% endif %}
+
+{% if can_access('clear_stock') or can_access('delete_product') %}
+<section class="panel danger-zone">
+    <h2>Danger zone</h2>
+    <p>Use these only when you are sure.</p>
+    {% if can_access('clear_stock') %}
+    <form method="post" action="{{ url_for('clear_stock', name=product.name) }}" class="stacked-form" data-product-danger-confirm data-confirm-title="Clear stock?" data-confirm-action="Clear all stock" data-confirm-message="This will remove all available stock saved for this product." data-confirm-button="Yes, clear stock">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger" type="submit">Clear stock</button>
+    </form>
+    {% endif %}
+    {% if can_access('delete_product') %}
+    <form method="post" action="{{ url_for('delete_product', name=product.name) }}" class="stacked-form" data-product-danger-confirm data-confirm-title="Delete product?" data-confirm-action="Delete product" data-confirm-message="This will permanently delete this product from the panel." data-confirm-button="Yes, delete product">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="danger" type="submit">Delete product</button>
+    </form>
+    {% endif %}
+</section>
+{% endif %}
+
+{% if can_access('clear_stock') or can_access('delete_product') or can_access('resend_fresh_stock_notification') %}
+<div id="product-danger-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-product-danger-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="product-danger-confirm-title">
+    <h3 id="product-danger-confirm-title">Confirm product action</h3>
+    <p id="product-danger-confirm-message" class="muted">Please confirm this product action.</p>
+    <div class="action-confirm-summary">
+      <div><span>Product</span><strong id="product-danger-confirm-product">{{ product.name }}</strong></div>
+      <div><span>Action</span><strong id="product-danger-confirm-action">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-product-danger-confirm>Cancel</button>
+      <button type="button" class="action-button danger" id="product-danger-confirm-submit">Confirm</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+
+{% block scripts %}
+<script>
+(function () {
+  function uniqueNonEmptyLines(value) {
+    const seen = new Set();
+    const rows = [];
+    (value || '').split(/\r?\n/).forEach(function (line) {
+      const trimmed = line.trim();
+      if (!trimmed || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      rows.push(trimmed);
+    });
+    return rows;
+  }
+
+  function getFormatterMode() {
+    const modeInput = document.getElementById('formatter-mode');
+    return modeInput ? modeInput.value : 'mail';
+  }
+
+  function updateFormatterModeUI() {
+    const mode = getFormatterMode();
+    const input = document.getElementById('formatter-items');
+    const inputLabel = document.querySelector('[data-formatter-input-label]');
+    const passFields = document.querySelector('[data-formatter-pass-fields]');
+    if (passFields) {
+      passFields.hidden = mode === 'simple';
+    }
+    if (inputLabel) {
+      inputLabel.textContent = mode === 'simple' ? 'Codes/items, one per line' : 'Emails, one per line';
+    }
+    if (input) {
+      input.placeholder = mode === 'simple'
+        ? 'CODE-1\nCODE-2\nCODE-3'
+        : 'user1@example.com\nuser2@example.com\nuser3@example.com';
+    }
+  }
+
+  function getFormattedStock() {
+    const itemsInput = document.getElementById('formatter-items');
+    const accountPassInput = document.getElementById('formatter-account-pass');
+    const mailPassInput = document.getElementById('formatter-mail-pass');
+    const preview = document.getElementById('formatted-stock-output');
+    const status = document.querySelector('[data-stock-format-status]');
+    if (!itemsInput || !preview) {
+      return '';
+    }
+
+    const mode = getFormatterMode();
+    const items = uniqueNonEmptyLines(itemsInput.value);
+    const accountPass = (accountPassInput?.value || '').trim();
+    const mailPass = (mailPassInput?.value || '').trim();
+    const needsPasses = mode === 'mail';
+    const missingPasses = needsPasses && Boolean(items.length && (!accountPass || !mailPass));
+    const formatted = mode === 'simple'
+      ? items.join('\n---\n')
+      : items.map(function (mail) {
+          return 'Mail:- ' + mail + '\nPass:- ' + accountPass + '\nMail Pass:- ' + mailPass;
+        }).join('\n---\n');
+
+    preview.value = formatted;
+    if (status) {
+      status.textContent = items.length + ' item(s) generated.' + (missingPasses ? ' Add both passes before submitting.' : '');
+      status.classList.toggle('warning', missingPasses);
+    }
+    return formatted;
+  }
+
+  function flashButton(button, text) {
+    const oldText = button.textContent;
+    if (!button.dataset.originalMinWidth) {
+      button.dataset.originalMinWidth = button.style.minWidth || '';
+    }
+    const currentWidth = button.getBoundingClientRect().width;
+    if (currentWidth) {
+      button.style.minWidth = Math.ceil(currentWidth) + 'px';
+    }
+    button.textContent = text;
+    setTimeout(function () {
+      button.textContent = oldText;
+      button.style.minWidth = button.dataset.originalMinWidth;
+    }, 1200);
+  }
+
+  updateFormatterModeUI();
+
+  document.addEventListener('input', function (event) {
+    if (event.target.closest('[data-stock-formatter]')) {
+      updateFormatterModeUI();
+      getFormattedStock();
+    }
+  });
+
+  document.addEventListener('change', function (event) {
+    if (event.target.closest('[data-stock-formatter]')) {
+      updateFormatterModeUI();
+      getFormattedStock();
+    }
+  });
+
+  let pendingProductDangerForm = null;
+
+  function closeProductDangerConfirm() {
+    const modal = document.getElementById('product-danger-confirm-modal');
+    if (modal) modal.hidden = true;
+    document.body.classList.remove('modal-open');
+    pendingProductDangerForm = null;
+  }
+
+  function openProductDangerConfirm(form) {
+    const modal = document.getElementById('product-danger-confirm-modal');
+    if (!modal) return false;
+    pendingProductDangerForm = form;
+    const title = document.getElementById('product-danger-confirm-title');
+    const message = document.getElementById('product-danger-confirm-message');
+    const action = document.getElementById('product-danger-confirm-action');
+    const submit = document.getElementById('product-danger-confirm-submit');
+    if (title) title.textContent = form.dataset.confirmTitle || 'Confirm product action';
+    if (message) message.textContent = form.dataset.confirmMessage || 'Please confirm this product action.';
+    if (action) action.textContent = form.dataset.confirmAction || 'Product action';
+    if (submit) {
+      submit.textContent = form.dataset.confirmButton || 'Confirm';
+      const tone = form.dataset.confirmTone === 'primary' ? 'primary' : 'danger';
+      submit.className = 'action-button ' + tone;
+    }
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
+  document.addEventListener('submit', function (event) {
+    const form = event.target.closest('[data-product-danger-confirm]');
+    if (!form || form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    openProductDangerConfirm(form);
+  });
+
+  document.addEventListener('keydown', function (event) {
+    const modal = document.getElementById('product-danger-confirm-modal');
+    if (event.key === 'Escape' && modal && !modal.hidden) {
+      closeProductDangerConfirm();
+    }
+  });
+
+  document.addEventListener('click', async function (event) {
+    if (event.target.hasAttribute('data-close-product-danger-confirm')) {
+      closeProductDangerConfirm();
+      return;
+    }
+
+    if (event.target.closest && event.target.closest('#product-danger-confirm-submit') && pendingProductDangerForm) {
+      const form = pendingProductDangerForm;
+      form.dataset.confirmed = '1';
+      closeProductDangerConfirm();
+      form.submit();
+      return;
+    }
+
+    const generateButton = event.target.closest('[data-generate-stock-format]');
+    if (generateButton) {
+      updateFormatterModeUI();
+      getFormattedStock();
+      flashButton(generateButton, 'Generated');
+      return;
+    }
+
+    const useButton = event.target.closest('[data-use-stock-format]');
+    if (useButton) {
+      const formatted = getFormattedStock();
+      const stockBox = document.getElementById('normal-stock-items');
+      const mode = getFormatterMode();
+      const accountPass = (document.getElementById('formatter-account-pass')?.value || '').trim();
+      const mailPass = (document.getElementById('formatter-mail-pass')?.value || '').trim();
+      if (!stockBox || !formatted) {
+        flashButton(useButton, 'Nothing to add');
+        return;
+      }
+      if (mode === 'mail' && (!accountPass || !mailPass)) {
+        flashButton(useButton, 'Add passes');
+        return;
+      }
+      const existing = stockBox.value.trim();
+      stockBox.value = existing ? existing + '\n---\n' + formatted : formatted;
+      stockBox.focus();
+      flashButton(useButton, 'Added');
+      return;
+    }
+
+    const button = event.target.closest('[data-copy-target]');
+    if (!button) return;
+    const target = document.getElementById(button.getAttribute('data-copy-target'));
+    if (!target) return;
+    if (target.id === 'formatted-stock-output') {
+      getFormattedStock();
+    }
+    const value = target.tagName === 'TEXTAREA' ? target.value : target.textContent;
+    try {
+      await navigator.clipboard.writeText(value || '');
+      flashButton(button, 'Copied');
+    } catch (error) {
+      flashButton(button, 'Copy failed');
+    }
+  });
+
+})();
+</script>
+{% endblock %}

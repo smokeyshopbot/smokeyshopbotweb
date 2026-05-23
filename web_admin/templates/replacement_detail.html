@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block title %}Replacement {{ report.report_id }}{% endblock %}
+{% block content %}
+{% set public_status = replacement_status_key(report.status) %}
+{% set approved = report.approved_at %}
+{% set report_items = replacement_report_items(report) %}
+{% set first_item = report_items[0] if report_items else {} %}
+{% set screenshot_url = url_for('telegram_file', file_id=report.screenshot_file_id) if report.screenshot_file_id and bot_token_configured else '' %}
+<div class="page-header page-header-left-action replacement-detail-header replacement-detail-top">
+  <div>
+    <a class="small-button secondary back-link-button" href="{{ url_for('replacements') }}">← Back to Replacements</a>
+    <h1>Replacement report</h1>
+    <p>Review the report and approve it to send replacement stock from current inventory.</p>
+  </div>
+  <span class="badge {{ replacement_status_badge_class(report.status) }} replacement-status-large">{{ replacement_status_label(report.status) }}</span>
+</div>
+
+<section class="panel replacement-info-card replacement-main-card replacement-merged-info-card">
+  <div class="panel-title-row compact-title-row">
+    <h2>Report information</h2>
+    <span class="badge {{ replacement_status_badge_class(report.status) }}">{{ replacement_status_label(report.status) }}</span>
+  </div>
+  <div class="replacement-info-grid replacement-merged-info-grid">
+    <div class="replacement-info-tile">
+      <span>Report ID</span>
+      <strong><code>{{ report.report_id }}</code></strong>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Report date</span>
+      <strong>{{ fmt_dt(report.created_at) }}</strong>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Product</span>
+      <strong>{{ replacement_products_label(report) }}</strong>
+      <small>{{ report_items|length }} reported item(s)</small>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Order</span>
+      <strong><code>{{ replacement_orders_label(report) }}</code></strong>
+      <small>Original order</small>
+    </div>
+    <div class="replacement-info-tile">
+      <span>User</span>
+      <strong>{{ telegram_user_label(report.user_id, report.username) }}</strong>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Delivered on</span>
+      <strong>{{ fmt_dt(first_item.sold_at or report.sold_at) }}</strong>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Stock added by</span>
+      <strong>{{ first_item.stock_added_by_username or report.stock_added_by_username or 'Unknown' }}</strong>
+      <small>{{ fmt_dt(first_item.stock_added_at or report.stock_added_at) }}</small>
+    </div>
+    <div class="replacement-info-tile">
+      <span>Current product stock</span>
+      <strong>{{ stock_count }} item(s)</strong>
+    </div>
+    {% if report.replacement_order_id %}
+    <div class="replacement-info-tile">
+      <span>Replacement order</span>
+      <strong><a href="{{ url_for('order_detail', order_id=report.replacement_order_id) }}">{{ report.replacement_order_id }}</a></strong>
+      <small>Available in Orders</small>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="replacement-detail-layout polished-replacement-layout">
+  <div class="panel replacement-info-card replacement-main-card replacement-issue-card">
+    <div class="panel-title-row compact-title-row">
+      <h2>Submitted issue</h2>
+    </div>
+    <div class="issue-box replacement-issue-box">{{ report.issue_text or 'No issue text submitted.' }}</div>
+  </div>
+
+  <div class="panel replacement-info-card replacement-main-card replacement-issue-card">
+    <div class="panel-title-row compact-title-row">
+      <h2>Submitted screenshot</h2>
+    </div>
+    {% if screenshot_url %}
+      <div class="replacement-screenshot-card">
+        <button type="button" class="proof-image-button replacement-screenshot-button" data-proof-fullscreen-image="{{ screenshot_url }}" aria-label="Open replacement screenshot fullscreen">
+          <img src="{{ screenshot_url }}" alt="Replacement report screenshot" class="proof-image replacement-screenshot-image">
+        </button>
+        <p class="proof-image-hint">Click the screenshot to view fullscreen.</p>
+      </div>
+    {% elif report.screenshot_file_id %}
+      <p class="muted no-screenshot-note">Screenshot file ID is saved, but bot token is not configured in WebAdmin.</p>
+    {% else %}
+      <p class="muted no-screenshot-note">No screenshot uploaded.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel reported-item-panel polished-reported-items">
+  <div class="panel-title-row compact-title-row">
+    <div>
+      <h2>Reported delivered item(s)</h2>
+      <p class="muted">Only the user submitted text and fetched delivered stock record are shown here.</p>
+    </div>
+  </div>
+  <div class="reported-items-list">
+    {% for item in report_items %}
+      <div class="reported-item-card clean-reported-item-card">
+        <div class="reported-item-pair clean-reported-pair">
+          <div>
+            <span>User submitted</span>
+            <pre class="stock-report-pre compact-stock-pre replacement-item-pre">{{ item.submitted_item or report.submitted_item or '-' }}</pre>
+          </div>
+          <div>
+            <span>Fetched delivered record</span>
+            <pre class="stock-report-pre compact-stock-pre replacement-item-pre">{{ item.delivered_item or report.delivered_item or '-' }}</pre>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel replacement-actions-panel polished-actions-panel">
+  <div class="panel-title-row">
+    <h2>Approve & send replacement</h2>
+    <span class="badge {{ replacement_status_badge_class(report.status) }}">{{ replacement_status_label(report.status) }}</span>
+  </div>
+
+  {% if public_status == 'replaced' %}
+    <p class="success-text">Replacement was sent on {{ fmt_dt(report.replacement_sent_at) }} by {{ report.replacement_sent_by or 'owner' }}.</p>
+    {% if report.replacement_order_id %}<p>Replacement order: <a href="{{ url_for('order_detail', order_id=report.replacement_order_id) }}"><code>{{ report.replacement_order_id }}</code></a></p>{% endif %}
+    {% if report.replacement_admin_note %}<p><strong>Admin note sent:</strong> {{ report.replacement_admin_note }}</p>{% endif %}
+    {% if report.replacement_items %}<pre class="stock-report-pre compact-stock-pre">{{ report.replacement_items|join('\n\n') }}</pre>{% elif report.replacement_item %}<pre class="stock-report-pre compact-stock-pre">{{ report.replacement_item }}</pre>{% endif %}
+  {% elif public_status == 'cancelled' %}
+    <p class="muted">This report is cancelled.</p>
+    {% if report.cancel_note or report.close_note %}<p><strong>Cancel note:</strong> {{ report.cancel_note or report.close_note }}</p>{% endif %}
+  {% else %}
+    <div class="replacement-action-grid">
+      {% if not approved %}
+        <div class="replacement-action-card primary-action-card">
+          <h3>Approve & send replacement</h3>
+          <form method="post" action="{{ url_for('approve_replacement_report', report_id=report.report_id) }}" class="stacked-form" data-confirm-replacement-action data-action-title="Approve and send replacement?" data-action-message="This will approve the report and send replacement stock immediately if stock is available." data-action-submit="Approve & send" data-report-id="{{ report.report_id }}" data-product="{{ replacement_products_label(report) }}" data-stock-count="{{ stock_count }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Optional text to send with replacement
+              <textarea name="admin_note" rows="3" placeholder="Example: Please check the replacement and contact support if needed."></textarea>
+            </label>
+            <button class="primary" type="submit">Approve & send replacement</button>
+          </form>
+        </div>
+      {% elif stock_count > 0 %}
+        <div class="replacement-action-card success-card primary-action-card">
+          <h3>Send approved replacement</h3>
+          <p class="success-text">This report is approved and stock is available.</p>
+          <form method="post" action="{{ url_for('send_report_replacement', report_id=report.report_id) }}" class="stacked-form" data-confirm-replacement-action data-action-title="Send replacement?" data-action-message="This will send replacement stock to the user and mark the report as replaced." data-action-submit="Send replacement" data-report-id="{{ report.report_id }}" data-product="{{ replacement_products_label(report) }}" data-stock-count="{{ stock_count }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Optional text to send with replacement
+              <textarea name="admin_note" rows="3" placeholder="Optional message for the user">{{ report.replacement_admin_note or '' }}</textarea>
+            </label>
+            <button class="success" type="submit">Send replacement</button>
+          </form>
+        </div>
+      {% else %}
+        <div class="replacement-action-card warning-card">
+          <h3>Approved — waiting for stock</h3>
+          <p class="warning">No stock is available right now. The replacement will be delivered automatically when stock is added.</p>
+          {% if report.replacement_admin_note %}<p><strong>Saved admin note:</strong> {{ report.replacement_admin_note }}</p>{% endif %}
+        </div>
+      {% endif %}
+
+      <div class="replacement-action-card">
+        <h3>Reject / cancel report</h3>
+        <form method="post" action="{{ url_for('close_replacement_report', report_id=report.report_id) }}" class="stacked-form close-report-form" data-confirm-replacement-action data-action-title="Cancel replacement report?" data-action-message="This will cancel the report and notify the user with the reason you entered." data-action-submit="Cancel report" data-report-id="{{ report.report_id }}" data-product="{{ replacement_products_label(report) }}" data-stock-count="{{ stock_count }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>Reason sent to user
+            <textarea name="note" rows="3" placeholder="Why this replacement request is rejected/cancelled"></textarea>
+          </label>
+          <button class="danger" type="submit">Cancel report</button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+</section>
+
+<div id="replacement-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-replacement-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="replacement-confirm-title">
+    <h3 id="replacement-confirm-title">Confirm action</h3>
+    <p class="muted" id="replacement-confirm-message">Please confirm this replacement action.</p>
+    <div class="action-confirm-summary">
+      <div><span>Report</span><strong id="replacement-confirm-report">-</strong></div>
+      <div><span>Product</span><strong id="replacement-confirm-product">-</strong></div>
+      <div><span>Stock available</span><strong id="replacement-confirm-stock">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-replacement-confirm>Cancel</button>
+      <button type="button" class="action-button success" id="replacement-confirm-submit">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="proof-image-fullscreen" class="proof-image-fullscreen" hidden>
+  <button type="button" class="proof-image-fullscreen-close" aria-label="Close fullscreen image" data-close-proof-image>&times;</button>
+  <img id="proof-image-fullscreen-img" src="" alt="Replacement screenshot fullscreen">
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  let pendingReplacementForm = null;
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value || '-';
+  }
+  function closeReplacementConfirm() {
+    const shell = document.getElementById('replacement-confirm-modal');
+    if (shell) shell.hidden = true;
+    pendingReplacementForm = null;
+    document.body.classList.remove('modal-open');
+  }
+  function openReplacementConfirm(form) {
+    const shell = document.getElementById('replacement-confirm-modal');
+    if (!shell) return false;
+    pendingReplacementForm = form;
+    setText('replacement-confirm-report', form.dataset.reportId);
+    setText('replacement-confirm-product', form.dataset.product);
+    setText('replacement-confirm-stock', form.dataset.stockCount);
+    const title = document.getElementById('replacement-confirm-title');
+    const message = document.getElementById('replacement-confirm-message');
+    const submit = document.getElementById('replacement-confirm-submit');
+    if (title) title.textContent = form.dataset.actionTitle || 'Confirm action';
+    if (message) message.textContent = form.dataset.actionMessage || 'Please confirm this replacement action.';
+    if (submit) submit.textContent = form.dataset.actionSubmit || 'Confirm';
+    if (submit) {
+      submit.classList.toggle('danger', (form.dataset.actionSubmit || '').toLowerCase().includes('cancel'));
+      submit.classList.toggle('success', !(form.dataset.actionSubmit || '').toLowerCase().includes('cancel'));
+    }
+    shell.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+  document.addEventListener('submit', function (event) {
+    const form = event.target.closest && event.target.closest('[data-confirm-replacement-action]');
+    if (!form || form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!openReplacementConfirm(form)) {
+      form.dataset.confirmed = '1';
+      form.submit();
+    }
+  });
+  document.addEventListener('click', function (event) {
+    if (event.target.closest && event.target.closest('#replacement-confirm-submit') && pendingReplacementForm) {
+      const form = pendingReplacementForm;
+      form.dataset.confirmed = '1';
+      closeReplacementConfirm();
+      form.submit();
+      return;
+    }
+    if (event.target.hasAttribute && event.target.hasAttribute('data-close-replacement-confirm')) {
+      closeReplacementConfirm();
+    }
+  });
+})();
+</script>
+{% endblock %}

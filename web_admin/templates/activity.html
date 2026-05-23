@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Activity Log{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Activity Log</h1><p>Recent admin and automation actions.</p></div></div>
+<section class="panel">
+  {% if rows %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead>
+      <tbody>
+      {% for row in rows %}
+        <tr>
+          <td>{{ fmt_dt(row.created_at) }}</td>
+          <td><strong>{{ row.action }}</strong></td>
+          <td>{{ row.details }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No activity recorded yet.</p>
+  {% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

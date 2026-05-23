@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Admin Panel{% endblock %} · Telegram Shop Bot</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20260519_hardening_v1">
+</head>
+<body>
+  {% if session.get('admin_logged_in') %}
+  <header class="mobile-topbar" data-mobile-topbar>
+    <button type="button" class="mobile-nav-toggle" data-mobile-nav-toggle aria-expanded="false" aria-controls="admin-sidebar-nav">☰ Menu</button>
+    <div class="mobile-topbar-title">🛍 Shop Admin</div>
+  </header>
+  <div class="sidebar-overlay" data-sidebar-overlay hidden></div>
+  <aside class="sidebar" data-sidebar>
+    <div class="sidebar-top">
+      <div class="brand">🛍 Shop Admin</div>
+      <button type="button" class="mobile-nav-toggle" data-mobile-nav-close aria-expanded="false" aria-controls="admin-sidebar-nav">✕ Close</button>
+    </div>
+    <nav id="admin-sidebar-nav">
+      {% if can_access('dashboard') %}<a href="{{ url_for('dashboard') }}">Dashboard</a>{% endif %}
+      {% if current_admin_role == 'stock_manager' and can_access('stock_manager_dashboard') %}<a href="{{ url_for('stock_manager_dashboard') }}">My Stock Dashboard</a>{% endif %}
+      {% if can_access('products') %}
+      <a href="{{ url_for('products') }}" class="nav-with-badge" data-stock-alert-link>
+        <span>Products & Stock</span>
+        {% if current_admin_role == 'owner' and product_stock_alert.count %}<span class="nav-badge stock-alert-{{ product_stock_alert.severity }}" title="{{ product_stock_alert.out_of_stock }} out of stock, {{ product_stock_alert.low_stock }} low stock">{{ product_stock_alert.count }}</span>{% endif %}
+      </a>
+      {% endif %}
+      {% if can_access('users') %}<a href="{{ url_for('users') }}">Users</a>{% endif %}
+      {% if can_access('orders') %}<a href="{{ url_for('orders') }}">Recent Orders</a>{% endif %}
+      {% if can_access('replacement_orders') %}<a href="{{ url_for('replacement_orders') }}">Recent Replacements</a>{% endif %}
+      {% if can_access('pending_orders') %}
+      <a href="{{ url_for('pending_orders') }}" class="nav-with-badge">
+        <span>Pending Stock Orders</span>
+        {% if pending_stock_order_count %}<span class="nav-badge">{{ pending_stock_order_count }}</span>{% endif %}
+      </a>
+      {% endif %}
+      {% if can_access('payments') %}
+      <a href="{{ url_for('payments') }}" class="nav-with-badge">
+        <span>Payment Reviews</span>
+        {% if pending_payment_review_count %}<span class="nav-badge">{{ pending_payment_review_count }}</span>{% endif %}
+      </a>
+      {% endif %}
+      {% if can_access('replacements') %}
+      <a href="{{ url_for('replacements') }}" class="nav-with-badge">
+        <span>Replacements</span>
+        {% if pending_replacement_report_count %}<span class="nav-badge">{{ pending_replacement_report_count }}</span>{% endif %}
+      </a>
+      {% endif %}
+      {% if can_access('admins_panel') %}
+      <a href="{{ url_for('admins_panel') }}" class="nav-with-badge">
+        <span>Admins</span>
+        {% if pending_payout_request_count %}<span class="nav-badge">{{ pending_payout_request_count }}</span>{% endif %}
+      </a>
+      {% endif %}
+      {% if can_access('payment_settings_form') %}<a href="{{ url_for('payment_settings_form') }}">Payment Settings</a>{% endif %}
+      {% if can_access('secret_settings_form') %}<a href="{{ url_for('secret_settings_form') }}">Secret Settings</a>{% endif %}
+      {% if can_access('system_health') %}<a href="{{ url_for('system_health') }}">System Health</a>{% endif %}
+      {% if can_access('ranking') %}<a href="{{ url_for('ranking') }}">Buyer Ranking</a>{% endif %}
+      {% if can_access('activity_log') %}<a href="{{ url_for('activity_log') }}">Activity Log</a>{% endif %}
+      {% if can_access('broadcast_form') %}<a href="{{ url_for('broadcast_form') }}">Broadcast</a>{% endif %}
+      {% if can_access('help_page') %}<a href="{{ url_for('help_page') }}">Admin Map</a>{% endif %}
+    </nav>
+    <form method="post" action="{{ url_for('logout') }}" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="link-button">Logout</button>
+    </form>
+    <div class="sidebar-note">
+      <div>Role: {{ admin_role_labels.get(current_admin_role, current_admin_role) }}</div>
+      <div>{% if bot_token_configured %}Bot API: connected{% else %}Bot API: not configured{% endif %}</div>
+    </div>
+  </aside>
+  {% endif %}
+
+  <main class="main {% if not session.get('admin_logged_in') %}main-centered{% endif %}">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-wrap">
+          {% for category, message in messages %}
+            <div class="flash {{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    <div id="live-page-content">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+
+  {% if session.get('admin_logged_in') %}
+  <div id="order-action-confirm-modal" class="action-confirm-shell" hidden>
+    <div class="action-confirm-backdrop" data-close-order-action-confirm></div>
+    <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="order-action-confirm-title">
+      <h3 id="order-action-confirm-title">Confirm order action</h3>
+      <p id="order-action-confirm-message" class="muted">Please confirm this order action.</p>
+      <div class="action-confirm-summary">
+        <div><span>Order</span><strong id="order-action-confirm-ref">-</strong></div>
+        <div><span>Action</span><strong id="order-action-confirm-kind">-</strong></div>
+      </div>
+      <div class="action-confirm-buttons">
+        <button type="button" class="secondary-button" data-close-order-action-confirm>Cancel</button>
+        <button type="button" class="action-button primary" id="order-action-confirm-submit">Confirm</button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+  {% block scripts %}{% endblock %}
+  {% if session.get('admin_logged_in') %}
+  <script>
+  (function () {
+    const LIVE_PATHS = new Set(['/', '/products', '/orders', '/replacement-orders', '/pending-orders', '/payments', '/admins', '/replacements', '/ranking']);
+    const STATE_URL = '{{ url_for("live_state") }}';
+    const STATE_REFRESH_MS = {{ live_state_refresh_ms or 15000 }};
+    const PAGE_REFRESH_DEBOUNCE_MS = 1500;
+    const REQUEST_TIMEOUT_MS = 9000;
+    const originalTitle = document.title;
+    const OWNER_LIVE_NOTIFICATIONS = {{ 'true' if current_admin_role == 'owner' else 'false' }};
+    const LIVE_FULL_REFRESH_ENABLED = {{ 'true' if live_full_refresh_enabled else 'false' }};
+
+    let stateRunning = false;
+    let pageRunning = false;
+    let stateTimer = null;
+    let pageRefreshTimer = null;
+    let lastSignature = sessionStorage.getItem('adminLiveSignature') || '';
+    let lastCounts = readJson(sessionStorage.getItem('adminLiveCounts')) || null;
+    let pauseRefreshUntil = 0;
+    let liveStarted = false;
+
+    function readJson(value) {
+      try { return value ? JSON.parse(value) : null; } catch (_) { return null; }
+    }
+
+
+    function setupMobileNav() {
+      const sidebar = document.querySelector('[data-sidebar]');
+      const toggles = Array.from(document.querySelectorAll('[data-mobile-nav-toggle]'));
+      const closeButtons = Array.from(document.querySelectorAll('[data-mobile-nav-close]'));
+      const overlay = document.querySelector('[data-sidebar-overlay]');
+      if (!sidebar || !toggles.length) return;
+
+      const setNavOpen = (isOpen) => {
+        sidebar.classList.toggle('nav-open', isOpen);
+        document.body.classList.toggle('sidebar-open', isOpen);
+        toggles.concat(closeButtons).forEach((button) => {
+          button.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        });
+        if (overlay) overlay.hidden = !isOpen;
+      };
+
+      const closeNav = () => setNavOpen(false);
+      toggles.forEach((toggle) => {
+        toggle.addEventListener('click', () => {
+          setNavOpen(!sidebar.classList.contains('nav-open'));
+        });
+      });
+      closeButtons.forEach((button) => {
+        button.addEventListener('click', closeNav);
+      });
+      if (overlay) overlay.addEventListener('click', closeNav);
+      sidebar.querySelectorAll('nav a').forEach((link) => {
+        link.addEventListener('click', closeNav);
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeNav();
+      });
+      window.addEventListener('resize', () => {
+        if (window.innerWidth > 980) closeNav();
+      });
+    }
+
+    function pageCanLiveRefresh() {
+      return LIVE_PATHS.has(window.location.pathname);
+    }
+
+    function contentCanSwap(container) {
+      if (!pageCanLiveRefresh()) return false;
+      if (Date.now() < pauseRefreshUntil) return false;
+      if (document.body.classList.contains('modal-open')) return false;
+      const active = document.activeElement;
+      if (active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) return false;
+      // Buttons should not permanently block refreshes. Only skip while a form is actively being submitted/confirmed.
+      if (active && active.closest && active.closest('[data-confirm-payment-action]')) return false;
+      if (active && active.closest && active.closest('[data-confirm-order-action]')) return false;
+      if (tableIsHorizontallyScrolled(container)) return false;
+      return true;
+    }
+
+    function tableIsHorizontallyScrolled(container) {
+      const scope = container || document;
+      return Array.from(scope.querySelectorAll('.table-wrap')).some((el) => el.scrollLeft > 2);
+    }
+
+    function rememberScrollState(container) {
+      return {
+        windowX: window.scrollX,
+        windowY: window.scrollY,
+        tables: Array.from(container.querySelectorAll('.table-wrap')).map((el, index) => ({
+          index,
+          left: el.scrollLeft,
+          top: el.scrollTop
+        }))
+      };
+    }
+
+    function restoreScrollState(container, state) {
+      if (!state) return;
+      const apply = () => {
+        const tableWraps = Array.from(container.querySelectorAll('.table-wrap'));
+        state.tables.forEach((saved) => {
+          const el = tableWraps[saved.index];
+          if (el) {
+            el.scrollLeft = saved.left;
+            el.scrollTop = saved.top;
+          }
+        });
+        window.scrollTo(state.windowX, state.windowY);
+      };
+      apply();
+      requestAnimationFrame(() => requestAnimationFrame(apply));
+      setTimeout(apply, 80);
+    }
+
+    function syncBadgesFromDoc(newDoc) {
+      const currentLinks = document.querySelectorAll('.sidebar nav a.nav-with-badge');
+      const newLinks = newDoc.querySelectorAll('.sidebar nav a.nav-with-badge');
+      currentLinks.forEach((link, index) => {
+        if (newLinks[index]) link.innerHTML = newLinks[index].innerHTML;
+      });
+    }
+
+    function syncBadgesFromState(state) {
+      if (!state || !state.counts) return;
+      const pendingStock = Number(state.counts.orders_pending_stock || 0);
+      const reviews = Number(state.counts.payment_reviews || 0);
+      const stockAlerts = OWNER_LIVE_NOTIFICATIONS ? Number(state.counts.product_stock_alerts || 0) : 0;
+      const payoutRequests = Number(state.counts.stock_manager_payout_requests || 0);
+      const replacementReports = Number(state.counts.replacement_reports_pending || 0);
+      const stockInfo = state.stock_alert || {};
+      const stockSeverity = stockInfo.severity || (Number(state.counts.products_out_of_stock || 0) > 0 ? 'danger' : (stockAlerts > 0 ? 'warning' : ''));
+      const stockTitle = Number(stockInfo.out_of_stock || 0) + ' out of stock, ' + Number(stockInfo.low_stock || 0) + ' low stock';
+      const productsLink = document.querySelector('a[href="{{ url_for("products") }}"]');
+      const pendingLink = document.querySelector('a[href="{{ url_for("pending_orders") }}"]');
+      const paymentsLink = document.querySelector('a[href="{{ url_for("payments") }}"]');
+      const adminsLink = document.querySelector('a[href="{{ url_for("admins_panel") }}"]');
+      const replacementsLink = document.querySelector('a[href="{{ url_for("replacements") }}"]');
+      setNavBadge(productsLink, stockAlerts, stockSeverity ? 'stock-alert-' + stockSeverity : '', stockTitle);
+      setNavBadge(pendingLink, pendingStock);
+      setNavBadge(paymentsLink, reviews);
+      setNavBadge(adminsLink, payoutRequests);
+      setNavBadge(replacementsLink, replacementReports);
+      const visibleImportant = OWNER_LIVE_NOTIFICATIONS ? ((productsLink ? stockAlerts : 0) + (pendingLink ? pendingStock : 0) + (paymentsLink ? reviews : 0) + (adminsLink ? payoutRequests : 0) + (replacementsLink ? replacementReports : 0)) : 0;
+      updateTitle(visibleImportant);
+    }
+
+    function setNavBadge(link, count, variantClass, title) {
+      if (!link) return;
+      let badge = link.querySelector('.nav-badge');
+      if (count > 0) {
+        if (!badge) {
+          badge = document.createElement('span');
+          link.appendChild(badge);
+        }
+        badge.className = 'nav-badge' + (variantClass ? ' ' + variantClass : '');
+        badge.textContent = String(count);
+        if (title) {
+          badge.setAttribute('title', title);
+        } else {
+          badge.removeAttribute('title');
+        }
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+
+    function updateTitle(totalImportant) {
+      if (totalImportant > 0) {
+        document.title = '(' + totalImportant + ') ' + originalTitle;
+      } else {
+        document.title = originalTitle;
+      }
+    }
+
+    function ensureToastShell() {
+      let shell = document.getElementById('admin-live-toast-wrap');
+      if (!shell) {
+        shell = document.createElement('div');
+        shell.id = 'admin-live-toast-wrap';
+        shell.setAttribute('aria-live', 'polite');
+        document.body.appendChild(shell);
+      }
+      return shell;
+    }
+
+    function showLiveToast(message) {
+      const shell = ensureToastShell();
+      const toast = document.createElement('div');
+      toast.className = 'admin-live-toast';
+      toast.textContent = message;
+      shell.appendChild(toast);
+      setTimeout(() => { toast.classList.add('hide'); }, 4500);
+      setTimeout(() => { toast.remove(); }, 5200);
+    }
+
+    function notifyBrowser(message) {
+      if (!OWNER_LIVE_NOTIFICATIONS) return;
+      showLiveToast(message);
+      try {
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('Shop Admin', { body: message });
+        }
+      } catch (_) {}
+    }
+
+    function requestNotificationPermissionOnce() {
+      if (!OWNER_LIVE_NOTIFICATIONS) return;
+      try {
+        if (!('Notification' in window)) return;
+        if (Notification.permission !== 'default') return;
+        if (localStorage.getItem('adminLiveNotificationAsked') === '1') return;
+        localStorage.setItem('adminLiveNotificationAsked', '1');
+        Notification.requestPermission().catch(() => {});
+      } catch (_) {}
+    }
+
+    function describeChange(prevCounts, nextCounts) {
+      if (!OWNER_LIVE_NOTIFICATIONS || !prevCounts || !nextCounts) return '';
+      const prevReviews = Number(prevCounts.payment_reviews || 0);
+      const nextReviews = Number(nextCounts.payment_reviews || 0);
+      if (nextReviews > prevReviews) {
+        return 'New payment review received (' + nextReviews + ' pending).';
+      }
+      const prevReplacements = Number(prevCounts.replacement_reports_pending || 0);
+      const nextReplacements = Number(nextCounts.replacement_reports_pending || 0);
+      if (nextReplacements > prevReplacements) {
+        return 'New replacement report received (' + nextReplacements + ' pending).';
+      }
+      const prevPayouts = Number(prevCounts.stock_manager_payout_requests || 0);
+      const nextPayouts = Number(nextCounts.stock_manager_payout_requests || 0);
+      if (nextPayouts > prevPayouts) {
+        return 'New stock manager payout request (' + nextPayouts + ' pending).';
+      }
+      const prevStock = Number(prevCounts.orders_pending_stock || 0);
+      const nextStock = Number(nextCounts.orders_pending_stock || 0);
+      if (nextStock > prevStock) {
+        return 'New paid order waiting for stock (' + nextStock + ' pending).';
+      }
+      const prevOutOfStock = Number(prevCounts.products_out_of_stock || 0);
+      const nextOutOfStock = Number(nextCounts.products_out_of_stock || 0);
+      if (nextOutOfStock > prevOutOfStock) {
+        return 'Product stock is out on ' + nextOutOfStock + ' enabled product(s).';
+      }
+      const prevLowStock = Number(prevCounts.products_low_stock || 0);
+      const nextLowStock = Number(nextCounts.products_low_stock || 0);
+      if (nextLowStock > prevLowStock) {
+        return 'Low stock alert on ' + nextLowStock + ' enabled product(s).';
+      }
+      const prevStockAlerts = Number(prevCounts.product_stock_alerts || 0);
+      const nextStockAlerts = Number(nextCounts.product_stock_alerts || 0);
+      if (prevStockAlerts > 0 && nextStockAlerts === 0) {
+        return 'Product stock is back to okay.';
+      }
+      const prevOrders = Number(prevCounts.orders_total || 0);
+      const nextOrders = Number(nextCounts.orders_total || 0);
+      if (nextOrders > prevOrders) {
+        return 'New order received.';
+      }
+      const prevDelivered = Number(prevCounts.orders_delivered || 0);
+      const nextDelivered = Number(nextCounts.orders_delivered || 0);
+      if (nextDelivered > prevDelivered) {
+        return 'Order delivered automatically.';
+      }
+      return '';
+    }
+
+    function schedulePageRefresh(immediate) {
+      if (!LIVE_FULL_REFRESH_ENABLED) return;
+      if (!pageCanLiveRefresh()) return;
+      if (pageRefreshTimer) clearTimeout(pageRefreshTimer);
+      pageRefreshTimer = setTimeout(refreshLivePage, immediate ? 0 : PAGE_REFRESH_DEBOUNCE_MS);
+    }
+
+    async function fetchWithTimeout(url, options) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        return await fetch(url, Object.assign({}, options || {}, { signal: controller.signal }));
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function refreshLivePage() {
+      if (pageRunning || !pageCanLiveRefresh()) return;
+      const currentContent = document.getElementById('live-page-content');
+      if (!currentContent || !contentCanSwap(currentContent)) return;
+      pageRunning = true;
+      try {
+        const response = await fetchWithTimeout(window.location.href, {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { 'X-Admin-Live-Refresh': '1' }
+        });
+        if (!response.ok) return;
+        const html = await response.text();
+        const nextDoc = new DOMParser().parseFromString(html, 'text/html');
+        syncBadgesFromDoc(nextDoc);
+        const nextContent = nextDoc.getElementById('live-page-content');
+        if (nextContent && contentCanSwap(currentContent)) {
+          const scrollState = rememberScrollState(currentContent);
+          currentContent.innerHTML = nextContent.innerHTML;
+          restoreScrollState(currentContent, scrollState);
+        }
+      } catch (_) {
+        // Keep the current page stable if a refresh request fails or is aborted.
+      } finally {
+        pageRunning = false;
+      }
+    }
+
+    async function pollLiveState() {
+      if (stateRunning || document.hidden || !navigator.onLine) {
+        scheduleNextStatePoll();
+        return;
+      }
+      stateRunning = true;
+      try {
+        const response = await fetchWithTimeout(STATE_URL, {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { 'Accept': 'application/json' }
+        });
+        if (!response.ok) return;
+        const state = await response.json();
+        if (!state || !state.ok) return;
+        syncBadgesFromState(state);
+        const changed = lastSignature && state.signature && state.signature !== lastSignature;
+        const changeMessage = changed ? describeChange(lastCounts, state.counts) : '';
+        if (changeMessage) notifyBrowser(changeMessage);
+        if (changed) schedulePageRefresh(false);
+        lastSignature = state.signature || '';
+        lastCounts = state.counts || null;
+        sessionStorage.setItem('adminLiveSignature', lastSignature);
+        sessionStorage.setItem('adminLiveCounts', JSON.stringify(lastCounts || {}));
+      } catch (_) {
+        // Next poll retries. AbortController prevents a stuck request from stopping future polls.
+      } finally {
+        stateRunning = false;
+        scheduleNextStatePoll();
+      }
+    }
+
+    function scheduleNextStatePoll() {
+      if (stateTimer) clearTimeout(stateTimer);
+      stateTimer = setTimeout(pollLiveState, STATE_REFRESH_MS);
+    }
+
+    function startLiveUpdates() {
+      if (liveStarted) return;
+      liveStarted = true;
+      requestNotificationPermissionOnce();
+      pollLiveState();
+      if (pageCanLiveRefresh()) schedulePageRefresh(true);
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        pollLiveState();
+        schedulePageRefresh(true);
+      }
+    });
+    window.addEventListener('focus', () => {
+      pollLiveState();
+      schedulePageRefresh(true);
+    });
+    window.addEventListener('pageshow', () => {
+      pollLiveState();
+      schedulePageRefresh(true);
+    });
+    window.addEventListener('online', () => {
+      pollLiveState();
+      schedulePageRefresh(true);
+    });
+
+    document.addEventListener('pointerdown', (event) => {
+      if (event.target.closest && event.target.closest('.table-wrap')) {
+        pauseRefreshUntil = Date.now() + 2500;
+      }
+    });
+
+    document.addEventListener('scroll', (event) => {
+      if (event.target && event.target.classList && event.target.classList.contains('table-wrap')) {
+        pauseRefreshUntil = Date.now() + 3500;
+      }
+    }, true);
+
+    let pendingActionForm = null;
+    let pendingOrderActionForm = null;
+
+    function closeOrderActionConfirm() {
+      const shell = document.getElementById('order-action-confirm-modal');
+      if (shell) shell.hidden = true;
+      pendingOrderActionForm = null;
+      document.body.classList.remove('modal-open');
+    }
+
+    function openOrderActionConfirm(form) {
+      const shell = document.getElementById('order-action-confirm-modal');
+      const submitButton = document.getElementById('order-action-confirm-submit');
+      const title = document.getElementById('order-action-confirm-title');
+      const message = document.getElementById('order-action-confirm-message');
+      const ref = document.getElementById('order-action-confirm-ref');
+      const kind = document.getElementById('order-action-confirm-kind');
+      if (!shell || !submitButton || !title || !message) return false;
+
+      pendingOrderActionForm = form;
+      const action = (form.dataset.orderAction || '').toLowerCase();
+      const orderRef = form.dataset.orderRef || 'this order';
+      const isExpire = action === 'expire';
+      const isResend = action === 'resend';
+      const isRevoke = action === 'revoke';
+      const isTransfer = action === 'transfer';
+      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : 'Confirm')));
+
+      title.textContent = isRevoke
+        ? 'Delete Telegram file and revoke?'
+        : (isTransfer ? 'Transfer revoked delivery?' : (label + ' order?'));
+      message.textContent = isExpire
+        ? 'This will expire pending order ' + orderRef + '.'
+        : (isRevoke
+          ? 'This will try to delete the sent Telegram file/message for order ' + orderRef + ' and disable /getorder refetch. Telegram may refuse deletion after about 48 hours.'
+          : (isTransfer
+            ? 'This will send the exact revoked stock/items from ' + orderRef + ' to the corrected user and create a new delivery history record.'
+            : 'This will resend the delivered product for order ' + orderRef + ' to the user.'));
+      submitButton.textContent = label;
+      submitButton.classList.toggle('danger', isExpire || isRevoke);
+      submitButton.classList.toggle('primary', !(isExpire || isRevoke));
+      if (ref) ref.textContent = orderRef;
+      if (kind) kind.textContent = label;
+
+      shell.hidden = false;
+      document.body.classList.add('modal-open');
+      return true;
+    }
+
+    function requestOrderActionConfirm(form) {
+      if (!form || form.dataset.confirmed === '1') return false;
+      if (!openOrderActionConfirm(form)) {
+        form.dataset.confirmed = '1';
+        form.submit();
+      }
+      return true;
+    }
+
+
+    function closePaymentActionConfirm() {
+      const shell = document.getElementById('payment-action-confirm-modal');
+      if (shell) shell.hidden = true;
+      pendingActionForm = null;
+      document.body.classList.remove('modal-open');
+    }
+
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value || '-';
+    }
+
+    function openPaymentActionConfirm(form) {
+      const shell = document.getElementById('payment-action-confirm-modal');
+      const submitButton = document.getElementById('action-confirm-submit');
+      const title = document.getElementById('action-confirm-title');
+      const message = document.getElementById('action-confirm-message');
+      if (!shell || !submitButton || !title || !message) return false;
+
+      pendingActionForm = form;
+      const action = (form.dataset.confirmAction || '').toLowerCase();
+      const isApprove = action === 'approve';
+      const actionLabel = isApprove ? 'Approve' : 'Reject';
+
+      title.textContent = actionLabel + ' payment request?';
+      message.textContent = isApprove
+        ? 'This will approve the submitted proof and complete the payment flow.'
+        : 'This will reject the submitted proof. The user may need to submit payment proof again.';
+      submitButton.textContent = 'Yes, ' + actionLabel.toLowerCase();
+      submitButton.classList.toggle('success', isApprove);
+      submitButton.classList.toggle('danger', !isApprove);
+
+      setText('action-confirm-ref', form.dataset.confirmRef);
+      setText('action-confirm-user', form.dataset.confirmUser);
+      setText('action-confirm-type', form.dataset.confirmType);
+      setText('action-confirm-method', form.dataset.confirmMethod);
+      setText('action-confirm-amount', form.dataset.confirmAmount);
+
+      shell.hidden = false;
+      document.body.classList.add('modal-open');
+      return true;
+    }
+
+    function requestPaymentActionConfirm(form) {
+      if (!form || form.dataset.confirmed === '1') return false;
+      if (!openPaymentActionConfirm(form)) {
+        form.dataset.confirmed = '1';
+        form.submit();
+      }
+      return true;
+    }
+
+    document.addEventListener('submit', (event) => {
+      const form = event.target.closest && event.target.closest('[data-confirm-order-action]');
+      if (!form || form.dataset.confirmed === '1') return;
+      event.preventDefault();
+      requestOrderActionConfirm(form);
+    });
+
+    document.addEventListener('submit', (event) => {
+      const form = event.target.closest && event.target.closest('[data-confirm-payment-action]');
+      if (!form || form.dataset.confirmed === '1') return;
+      event.preventDefault();
+      requestPaymentActionConfirm(form);
+    });
+
+    document.addEventListener('click', (event) => {
+      const orderButton = event.target.closest && event.target.closest('[data-confirm-order-action] button[type="submit"]');
+      if (orderButton) {
+        const form = orderButton.closest('[data-confirm-order-action]');
+        if (form && form.dataset.confirmed !== '1') {
+          event.preventDefault();
+          requestOrderActionConfirm(form);
+          return;
+        }
+      }
+
+      const orderConfirmSubmit = event.target.closest && event.target.closest('#order-action-confirm-submit');
+      if (orderConfirmSubmit && pendingOrderActionForm) {
+        const form = pendingOrderActionForm;
+        form.dataset.confirmed = '1';
+        closeOrderActionConfirm();
+        form.submit();
+        return;
+      }
+      if (event.target.hasAttribute('data-close-order-action-confirm')) {
+        closeOrderActionConfirm();
+        return;
+      }
+
+      const paymentButton = event.target.closest && event.target.closest('[data-confirm-payment-action] button[type="submit"]');
+      if (paymentButton) {
+        const form = paymentButton.closest('[data-confirm-payment-action]');
+        if (form && form.dataset.confirmed !== '1') {
+          event.preventDefault();
+          requestPaymentActionConfirm(form);
+          return;
+        }
+      }
+
+      const confirmSubmit = event.target.closest && event.target.closest('#action-confirm-submit');
+      if (confirmSubmit && pendingActionForm) {
+        const form = pendingActionForm;
+        form.dataset.confirmed = '1';
+        closePaymentActionConfirm();
+        form.submit();
+        return;
+      }
+      if (event.target.hasAttribute('data-close-action-confirm')) {
+        closePaymentActionConfirm();
+        return;
+      }
+    });
+
+    document.addEventListener('click', (event) => {
+      const proofButton = event.target.closest('[data-proof-target]');
+      if (proofButton) {
+        const shell = document.getElementById('proof-modal');
+        const body = document.getElementById('proof-modal-body');
+        const source = document.getElementById(proofButton.getAttribute('data-proof-target'));
+        if (shell && body && source) {
+          body.innerHTML = source.innerHTML;
+          shell.hidden = false;
+          document.body.classList.add('modal-open');
+        }
+      }
+      const fullscreenProofImage = event.target.closest && event.target.closest('[data-proof-fullscreen-image]');
+      if (fullscreenProofImage) {
+        const shell = document.getElementById('proof-image-fullscreen');
+        const img = document.getElementById('proof-image-fullscreen-img');
+        if (shell && img) {
+          img.src = fullscreenProofImage.getAttribute('data-proof-fullscreen-image') || '';
+          shell.hidden = false;
+          document.body.classList.add('modal-open');
+        }
+        return;
+      }
+      if (event.target.hasAttribute('data-close-proof-image') || (event.target.id === 'proof-image-fullscreen')) {
+        const shell = document.getElementById('proof-image-fullscreen');
+        const img = document.getElementById('proof-image-fullscreen-img');
+        if (shell) shell.hidden = true;
+        if (img) img.src = '';
+        const proofShell = document.getElementById('proof-modal');
+        if (!proofShell || proofShell.hidden) document.body.classList.remove('modal-open');
+        return;
+      }
+      if (event.target.hasAttribute('data-close-proof-modal')) {
+        const imageShell = document.getElementById('proof-image-fullscreen');
+        const image = document.getElementById('proof-image-fullscreen-img');
+        if (imageShell && !imageShell.hidden) {
+          imageShell.hidden = true;
+          if (image) image.src = '';
+          return;
+        }
+        const shell = document.getElementById('proof-modal');
+        const body = document.getElementById('proof-modal-body');
+        if (shell) shell.hidden = true;
+        if (body) body.innerHTML = '';
+        document.body.classList.remove('modal-open');
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      const orderActionShell = document.getElementById('order-action-confirm-modal');
+      if (orderActionShell && !orderActionShell.hidden) {
+        closeOrderActionConfirm();
+        return;
+      }
+      const actionShell = document.getElementById('payment-action-confirm-modal');
+      if (actionShell && !actionShell.hidden) {
+        closePaymentActionConfirm();
+        return;
+      }
+      const imageShell = document.getElementById('proof-image-fullscreen');
+      const image = document.getElementById('proof-image-fullscreen-img');
+      if (imageShell && !imageShell.hidden) {
+        imageShell.hidden = true;
+        if (image) image.src = '';
+        const proofShell = document.getElementById('proof-modal');
+        if (!proofShell || proofShell.hidden) document.body.classList.remove('modal-open');
+        return;
+      }
+      const shell = document.getElementById('proof-modal');
+      const body = document.getElementById('proof-modal-body');
+      if (shell && !shell.hidden) {
+        shell.hidden = true;
+        if (body) body.innerHTML = '';
+        document.body.classList.remove('modal-open');
+      }
+    });
+
+    setupMobileNav();
+    startLiveUpdates();
+  })();
+  </script>
+  {% endif %}
+</body>
+</html>

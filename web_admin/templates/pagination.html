@@ -1,0 +1,14 @@
+{% if total_pages and total_pages > 1 %}
+<div class="pagination">
+  {% set args = request.args.to_dict() %}
+  {% if page > 1 %}
+    {% set _ = args.update({'page': page-1}) %}
+    <a href="{{ url_for(request.endpoint, **args) }}">← Previous</a>
+  {% endif %}
+  <span>Page {{ page }} of {{ total_pages }}</span>
+  {% if page < total_pages %}
+    {% set _ = args.update({'page': page+1}) %}
+    <a href="{{ url_for(request.endpoint, **args) }}">Next →</a>
+  {% endif %}
+</div>
+{% endif %}

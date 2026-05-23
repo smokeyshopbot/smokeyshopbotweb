@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+{% block title %}My Stock Dashboard{% endblock %}
+{% block content %}
+{% set summary = stats.summary %}
+{% set methods = summary.payment_methods %}
+<div class="page-header">
+  <div>
+    <h1>My Stock Dashboard</h1>
+    <p>Only stock connected to your WebAdmin account is counted here. Product sale prices stay hidden.</p>
+  </div>
+  <a class="small-button" href="{{ url_for('products') }}">Manage my stock</a>
+</div>
+
+<section class="grid cards stock-manager-summary-cards">
+  <div class="card"><span>Total stock added</span><strong>{{ summary.total_added }}</strong><small>Assigned stock tracked for your account.</small></div>
+  <div class="card replacement-due-card"><span>Pending replacements</span><strong>{{ summary.pending_replacement_count }}</strong><small>Replacement stock you still need to submit.</small></div>
+  <div class="card"><span>Current unsold stock</span><strong>{{ summary.current_stock }}</strong><small>Stock still available and added by you.</small></div>
+  <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered order items added by you.</small></div>
+  <div class="card"><span>Your earnings till date</span><strong>{{ money_usdt(summary.manager_earning_usdt) }}</strong><small>Stock added × owner-set earning rate.</small></div>
+  <div class="card payout-due-card"><span>Payout due to you</span><strong>{{ money_usdt(summary.payable_due_usdt) }}</strong><small>Minimum request: {{ money_usdt(stock_manager_min_payout_usdt) }}.</small></div>
+</section>
+
+<section class="panel payout-request-panel">
+  <div class="toolbar">
+    <div>
+      <h2>Payment details & payout request</h2>
+      <p class="muted">Choose how the owner should pay you. You can request payment when your payout due is at least {{ money_usdt(stock_manager_min_payout_usdt) }}.</p>
+    </div>
+    {% if summary.pending_payment_request %}
+      <span class="badge warning">Request pending</span>
+    {% endif %}
+  </div>
+  <div class="payout-grid payout-grid-centered">
+    <form method="post" action="{{ url_for('save_stock_manager_payment_details') }}" class="stacked-form payment-details-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Preferred payout method
+        <select name="payment_method" id="stock-manager-payment-method">
+          {% for method, label in stock_manager_payment_method_labels.items() %}
+            <option value="{{ method }}" {% if summary.payment_method == method %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <div class="payment-method-fields" data-payment-method-section="upi">
+        <h3>UPI details</h3>
+        <div class="form-grid two-col">
+          <label>Name
+            <input name="upi_name" value="{{ methods.upi.name }}" placeholder="Receiver name">
+          </label>
+          <label>UPI ID
+            <input name="upi_id" value="{{ methods.upi.upi_id }}" placeholder="name@bank">
+          </label>
+        </div>
+      </div>
+
+      <div class="payment-method-fields" data-payment-method-section="bep20">
+        <h3>USDT BEP20 details</h3>
+        <label>BEP20 wallet address
+          <input name="bep20_address" value="{{ methods.bep20.address }}" placeholder="0x...">
+        </label>
+      </div>
+
+      <div class="payment-method-fields" data-payment-method-section="binance">
+        <h3>Binance Pay details</h3>
+        <div class="form-grid two-col">
+          <label>Binance name
+            <input name="binance_name" value="{{ methods.binance.name }}" placeholder="Binance account name">
+          </label>
+          <label>Binance ID
+            <input name="binance_id" value="{{ methods.binance.binance_id }}" placeholder="Binance Pay ID">
+          </label>
+        </div>
+      </div>
+
+      {% if summary.payment_details_updated_at %}<small class="muted">Last updated: {{ summary.payment_details_updated_at }}</small>{% endif %}
+      <button class="primary" type="submit">Save payment details</button>
+    </form>
+    <div class="payout-request-box payout-request-box-centered">
+      <div>
+        <h3>Request payment</h3>
+        <p>Current payout due: <strong>{{ money_usdt(summary.payable_due_usdt) }}</strong></p>
+        {% if summary.has_payment_details %}
+          <p class="muted">Saved method: <strong>{{ summary.payment_method_label }}</strong></p>
+        {% endif %}
+        {% if summary.pending_payment_request %}
+          <p class="muted">You already sent a request for {{ money_usdt(summary.pending_payment_request.amount_usdt) }} on {{ fmt_dt(summary.pending_payment_request.requested_at) }}. Wait for the owner to clear it.</p>
+          <button type="button" disabled>Request pending</button>
+        {% elif summary.can_request_payment and summary.has_payment_details %}
+          <form method="post" action="{{ url_for('request_stock_manager_payment') }}" data-request-payment-form data-payout-amount="{{ money_usdt(summary.payable_due_usdt)|e }}" data-payout-method="{{ summary.payment_method_label|e }}" data-payout-details="{{ format_stock_manager_payment_details(summary)|e }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="success" type="submit">Request payment</button>
+          </form>
+        {% elif not summary.has_payment_details %}
+          <p class="muted">Save complete payment details first, then request payment when due reaches {{ money_usdt(stock_manager_min_payout_usdt) }}.</p>
+          <button type="button" disabled>Request payment</button>
+        {% else %}
+          <p class="muted">Minimum payout request is {{ money_usdt(stock_manager_min_payout_usdt) }}.</p>
+          <button type="button" disabled>Request payment</button>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Payment history</h2>
+      <p class="muted">Payments the owner has marked as paid to you.</p>
+    </div>
+  </div>
+  {% if stats.payout_history %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Date</th><th>Amount</th><th>Paid by</th><th>Method</th><th>Owner note</th></tr>
+      </thead>
+      <tbody>
+      {% for payout in stats.payout_history %}
+        <tr>
+          <td>{{ fmt_dt(payout.created_at) }}</td>
+          <td><strong>{{ money_usdt(payout.amount_usdt) }}</strong></td>
+          <td>{{ payout.paid_by or 'owner' }}</td>
+          <td>{{ payout.payment_method_label or stock_manager_payment_method_label(payout.payment_method) }}</td>
+          <td>{{ payout.note or '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No paid payout history yet.</p>
+  {% endif %}
+</section>
+
+<div id="request-payment-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-request-payment-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="request-payment-confirm-title">
+    <h3 id="request-payment-confirm-title">Request payout?</h3>
+    <p class="muted">This will send the owner a payout request with your saved payment details. You can only have one pending request at a time.</p>
+    <div class="action-confirm-summary">
+      <div><span>Amount</span><strong id="request-payment-confirm-amount">-</strong></div>
+      <div><span>Payment method</span><strong id="request-payment-confirm-method">-</strong></div>
+      <div><span>Payment details</span><strong><pre class="compact-pre" id="request-payment-confirm-details">-</pre></strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-request-payment-confirm>Cancel</button>
+      <button type="button" class="action-button success" id="request-payment-confirm-submit">Send request</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const select = document.getElementById('stock-manager-payment-method');
+  if (select) {
+    const sections = Array.from(document.querySelectorAll('[data-payment-method-section]'));
+    function syncPaymentMethodFields() {
+      sections.forEach(section => {
+        const active = section.dataset.paymentMethodSection === select.value;
+        section.hidden = !active;
+        section.querySelectorAll('input').forEach(input => {
+          input.required = active;
+        });
+      });
+    }
+    select.addEventListener('change', syncPaymentMethodFields);
+    syncPaymentMethodFields();
+  }
+
+  let pendingRequestPaymentForm = null;
+  const modal = document.getElementById('request-payment-confirm-modal');
+
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value || '-';
+  }
+
+  function closeRequestPaymentConfirm() {
+    if (modal) modal.hidden = true;
+    pendingRequestPaymentForm = null;
+    document.body.classList.remove('modal-open');
+  }
+
+  function openRequestPaymentConfirm(form) {
+    if (!modal) return false;
+    pendingRequestPaymentForm = form;
+    setText('request-payment-confirm-amount', form.dataset.payoutAmount);
+    setText('request-payment-confirm-method', form.dataset.payoutMethod);
+    setText('request-payment-confirm-details', form.dataset.payoutDetails);
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
+  document.addEventListener('submit', (event) => {
+    const form = event.target.closest && event.target.closest('[data-request-payment-form]');
+    if (!form || form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!openRequestPaymentConfirm(form)) {
+      form.dataset.confirmed = '1';
+      form.submit();
+    }
+  });
+
+  document.addEventListener('click', (event) => {
+    if (event.target.hasAttribute('data-close-request-payment-confirm')) {
+      closeRequestPaymentConfirm();
+      return;
+    }
+    if (event.target.closest && event.target.closest('#request-payment-confirm-submit') && pendingRequestPaymentForm) {
+      const form = pendingRequestPaymentForm;
+      form.dataset.confirmed = '1';
+      closeRequestPaymentConfirm();
+      form.submit();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && modal && !modal.hidden) closeRequestPaymentConfirm();
+  });
+})();
+</script>
+{% endblock %}

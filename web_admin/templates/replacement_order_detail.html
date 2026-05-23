@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Replacement {{ order.order_id }}{% endblock %}
+{% block content %}
+{% set delivery_revoked = order.get('delivery_revoked') %}
+{% set display_status = 'revoked' if delivery_revoked else order.status %}
+<div class="page-header detail-page-header">
+  <div>
+    <a class="small-button secondary back-link-button back-button-left" href="{{ url_for('replacement_orders') }}">← Back to Replacements</a>
+    <h1>Replacement {{ order.order_id }}</h1>
+    <p><span class="{{ status_badge_class(display_status) }}">{{ status_label(display_status) }}</span> · {{ fmt_dt(order.created_at) }}</p>
+  </div>
+  {% if order.status == 'delivered' and order.get('items') %}
+  <div class="toolbar-actions">
+    {% if not delivery_revoked %}
+    <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" class="inline-form" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ request.full_path }}">
+      <button class="primary" type="submit">Resend replacement to user</button>
+    </form>
+    <form method="post" action="{{ url_for('revoke_order_delivery', order_id=order.order_id) }}" class="inline-form" data-confirm-order-action data-order-action="revoke" data-order-ref="{{ order.order_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ request.full_path }}">
+      <button class="danger" type="submit">Delete from Telegram / Revoke</button>
+    </form>
+    {% else %}
+    <span class="status-badge status-red">Delivery revoked</span>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% if delivery_revoked %}
+<section class="panel revoked-delivery-panel">
+  <h2>Delivery revoked</h2>
+  <p class="muted">This replacement is blocked from /getorder refetch. It is kept in history so duplicate stock protection still knows these items were exposed.</p>
+  <div class="detail-grid compact-detail-grid">
+    <div><span>Revoked at</span><strong>{{ fmt_dt(order.delivery_revoked_at) }}</strong></div>
+    <div><span>Revoked by</span><strong>{{ order.delivery_revoked_by or 'Admin' }}</strong></div>
+    <div><span>Telegram deleted</span><strong>{{ order.delivery_telegram_deleted_count or 0 }} message(s)</strong></div>
+  </div>
+  {% if order.get('delivery_transferred_to_order_id') %}
+    <div class="transfer-complete-box">
+      <div>
+        <h3>Transferred</h3>
+        <p class="muted">This revoked replacement was already sent to the corrected user.</p>
+      </div>
+      <div class="transfer-complete-links">
+        <span>Correct user: <strong>{% if order.get('delivery_transferred_to_user_id') %}<a href="{{ url_for('user_detail', user_id=order.get('delivery_transferred_to_user_id')) }}">{{ telegram_user_label(order.get('delivery_transferred_to_user_id'), order.get('delivery_transferred_to_username')) }}</a>{% else %}—{% endif %}</strong></span>
+        <span>New replacement: <strong><a href="{{ url_for('replacement_order_detail', order_id=order.get('delivery_transferred_to_order_id')) }}">{{ order.get('delivery_transferred_to_order_id') }}</a></strong></span>
+      </div>
+    </div>
+  {% else %}
+    <form method="post" action="{{ url_for('transfer_revoked_order', order_id=order.order_id) }}" class="transfer-delivery-form" data-confirm-order-action data-order-action="transfer" data-order-ref="{{ order.order_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Correct user ID or @username
+        <input name="target_user_id" placeholder="123456789 or @username" required>
+      </label>
+      <label>
+        Transfer note (optional)
+        <input name="transfer_note" maxlength="1000" placeholder="Sent to wrong user by mistake">
+      </label>
+      <button class="primary" type="submit">Transfer revoked replacement</button>
+    </form>
+  {% endif %}
+</section>
+{% endif %}
+<section class="panel detail-grid">
+  {% if show_order_user_identity %}<div><span>User</span><strong><a href="{{ url_for('user_detail', user_id=order.user_id) }}">{{ telegram_user_label(order.user_id, order.username) }}</a></strong></div>{% endif %}
+  <div><span>Replacement ID</span><strong>{{ order.order_id }}</strong></div>
+  <div><span>Report ID</span><strong>{% if order.replacement_report_id %}{% if report %}<a href="{{ url_for('replacement_detail', report_id=order.replacement_report_id) }}">{{ order.replacement_report_id }}</a>{% else %}{{ order.replacement_report_id }}{% endif %}{% else %}—{% endif %}</strong></div>
+  <div><span>Product</span><strong>{{ order.product_name }} × {{ order.quantity }}</strong></div>
+  <div><span>Original order</span><strong>{% set original_orders = order.get('original_order_ids') or [] %}{% if original_orders %}{{ original_orders|join(', ') }}{% else %}{{ order.original_order_id or '—' }}{% endif %}</strong></div>
+  <div><span>Sent</span><strong>{{ fmt_dt(order.delivered_at or order.created_at) }}</strong></div>
+  <div><span>Sent by</span><strong>{{ order.replacement_sent_by or (report.replacement_sent_by if report else '') or 'Admin' }}</strong></div>
+</section>
+{% if order.replacement_admin_note or (report and report.replacement_admin_note) %}
+<section class="panel">
+  <h2>Admin note sent with replacement</h2>
+  <p>{{ order.replacement_admin_note or report.replacement_admin_note }}</p>
+</section>
+{% endif %}
+<section class="panel">
+  <h2>Replacement items</h2>
+  {% set delivered_items = order.get("items", []) %}
+  {% if delivered_items %}
+    <div class="delivered-items-grid">
+      {% for item in delivered_items %}
+        <pre class="stock-item delivered-stock-item">{{ item }}</pre>
+      {% endfor %}
+    </div>
+  {% else %}<p class="muted">No replacement items saved on this delivery.</p>{% endif %}
+</section>
+{% endblock %}

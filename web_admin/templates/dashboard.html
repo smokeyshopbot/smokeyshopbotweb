@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Dashboard</h1>
+    <p>Live overview of your shop, payments, stock, users, and admin activity.</p>
+  </div>
+  <div class="dashboard-actions" style="display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+    <form method="post" action="{{ url_for('set_maintenance') }}" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if maintenance %}
+        <input type="hidden" name="mode" value="off"><button class="success" type="submit">Turn maintenance OFF</button>
+      {% else %}
+        <input type="hidden" name="mode" value="on"><button class="danger" type="submit">Turn maintenance ON</button>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+<section class="grid cards">
+  <a class="card" href="{{ url_for('users') }}"><span>Users</span><strong>{{ stats.users_total }}</strong><small>{{ stats.users_blocked }} blocked</small></a>
+  <a class="card" href="{{ url_for('products') }}"><span>Products</span><strong>{{ stats.products_enabled }}/{{ stats.products_total }}</strong><small>{{ stats.total_stock }} stock units</small></a>
+  <a class="card" href="{{ url_for('orders') }}"><span>Orders</span><strong>{{ stats.orders_total }}</strong><small>{{ stats.orders_delivered }} delivered</small></a>
+  <a class="card" href="{{ url_for('pending_orders') }}"><span>Pending stock orders</span><strong>{{ pending_stock }}</strong><small>paid orders waiting</small></a>
+  <a class="card" href="{{ url_for('payments') }}"><span>Payment review</span><strong>{{ pending_payments }}</strong><small>manual submissions</small></a>
+  <div class="card">
+    <span>Revenue / paid value</span>
+    {% if 'usdt' in active_payment_currencies %}<strong>{{ money_usdt(stats.revenue_usdt) }}</strong>{% endif %}
+    {% if 'inr' in active_payment_currencies %}<strong class="{% if 'usdt' in active_payment_currencies %}secondary-money{% endif %}">{{ money_inr(stats.revenue_inr) }}</strong>{% endif %}
+    {% if not active_payment_currencies %}<strong>—</strong><small>No enabled payment methods</small>{% else %}<small>showing enabled payment currencies only</small>{% endif %}
+  </div>
+</section>
+
+<div class="two-col">
+  <section class="panel">
+    <h2>Recent orders</h2>
+    {% if recent_orders %}
+    <table class="dashboard-orders-table">
+      <thead><tr><th>Order</th><th>User</th><th>Product</th><th class="center-cell status-col">Status</th><th>Amount</th></tr></thead>
+      <tbody>
+      {% for order in recent_orders %}
+        <tr>
+          <td><a href="{{ url_for('order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td>
+          <td><a href="{{ url_for('user_detail', user_id=order.user_id) }}">{{ telegram_user_label(order.user_id, order.username) }}</a></td>
+          <td>{{ order.product_name }} × {{ order.quantity }}</td>
+          <td class="center-cell status-cell"><span class="{{ status_badge_class(order.display_status or order.status) }}">{{ status_label(order.display_status or order.status) }}</span></td>
+          <td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="muted">No orders yet.</p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Low stock</h2>
+    {% if low_stock %}
+      <ul class="compact-list">
+      {% for p in low_stock %}
+        <li><strong>{{ p.name }}</strong><span>{{ p.actual_stock }} left</span></li>
+      {% endfor %}
+      </ul>
+    {% else %}<p class="muted">No products below the configured threshold.</p>{% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}Payment Settings{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Payment Settings</h1>
+    <p>Enable or disable payment methods and update the payment details shown by the bot. These values are stored in MongoDB, not .env. A method must be switched on here before users can see it in the bot.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <form method="post" action="{{ url_for('payment_settings_submit') }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div class="settings-grid">
+      <div class="setting-card payment-method-card" data-payment-method>
+        <div class="payment-method-header">
+          <div>
+            <strong>USDT BEP20</strong>
+          </div>
+          <button type="button" class="payment-toggle-button" data-payment-toggle-button></button>
+          <input class="sr-only payment-toggle-input" type="checkbox" name="usdt_bep20_enabled" value="1" data-payment-toggle {% if settings.usdt_bep20.enabled %}checked{% endif %}>
+        </div>
+        <p class="method-off-note muted">Disabled — users will not see this option.</p>
+        <div class="method-details" data-payment-details>
+          <label>BEP20 wallet address
+            <input name="usdt_wallet_address" value="{{ settings.usdt_bep20.wallet_address }}" placeholder="0x...">
+          </label>
+          <small class="muted">Used for USDT BEP20 payments and shown to users. Adding this in .env will not enable USDT; save it here and switch USDT BEP20 on.</small>
+        </div>
+      </div>
+
+      <div class="setting-card payment-method-card" data-payment-method>
+        <div class="payment-method-header">
+          <div>
+            <strong>UPI / INR</strong>
+          </div>
+          <button type="button" class="payment-toggle-button" data-payment-toggle-button></button>
+          <input class="sr-only payment-toggle-input" type="checkbox" name="upi_enabled" value="1" data-payment-toggle {% if settings.upi.enabled %}checked{% endif %}>
+        </div>
+        <p class="method-off-note muted">Disabled — INR/UPI fields are locked and users will not see INR payment options.</p>
+        <div class="method-details" data-payment-details>
+          <label>UPI ID
+            <input name="upi_id" value="{{ settings.upi.upi_id }}" placeholder="name@upi">
+          </label>
+          <label>UPI display name
+            <input name="upi_name" value="{{ settings.upi.upi_name }}" placeholder="Merchant name">
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-card payment-method-card" data-payment-method>
+        <div class="payment-method-header">
+          <div>
+            <strong>Binance Pay</strong>
+          </div>
+          <button type="button" class="payment-toggle-button" data-payment-toggle-button></button>
+          <input class="sr-only payment-toggle-input" type="checkbox" name="binance_enabled" value="1" data-payment-toggle {% if settings.binance.enabled %}checked{% endif %}>
+        </div>
+        <p class="method-off-note muted">Disabled — users will not see this option.</p>
+        <div class="method-details" data-payment-details>
+          <label>Binance Pay ID
+            <input name="binance_pay_id" value="{{ settings.binance.binance_pay_id }}" placeholder="Pay ID">
+          </label>
+          <label>Binance Pay display name
+            <input name="binance_pay_name" value="{{ settings.binance.binance_pay_name }}" placeholder="Merchant name">
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div id="wallet-topup-limits">
+      <h2>Wallet top-up limits</h2>
+      <p class="muted">Only currencies with an enabled top-up method are shown here. Saved values are kept while disabled, so you can re-enable later without retyping.</p>
+      <div class="settings-grid">
+        <label data-wallet-limit="inr">Minimum INR wallet top-up
+          <div class="price-input-wrap"><input name="wallet_min_inr" type="number" min="0.01" step="0.01" value="{{ settings.wallet_limits.min_inr }}"><span>INR</span></div>
+        </label>
+        <label data-wallet-limit="usdt">Minimum USDT wallet top-up
+          <div class="price-input-wrap"><input name="wallet_min_usdt" type="number" min="0.0001" step="0.0001" value="{{ settings.wallet_limits.min_usdt }}"><span>USDT</span></div>
+        </label>
+      </div>
+    </div>
+
+    <button class="primary" type="submit">Save payment settings</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>How this works</h2>
+  <p>The bot reads these settings from the database when showing checkout and wallet top-up options. If a method is disabled, users will not see that payment option. If a method is enabled but required details are empty, it is treated as disabled.</p>
+  <p>Disabled methods lock and hide their detail fields on this page. The saved values are kept so you can re-enable the method later without retyping everything.</p>
+  <p>Active payment sessions keep the exact details shown to that user, so a later update here will not make an already-created payment verify against a different wallet/payee.</p>
+</section>
+
+<script>
+function syncWalletTopupLimits() {
+  const upiEnabled = Boolean(document.querySelector('input[name="upi_enabled"]')?.checked);
+  const bep20Enabled = Boolean(document.querySelector('input[name="usdt_bep20_enabled"]')?.checked);
+  const binanceEnabled = Boolean(document.querySelector('input[name="binance_enabled"]')?.checked);
+  const inrLimit = document.querySelector('[data-wallet-limit="inr"]');
+  const usdtLimit = document.querySelector('[data-wallet-limit="usdt"]');
+  if (inrLimit) inrLimit.hidden = !upiEnabled;
+  if (usdtLimit) usdtLimit.hidden = !(bep20Enabled || binanceEnabled);
+  const section = document.getElementById('wallet-topup-limits');
+  if (section) section.hidden = !upiEnabled && !bep20Enabled && !binanceEnabled;
+}
+
+function syncPaymentMethodCards() {
+  document.querySelectorAll('[data-payment-method]').forEach((card) => {
+    const toggle = card.querySelector('[data-payment-toggle]');
+    const button = card.querySelector('[data-payment-toggle-button]');
+    const details = card.querySelector('[data-payment-details]');
+    const enabled = Boolean(toggle && toggle.checked);
+    card.classList.toggle('is-disabled', !enabled);
+    if (button) {
+      button.textContent = enabled ? 'Disable' : 'Enable';
+      button.classList.toggle('enabled', enabled);
+      button.classList.toggle('disabled', !enabled);
+      button.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      button.setAttribute('title', enabled ? 'Click to disable this payment method' : 'Click to enable this payment method');
+    }
+    if (details) {
+      details.hidden = !enabled;
+      details.querySelectorAll('input, textarea, select').forEach((field) => {
+        field.readOnly = !enabled;
+        field.tabIndex = enabled ? 0 : -1;
+        field.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+      });
+    }
+  });
+  syncWalletTopupLimits();
+}
+document.addEventListener('DOMContentLoaded', () => {
+  syncPaymentMethodCards();
+  document.querySelectorAll('[data-payment-toggle-button]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const card = button.closest('[data-payment-method]');
+      const toggle = card ? card.querySelector('[data-payment-toggle]') : null;
+      if (!toggle) return;
+      toggle.checked = !toggle.checked;
+      toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  });
+  document.querySelectorAll('[data-payment-toggle]').forEach((toggle) => {
+    toggle.addEventListener('change', syncPaymentMethodCards);
+  });
+});
+</script>
+{% endblock %}

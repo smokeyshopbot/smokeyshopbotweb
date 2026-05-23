@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Buyer Ranking{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Buyer Ranking</h1><p>Counts delivered paid orders and paid orders waiting for stock.</p></div></div>
+<section class="panel">
+{% if rows %}
+<table>
+  <thead><tr><th>Rank</th><th>User</th><th>Orders</th><th>Delivered</th><th>Waiting stock</th><th>Total value</th><th>Last order</th></tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>#{{ (page - 1) * 10 + loop.index }}</td>
+      <td><a href="{{ url_for('user_detail', user_id=row.user_id) }}">{{ telegram_user_label(row.user_id, row.username) }}</a></td>
+      <td>{{ row.total_orders }}</td>
+      <td>{{ row.delivered_orders }}</td>
+      <td>{{ row.pending_stock_orders }}</td>
+      <td>
+        {% if 'inr' in active_payment_currencies %}{{ money_inr(row.total_inr) }}{% endif %}
+        {% if 'inr' in active_payment_currencies and 'usdt' in active_payment_currencies %}<br>{% endif %}
+        {% if 'usdt' in active_payment_currencies %}{{ money_usdt(row.total_usdt) }}{% endif %}
+        {% if not active_payment_currencies %}<span class="muted">—</span>{% endif %}
+      </td>
+      <td>{{ fmt_dt(row.last_order_at) }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">No paid buyer data yet.</p>{% endif %}
+{% include "pagination.html" %}
+</section>
+{% endblock %}

@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Payment Reviews{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Payment Reviews</h1><p>Approve or reject UPI, Binance Pay and manual USDT submissions from the website.</p></div></div>
+<section class="panel">
+  <div class="toolbar">
+    <form method="get" class="search-form">
+      <select name="status">
+        <option value="all" {% if status == 'all' %}selected{% endif %}>All</option>
+        <option value="needs_review" {% if status == 'needs_review' %}selected{% endif %}>Needs review</option>
+        <option value="approved" {% if status == 'approved' %}selected{% endif %}>Approved</option>
+        <option value="rejected" {% if status == 'rejected' %}selected{% endif %}>Rejected</option>
+      </select>
+      <button type="submit">Filter</button>
+    </form>
+    <span class="muted">{{ total }} payment(s)</span>
+  </div>
+  {% if payments %}
+  <div class="table-wrap">
+    <table class="payments-table">
+      <thead><tr><th>Ref</th>{% if show_payment_user_identity %}<th>User</th>{% endif %}<th>Type</th><th>Method</th><th>Amount</th><th>Proof</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for p in payments %}
+        {% set file_id = p.upi_screenshot_file_id or p.binance_screenshot_file_id or p.usdt_screenshot_file_id %}
+        {% set screenshot_url = url_for('telegram_file', file_id=file_id) if file_id and bot_token_configured else '' %}
+        <tr>
+          <td><strong>{{ p.ref_id }}</strong><br><small>{{ fmt_dt(p.created_at) }}</small></td>
+          {% if show_payment_user_identity %}<td><a href="{{ url_for('user_detail', user_id=p.user_id) }}">{{ telegram_user_label(p.user_id, p.username) }}</a></td>{% endif %}
+          <td>{{ p.pay_type|title }}</td>
+          <td>{{ method_label(p.method) }}</td>
+          <td>{% if p.admin_wallet_action == 'remove' %}-{% elif p.admin_wallet_action == 'add' %}+{% endif %}{% if p.method == 'upi' or p.currency == 'inr' %}{{ money_inr(p.expected_inr or p.load_amount) }}{% else %}{{ money_usdt(p.expected_usdt or p.unique_usdt or p.load_amount) }}{% endif %}</td>
+          <td>
+            <button type="button" class="proof-button" data-proof-target="proof-{{ loop.index }}">View proof</button>
+            <div id="proof-{{ loop.index }}" class="proof-modal-template" hidden>
+              <div class="proof-modal-header">
+                <div>
+                  <h3>Payment proof</h3>
+                </div>
+              </div>
+              <div class="proof-modal-layout">
+                <div class="proof-details-pane">
+                  <div class="proof-overview-grid">
+                    <div class="proof-card"><span class="proof-label">Reference</span><strong>{{ p.ref_id }}</strong></div>
+                    {% if show_payment_user_identity %}<div class="proof-card"><span class="proof-label">User</span><strong>{{ telegram_user_label(p.user_id, p.username) }}</strong></div>{% endif %}
+                    <div class="proof-card"><span class="proof-label">Payment method</span><strong>{{ method_label(p.method) }}</strong></div>
+                    <div class="proof-card"><span class="proof-label">Type</span><strong>{{ p.pay_type|title }}</strong></div>
+                    <div class="proof-card"><span class="proof-label">Amount</span><strong>{% if p.admin_wallet_action == 'remove' %}-{% elif p.admin_wallet_action == 'add' %}+{% endif %}{% if p.method == 'upi' or p.currency == 'inr' %}{{ money_inr(p.expected_inr or p.load_amount) }}{% else %}{{ money_usdt(p.expected_usdt or p.unique_usdt or p.load_amount) }}{% endif %}</strong></div>
+                    {% if p.pay_type == 'order' and p.order_product_name %}<div class="proof-card"><span class="proof-label">Ordered item</span><strong>{{ p.order_product_name }}{% if p.order_quantity %} x {{ p.order_quantity }}{% endif %}</strong></div>{% endif %}
+                  </div>
+                  <div class="proof-detail-list">
+                    {% if p.upi_payee_name %}<div class="proof-detail-row"><span>Payer name</span><strong>{{ p.upi_payee_name }}</strong></div>{% endif %}
+                    {% if p.upi_txn_id %}<div class="proof-detail-row"><span>UTR / Transaction ID</span><strong>{{ p.upi_txn_id }}</strong></div>{% endif %}
+                    {% if p.binance_name %}<div class="proof-detail-row"><span>Binance name / ID</span><strong>{{ p.binance_name }}</strong></div>{% endif %}
+                    {% if p.binance_transaction_id %}<div class="proof-detail-row"><span>Auto Binance Tx ID</span><strong class="break-anywhere">{{ p.binance_transaction_id }}</strong></div>{% endif %}
+                    {% if p.binance_payer_name %}<div class="proof-detail-row"><span>Auto Binance payer</span><strong>{{ p.binance_payer_name }}</strong></div>{% endif %}
+                    {% if p.usdt_txn_hash %}<div class="proof-detail-row"><span>USDT Tx hash</span><strong class="break-anywhere">{{ p.usdt_txn_hash }}</strong></div>{% endif %}
+                    {% if p.notes %}<div class="proof-detail-row"><span>Notes</span><strong>{{ p.notes }}</strong></div>{% endif %}
+                  </div>
+                </div>
+                <div class="proof-image-block">
+                  {% if screenshot_url %}
+                    <button type="button" class="proof-image-button" data-proof-fullscreen-image="{{ screenshot_url }}" aria-label="Open payment screenshot fullscreen">
+                      <img src="{{ screenshot_url }}" alt="Payment screenshot" class="proof-image">
+                    </button>
+                    <p class="proof-image-hint">Click the image to view fullscreen.</p>
+                  {% elif file_id %}
+                    <p class="muted">Screenshot file ID is saved, but bot token is not configured in WebAdmin.</p>
+                  {% else %}
+                    <p class="muted">No screenshot was submitted for this payment.</p>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+          </td>
+          <td>
+            {% if p.status in ['upi_submitted','binance_submitted','usdt_manual_submitted'] %}
+              <div class="payment-action-stack">
+                <form method="post" action="{{ url_for('decide_payment', ref_id=p.ref_id, action='approve') }}" class="payment-action-form" data-confirm-payment-action data-confirm-action="approve" data-confirm-ref="{{ p.ref_id }}" data-confirm-method="{{ method_label(p.method) }}" data-confirm-amount="{% if p.admin_wallet_action == 'remove' %}-{% elif p.admin_wallet_action == 'add' %}+{% endif %}{% if p.method == 'upi' or p.currency == 'inr' %}{{ money_inr(p.expected_inr or p.load_amount) }}{% else %}{{ money_usdt(p.expected_usdt or p.unique_usdt or p.load_amount) }}{% endif %}" data-confirm-user="{% if show_payment_user_identity %}{{ telegram_user_label(p.user_id, p.username) }}{% else %}Hidden{% endif %}" data-confirm-type="{{ p.pay_type|title }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="success action-button" type="submit">Approve</button>
+                </form>
+                <form method="post" action="{{ url_for('decide_payment', ref_id=p.ref_id, action='reject') }}" class="payment-action-form" data-confirm-payment-action data-confirm-action="reject" data-confirm-ref="{{ p.ref_id }}" data-confirm-method="{{ method_label(p.method) }}" data-confirm-amount="{% if p.admin_wallet_action == 'remove' %}-{% elif p.admin_wallet_action == 'add' %}+{% endif %}{% if p.method == 'upi' or p.currency == 'inr' %}{{ money_inr(p.expected_inr or p.load_amount) }}{% else %}{{ money_usdt(p.expected_usdt or p.unique_usdt or p.load_amount) }}{% endif %}" data-confirm-user="{% if show_payment_user_identity %}{{ telegram_user_label(p.user_id, p.username) }}{% else %}Hidden{% endif %}" data-confirm-type="{{ p.pay_type|title }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="danger action-button" type="submit">Reject</button>
+                </form>
+              </div>
+            {% else %}<span class="muted">No action</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<p class="muted">No payment requests found.</p>{% endif %}
+  {% include "pagination.html" %}
+</section>
+
+<div id="proof-modal" class="proof-modal-shell" hidden>
+  <div class="proof-modal-backdrop" data-close-proof-modal></div>
+  <div class="proof-modal-panel" role="dialog" aria-modal="true" aria-labelledby="proof-modal-title">
+    <button type="button" class="proof-modal-close" aria-label="Close" data-close-proof-modal>&times;</button>
+    <div id="proof-modal-body"></div>
+  </div>
+</div>
+
+
+<div id="proof-image-fullscreen" class="proof-image-fullscreen" hidden>
+  <button type="button" class="proof-image-fullscreen-close" aria-label="Close fullscreen image" data-close-proof-image>&times;</button>
+  <img id="proof-image-fullscreen-img" src="" alt="Payment screenshot fullscreen">
+</div>
+
+<div id="payment-action-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-action-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="action-confirm-title">
+    <h3 id="action-confirm-title">Confirm payment action</h3>
+    <p id="action-confirm-message" class="muted">Please confirm this payment action.</p>
+    <div class="action-confirm-summary">
+      <div><span>Reference</span><strong id="action-confirm-ref">-</strong></div>
+      {% if show_payment_user_identity %}<div><span>User</span><strong id="action-confirm-user">-</strong></div>{% endif %}
+      <div><span>Type</span><strong id="action-confirm-type">-</strong></div>
+      <div><span>Method</span><strong id="action-confirm-method">-</strong></div>
+      <div><span>Amount</span><strong id="action-confirm-amount">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-action-confirm>Cancel</button>
+      <button type="button" id="action-confirm-submit" class="action-button">Confirm</button>
+    </div>
+  </div>
+</div>
+{% endblock %}

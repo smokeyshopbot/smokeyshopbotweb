@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Admins{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Admins</h1>
+    <p>Manage limited WebAdmin accounts. Use Manage to open a full account page with stock-manager payout details, pending replacements, and payment history.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <h2>Add limited admin</h2>
+  <p class="muted">Owner has full access. These extra accounts only see the sidebar sections allowed for their role.</p>
+  <form method="post" action="{{ url_for('add_admin_account') }}" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Username
+      <input name="admin_username" required autocomplete="off" placeholder="stock_admin">
+    </label>
+    <label>Password
+      <input name="admin_password" type="password" required autocomplete="new-password" placeholder="Set a password">
+    </label>
+    <label>Role
+      <select name="admin_role" required>
+        {% for role in admin_sub_roles %}
+          <option value="{{ role }}">{{ admin_role_labels.get(role, role) }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="primary" type="submit">Add admin</button>
+  </form>
+
+  <div class="role-help-grid">
+    {% for role in admin_sub_roles %}
+      <div class="role-help-card">
+        <strong>{{ admin_role_labels.get(role, role) }}</strong>
+        <small>{{ admin_role_descriptions.get(role, '') }}</small>
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Admin accounts</h2>
+      <p class="muted">Stock-manager details are inside each account’s Manage page, not expanded here.</p>
+    </div>
+    {% if pending_payout_request_count %}<span class="badge warning">{{ pending_payout_request_count }} payout request{{ '' if pending_payout_request_count == 1 else 's' }} pending</span>{% endif %}
+  </div>
+  {% if admin_accounts %}
+  <div class="table-wrap">
+    <table class="admins-table">
+      <thead><tr><th>Username</th><th>Role</th><th>Created</th><th class="status-col">Payment requests</th><th class="actions-col">Actions</th></tr></thead>
+      <tbody>
+      {% for account in admin_accounts %}
+        {% set summary = stock_summary_by_id.get(account.id, {}) %}
+        <tr>
+          <td><strong>{{ account.username }}</strong></td>
+          <td>{{ admin_role_labels.get(account.role, account.role) }}</td>
+          <td>{{ fmt_dt(account.created_at) }}</td>
+          <td class="status-cell admin-status-cell">
+            {% if account.role == 'stock_manager' and summary.get('pending_payment_request') %}
+              <span class="badge warning compact-badge manager-pending-badge">Request pending</span>
+            {% else %}
+              <span class="muted admin-not-stock">—</span>
+            {% endif %}
+          </td>
+          <td class="actions-cell admin-actions-cell">
+            <div class="admin-actions">
+              <a class="small-button primary" href="{{ url_for('admin_account_detail', account_id=account.id) }}">Manage</a>
+              <form method="post" action="{{ url_for('delete_admin_account', account_id=account.id) }}" data-remove-admin-form data-admin-username="{{ account.username|e }}" data-admin-role="{{ admin_role_labels.get(account.role, account.role)|e }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="danger small-button" type="submit">Remove</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No limited WebAdmin accounts added yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Recent payout requests</h2>
+      <p class="muted">New stock-manager payout requests show here and in the Admins sidebar badge.</p>
+    </div>
+  </div>
+  {% if payout_requests %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Admin</th><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Details</th></tr></thead>
+      <tbody>
+      {% for req in payout_requests %}
+        <tr>
+          <td><strong>{{ req.username }}</strong></td>
+          <td>{{ money_usdt(req.amount_usdt) }}</td>
+          <td>{{ req.payment_method_label or stock_manager_payment_method_label(req.payment_method) }}</td>
+          <td class="center-cell status-cell"><span class="badge {{ 'success' if req.status == 'paid' else 'warning' }}">{{ (req.status or 'pending')|title }}</span></td>
+          <td>{{ fmt_dt(req.requested_at) }}</td>
+          <td><pre class="compact-pre">{{ req.payment_details }}</pre></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No stock manager payout requests yet.</p>
+  {% endif %}
+</section>
+
+
+<div id="remove-admin-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-remove-admin-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="remove-admin-confirm-title">
+    <h3 id="remove-admin-confirm-title">Remove admin account?</h3>
+    <p class="muted">This only removes the WebAdmin login account. It does not delete products, stock, orders, payments, payout history, or user data.</p>
+    <div class="action-confirm-summary">
+      <div><span>Admin</span><strong id="remove-admin-confirm-username">-</strong></div>
+      <div><span>Role</span><strong id="remove-admin-confirm-role">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-remove-admin-confirm>Cancel</button>
+      <button type="button" class="action-button danger" id="remove-admin-confirm-submit">Yes, remove</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  let pendingRemoveAdminForm = null;
+
+  function removeAdminModal() {
+    return document.getElementById('remove-admin-confirm-modal');
+  }
+
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value || '-';
+  }
+
+  function submitRemoveAdminForm(form) {
+    if (!form) return;
+    form.dataset.confirmed = '1';
+    if (typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+    } else {
+      form.submit();
+    }
+  }
+
+  function closeRemoveAdminConfirm() {
+    const modal = removeAdminModal();
+    if (modal) modal.hidden = true;
+    pendingRemoveAdminForm = null;
+    document.body.classList.remove('modal-open');
+  }
+
+  function openRemoveAdminConfirm(form) {
+    const modal = removeAdminModal();
+    if (!modal) return false;
+    pendingRemoveAdminForm = form;
+    setText('remove-admin-confirm-username', form.dataset.adminUsername);
+    setText('remove-admin-confirm-role', form.dataset.adminRole);
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
+  document.addEventListener('submit', (event) => {
+    const form = event.target.closest && event.target.closest('[data-remove-admin-form]');
+    if (!form || form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (!openRemoveAdminConfirm(form)) {
+      submitRemoveAdminForm(form);
+    }
+  });
+
+  document.addEventListener('click', (event) => {
+    if (event.target.hasAttribute('data-close-remove-admin-confirm')) {
+      closeRemoveAdminConfirm();
+      return;
+    }
+    if (event.target.closest && event.target.closest('#remove-admin-confirm-submit') && pendingRemoveAdminForm) {
+      const form = pendingRemoveAdminForm;
+      closeRemoveAdminConfirm();
+      submitRemoveAdminForm(form);
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    const modal = removeAdminModal();
+    if (event.key === 'Escape' && modal && !modal.hidden) closeRemoveAdminConfirm();
+  });
+})();
+</script>
+{% endblock %}
+

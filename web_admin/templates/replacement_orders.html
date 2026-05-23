@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Recent Replacements{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Recent Replacements</h1>
+    {% if show_order_user_identity %}
+      <p>Replacement deliveries are kept separate from purchase orders. Search by replacement ID, report ID, user, username, product, or original order.</p>
+    {% else %}
+      <p>Replacement deliveries are separate from purchase orders. User IDs and usernames are hidden for your role.</p>
+    {% endif %}
+  </div>
+</div>
+<section class="panel">
+  <div class="toolbar">
+    <form method="get" class="search-form">
+      <input name="q" placeholder="{{ 'Replacement, report, user, username, product or original order' if show_order_user_identity else 'Replacement, report, product or original order' }}" value="{{ q }}">
+      <button type="submit">Search</button>
+      {% if q %}<a class="small-button secondary-button" href="{{ url_for('replacement_orders') }}">Clear</a>{% endif %}
+    </form>
+    <div class="toolbar-actions"><span class="muted">{{ total }} replacement(s)</span></div>
+  </div>
+  {% if orders %}
+  <div class="table-wrap"><table class="orders-table">
+    <thead>
+      <tr>
+        <th>Replacement</th>
+        <th>Report</th>
+        {% if show_order_user_identity %}<th>User</th>{% endif %}
+        <th>Date</th>
+        <th>Product</th>
+        <th>Original order</th>
+        <th class="center-cell status-col">Status</th>
+        <th class="center-cell">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for order in orders %}
+      {% set original_orders = order.get('original_order_ids') or [] %}
+      <tr>
+        <td><a href="{{ url_for('replacement_order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td>
+        <td>
+          {% if order.replacement_report_id %}
+            {% if order.manual_replacement_delivery %}
+              {{ order.replacement_report_id }}
+            {% else %}
+              <a href="{{ url_for('replacement_detail', report_id=order.replacement_report_id) }}">{{ order.replacement_report_id }}</a>
+            {% endif %}
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        {% if show_order_user_identity %}<td><a href="{{ url_for('user_detail', user_id=order.user_id) }}">{{ telegram_user_label(order.user_id, order.username) }}</a></td>{% endif %}
+        <td>{{ fmt_dt(order.created_at) }}</td>
+        <td>{{ order.product_name }} × {{ order.quantity }}</td>
+        <td>
+          {% if original_orders %}
+            {% for oid in original_orders %}<span class="mini-code">{{ oid }}</span>{% endfor %}
+          {% elif order.original_order_id %}
+            <span class="mini-code">{{ order.original_order_id }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        {% set display_status = 'revoked' if order.get('delivery_revoked') else order.status %}
+        <td class="center-cell status-cell"><span class="{{ status_badge_class(display_status) }}">{{ status_label(display_status) }}</span></td>
+        <td class="center-cell order-action-cell">
+          {% if order.status == 'delivered' and order.get('items') and not order.get('delivery_revoked') %}
+            <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="next" value="{{ request.full_path }}">
+              <button type="submit" class="small-button">Resend</button>
+            </form>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted">No replacement deliveries found.</p>{% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

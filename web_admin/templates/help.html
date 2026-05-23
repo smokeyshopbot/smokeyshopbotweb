@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Website Map{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Website Admin Map</h1><p>Use these website pages for admin work.</p></div></div>
+<section class="panel">
+<table>
+<thead><tr><th>Admin task</th><th>Website page/action</th></tr></thead>
+<tbody>
+<tr><td>Dashboard, maintenance, stats</td><td>Dashboard</td></tr>
+<tr><td>Add/remove products, edit prices, enable/disable products</td><td>Products & Stock</td></tr>
+<tr><td>Add stock, remove stock, view current stock</td><td>Products & Stock → Manage</td></tr>
+<tr><td>View and manage users</td><td>Users → open a user detail page</td></tr>
+<tr><td>Adjust user wallet</td><td>User detail → Adjust wallet</td></tr>
+<tr><td>Send message to one user</td><td>User detail → Send message to this user</td></tr>
+<tr><td>Block/unblock user</td><td>Users or user detail → Block/Unblock</td></tr>
+<tr><td>Pending stock orders</td><td>Pending Stock Orders</td></tr>
+<tr><td>Search/review orders</td><td>Recent Orders / Order detail</td></tr>
+<tr><td>Approve/reject manual payments</td><td>Payment Reviews</td></tr>
+<tr><td>Payment method details</td><td>Payment Settings</td></tr>
+<tr><td>Bot token, API keys, support usernames, timeouts</td><td>Secret Settings</td></tr>
+<tr><td>Buyer leaderboard</td><td>Buyer Ranking</td></tr>
+<tr><td>Broadcast to all users</td><td>Broadcast</td></tr>
+</tbody>
+</table>
+</section>
+{% endblock %}

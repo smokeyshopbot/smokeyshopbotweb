@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}System Health{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>System Health</h1>
+    <p>Quick safety checks for database, payments, duplicate protection, stock alerts, and pending work.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <h2>Checks</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Check</th><th>Status</th><th>Details</th></tr>
+      </thead>
+      <tbody>
+      {% for check in health.checks %}
+        <tr>
+          <td>{{ check.name }}</td>
+          <td><span class="badge {{ 'ok' if check.status == 'ok' else ('warning' if check.status == 'warning' else 'failed') }}">{{ check.status|upper }}</span></td>
+          <td>{{ check.detail }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Live counters</h2>
+  <div class="stats-grid">
+    <div class="stat"><span>Payment reviews</span><strong>{{ health.counters.pending_payment_reviews }}</strong></div>
+    <div class="stat"><span>Pending stock orders</span><strong>{{ health.counters.pending_stock_orders }}</strong></div>
+    <div class="stat"><span>Waiting payments</span><strong>{{ health.counters.waiting_payments }}</strong></div>
+    <div class="stat"><span>Payout requests</span><strong>{{ health.counters.pending_payout_requests }}</strong></div>
+    <div class="stat"><span>Replacement reports</span><strong>{{ health.counters.pending_replacement_reports }}</strong></div>
+    <div class="stat"><span>Low/out of stock</span><strong>{{ health.counters.low_or_out_of_stock_products }}</strong></div>
+  </div>
+  <p class="muted">Generated {{ fmt_dt(health.generated_at) }}.</p>
+</section>
+{% endblock %}
