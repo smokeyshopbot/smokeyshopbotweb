@@ -187,7 +187,7 @@ code { background: #030712; border: 1px solid var(--line); border-radius: 6px; p
   min-width: 92px;
   padding: 8px 14px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   background: rgba(15,23,42,.7);
   color: var(--text);
   font-size: .84rem;
@@ -833,16 +833,57 @@ body.modal-open {
   line-height: 1.45;
 }
 .stock-visibility-cell {
-  display: inline-flex;
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  text-align: center;
 }
 .stock-visibility-label {
   color: var(--muted);
   font-size: .78rem;
   text-transform: uppercase;
   letter-spacing: .04em;
+}
+
+.stock-visibility-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+}
+.stock-manager-replacement-due {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 2px;
+  color: #fbbf24;
+  font-size: .8rem;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.stock-manager-replacement-due strong {
+  color: #fde68a;
+  font-weight: 900;
+}
+.stock-manager-replacement-due small {
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+.stock-hidden-note {
+  width: 100%;
+  text-align: center;
 }
 .stock-hidden-summary {
   color: var(--muted);
@@ -2091,19 +2132,19 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
 .replacement-info-card { min-height: 100%; }
 .panel-title-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .clean-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
-.clean-detail-grid > div { background: rgba(15, 23, 42, 0.55); border: 1px solid var(--border); border-radius: 16px; padding: 12px 14px; min-width: 0; }
+.clean-detail-grid > div { background: rgba(15, 23, 42, 0.55); border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px; min-width: 0; }
 .clean-detail-grid span { display: block; color: var(--muted); font-size: 0.9rem; margin-bottom: 5px; }
 .clean-detail-grid strong { display: block; color: var(--text); overflow-wrap: anywhere; }
-.issue-box { white-space: pre-wrap; line-height: 1.55; background: rgba(2, 6, 23, 0.35); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
+.issue-box { white-space: pre-wrap; line-height: 1.55; background: rgba(2, 6, 23, 0.35); border: 1px solid var(--line); border-radius: 16px; padding: 14px; }
 .replacement-issue-box { min-height: 130px; margin: 12px 0; }
-.stock-report-pre { white-space: pre-wrap; word-break: break-word; background: rgba(2, 6, 23, 0.55); border: 1px solid var(--border); border-radius: 16px; padding: 14px; max-height: 360px; overflow: auto; }
+.stock-report-pre { white-space: pre-wrap; word-break: break-word; background: rgba(2, 6, 23, 0.55); border: 1px solid var(--line); border-radius: 16px; padding: 14px; max-height: 360px; overflow: auto; }
 .compact-stock-pre { max-height: 220px; margin: 12px 0; }
-.submitted-item-line { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(15, 23, 42, 0.45); }
+.submitted-item-line { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(15, 23, 42, 0.45); }
 .submitted-item-line span { color: var(--muted); }
 .submitted-item-line strong { overflow-wrap: anywhere; }
 .replacement-actions-panel form { margin-top: 12px; }
 .replacement-action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 14px; }
-.replacement-action-card { border: 1px solid var(--border); border-radius: 18px; background: rgba(2, 6, 23, 0.35); padding: 18px; }
+.replacement-action-card { border: 1px solid var(--line); border-radius: 18px; background: rgba(2, 6, 23, 0.35); padding: 18px; }
 .replacement-action-card h3 { margin-top: 0; }
 .warning-card { border-color: rgba(245, 158, 11, 0.32); }
 .success-card { border-color: rgba(34, 197, 94, 0.32); }
@@ -2418,7 +2459,7 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
 }
 .clean-reported-item-card,
 .reported-item-card.clean-reported-item-card {
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   background: rgba(2, 6, 23, .35);
   border-radius: 18px;
   padding: 16px;
@@ -2490,7 +2531,7 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
   min-height: 360px;
   max-width: none;
   background: rgba(2, 6, 23, .55);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
 }
 .replacement-screenshot-image {
   width: 100%;
@@ -2961,4 +3002,187 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
   .transfer-complete-links {
     text-align: left;
   }
+}
+
+/* Manual replacement report lookup */
+.manual-report-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.manual-report-heading {
+  align-items: flex-start;
+}
+
+.manual-report-form {
+  display: grid;
+  gap: 10px;
+}
+
+.manual-report-form textarea {
+  width: 100%;
+  min-height: 130px;
+  resize: vertical;
+}
+
+.manual-report-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.manual-lookup-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+
+.manual-lookup-list {
+  display: grid;
+  gap: 12px;
+}
+
+.manual-lookup-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+}
+
+.manual-lookup-card-main {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.manual-lookup-topline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.manual-lookup-item {
+  margin: 0;
+  max-height: 150px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.manual-lookup-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.manual-lookup-meta div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.manual-lookup-meta span {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+
+.manual-lookup-meta strong {
+  overflow-wrap: anywhere;
+}
+
+.manual-lookup-action {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  border-left: 1px solid var(--line);
+  padding-left: 16px;
+}
+
+.manual-lookup-action form {
+  display: grid;
+  gap: 10px;
+}
+
+.manual-lookup-action label {
+  display: grid;
+  gap: 6px;
+}
+
+.badge-muted {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+@media (max-width: 980px) {
+  .manual-lookup-card {
+    grid-template-columns: 1fr;
+  }
+  .manual-lookup-action {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    padding-left: 0;
+    padding-top: 12px;
+  }
+  .manual-lookup-meta {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .manual-lookup-meta {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+/* Replacement detail reported/fetched stock scroll area */
+.reported-items-scroll-area {
+  max-height: 640px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+.replacement-detail-scrollbox {
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+/* Let the replacement reported-items panel own the scrolling.
+   The inner submitted/fetched text blocks should not trap the mouse wheel. */
+.reported-items-scroll-area .replacement-detail-scrollbox {
+  max-height: none !important;
+  overflow: visible !important;
+  overscroll-behavior: auto;
+}
+
+.stock-manager-summary-cards-compact {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+.stock-manager-replacement-due-only {
+  margin-top: 0;
+  justify-content: center;
+  font-size: .9rem;
+}
+.stock-manager-no-replacements {
+  display: inline-block;
+  min-width: 2ch;
 }

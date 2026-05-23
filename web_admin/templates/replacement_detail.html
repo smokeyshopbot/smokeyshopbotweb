@@ -100,21 +100,23 @@
       <p class="muted">Only the user submitted text and fetched delivered stock record are shown here.</p>
     </div>
   </div>
-  <div class="reported-items-list">
-    {% for item in report_items %}
-      <div class="reported-item-card clean-reported-item-card">
-        <div class="reported-item-pair clean-reported-pair">
-          <div>
-            <span>User submitted</span>
-            <pre class="stock-report-pre compact-stock-pre replacement-item-pre">{{ item.submitted_item or report.submitted_item or '-' }}</pre>
-          </div>
-          <div>
-            <span>Fetched delivered record</span>
-            <pre class="stock-report-pre compact-stock-pre replacement-item-pre">{{ item.delivered_item or report.delivered_item or '-' }}</pre>
+  <div class="reported-items-scroll-area">
+    <div class="reported-items-list">
+      {% for item in report_items %}
+        <div class="reported-item-card clean-reported-item-card">
+          <div class="reported-item-pair clean-reported-pair">
+            <div>
+              <span>User submitted</span>
+              <pre class="stock-report-pre compact-stock-pre replacement-item-pre replacement-detail-scrollbox">{{ item.submitted_item or report.submitted_item or '-' }}</pre>
+            </div>
+            <div>
+              <span>Fetched delivered record</span>
+              <pre class="stock-report-pre compact-stock-pre replacement-item-pre replacement-detail-scrollbox">{{ item.delivered_item or report.delivered_item or '-' }}</pre>
+            </div>
           </div>
         </div>
-      </div>
-    {% endfor %}
+      {% endfor %}
+    </div>
   </div>
 </section>
 

@@ -146,7 +146,9 @@ async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return True
 
     if state.get("step") == "item":
-        matched_items = await db.find_user_delivered_stock_items_for_report(user_id, text)
+        # Allow bulk replacement reports. The old default capped matches at 20,
+        # so reports containing 30+ simple codes could only count the first 20.
+        matched_items = await db.find_user_delivered_stock_items_for_report(user_id, text, limit=200)
         if not matched_items:
             await update.message.reply_text(
                 tr(lang, "report_item_not_found"),
@@ -181,10 +183,13 @@ async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ))
         else:
             item_lines = []
-            for idx, matched in enumerate(reportable_items[:20], start=1):
+            visible_items = reportable_items[:20]
+            for idx, matched in enumerate(visible_items, start=1):
                 item_lines.append(
                     f"{idx}. `{matched.get('order_id', 'N/A')}` | {matched.get('product_name', 'Product')}"
                 )
+            if len(reportable_items) > len(visible_items):
+                item_lines.append(f"… and {len(reportable_items) - len(visible_items)} more item(s)")
             skipped_note = ""
             if already_reported_items:
                 skipped_note = tr(lang, "report_items_skipped_note", skipped=len(already_reported_items))

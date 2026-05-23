@@ -22,7 +22,7 @@
 
 {% if account.role == 'stock_manager' %}
 <section class="grid cards stock-manager-summary-cards">
-  <div class="card"><span>Total stock added</span><strong>{{ summary.total_added }}</strong><small>Lifetime stock added by this manager.</small></div>
+  <div class="card"><span>Total stock submitted</span><strong>{{ summary.total_added }}</strong><small>Normal stock uploads only. Replacement uploads are excluded.</small></div>
   <div class="card replacement-due-card"><span>Pending replacements</span><strong>{{ summary.pending_replacement_count }}</strong><small>Replacement stock this manager still needs to submit.</small></div>
   <div class="card"><span>Current stock</span><strong>{{ summary.current_stock }}</strong><small>Unsold stock still available from this manager.</small></div>
   <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered items added by this manager.</small></div>

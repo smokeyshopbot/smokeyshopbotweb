@@ -110,7 +110,7 @@
         <tr>
           <th>Product</th>
           {% if show_prices %}<th>Price</th>{% endif %}
-          <th class="stock-col">Stock</th>
+          <th class="stock-col">{{ 'Replacement due' if is_stock_manager_role else 'Stock' }}</th>
           {% if show_status_controls %}<th class="status-col">Status</th>{% endif %}
           <th class="actions-col">Actions</th>
         </tr>
@@ -145,16 +145,13 @@
         {% endif %}
         <td class="stock-cell">
           {% if is_stock_manager_role %}
-            {% set stock_count = p.visible_stock_count or 0 %}
-            <div class="stock-visibility-cell">
-              <span class="stock-visibility-label">Your stock</span>
-              {% if stock_count <= 0 %}
-                <span class="stock-number stock-zero">0</span>
-              {% else %}
-                <span class="stock-number stock-good">{{ stock_count }}</span>
-              {% endif %}
-              {% if p.hidden_stock_count %}<small class="muted">Other stock hidden</small>{% endif %}
-            </div>
+            {% if p.pending_replacement_count %}
+              <div class="stock-manager-replacement-due stock-manager-replacement-due-only">
+                <span><strong>{{ p.pending_replacement_count }}</strong> {{ 'replacement item' if p.pending_replacement_count == 1 else 'replacement items' }} needed</span>
+              </div>
+            {% else %}
+              <span class="muted stock-manager-no-replacements">—</span>
+            {% endif %}
           {% else %}
             {% set stock_count = p.available_stock or 0 %}
             {% if stock_count <= 0 %}

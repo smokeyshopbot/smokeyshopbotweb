@@ -833,9 +833,12 @@ def ensure_admin_indexes(db) -> None:
 
     db.admin_activity.create_index([("created_at", -1)])
     db.replacement_reports.create_index([("status", 1), ("created_at", -1)])
+    db.replacement_reports.create_index([("items.item_hash", 1), ("status", 1)])
     db.stock_manager_payment_requests.create_index([("status", 1), ("requested_at", -1)])
     db.stock_manager_stock_events.create_index([("username_key", 1), ("created_at", -1)])
     db.stock_manager_replacement_obligations.create_index([("username_key", 1), ("status", 1)])
+    db.stock_manager_replacement_obligations.create_index([("stock_added_by_username_key", 1), ("product_name", 1), ("fulfilled_at", 1)])
+    db.stock_manager_replacement_obligations.create_index([("source_order_id", 1), ("item_hash", 1)])
 
 
 def _login_rate_key(username: str) -> str:
@@ -1470,7 +1473,81 @@ def register_routes(app: Flask) -> None:
         )
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         counts = {key: app.db.replacement_reports.count_documents(q) for key, q in status_queries.items()}
-        return render_template("replacements.html", reports=reports, status=status, counts=counts, page=page, total_pages=total_pages, total=total)
+        return render_template(
+            "replacements.html",
+            reports=reports,
+            status=status,
+            counts=counts,
+            page=page,
+            total_pages=total_pages,
+            total=total,
+            manual_lookup=None,
+            manual_report_text="",
+        )
+
+    @app.post("/replacements/manual-lookup")
+    @login_required
+    @owner_required
+    @csrf_required
+    def manual_replacement_lookup():
+        manual_report_text = (request.form.get("manual_report_text") or "").strip()
+        status = (request.form.get("status") or "pending").strip().lower()
+        allowed_statuses = {"pending", "replaced", "cancelled"}
+        if status not in allowed_statuses:
+            status = "pending"
+        status_queries = {
+            "pending": {"status": {"$in": ["pending", "reviewing", "approved", "replacement_ready"]}},
+            "replaced": {"status": {"$in": ["replaced", "replacement_sent"]}},
+            "cancelled": {"status": {"$in": ["cancelled", "closed", "rejected"]}},
+        }
+        query: dict[str, Any] = status_queries[status]
+        page = 1
+        total = app.db.replacement_reports.count_documents(query)
+        reports = list(app.db.replacement_reports.find(query).sort("created_at", -1).limit(PAGE_SIZE))
+        total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
+        counts = {key: app.db.replacement_reports.count_documents(q) for key, q in status_queries.items()}
+        manual_lookup = None
+        if len(normalize_report_match_text(manual_report_text)) < 3:
+            flash("Paste the user's reported account/code before searching.", "error")
+        else:
+            manual_lookup = build_manual_replacement_lookup_results(app.db, manual_report_text)
+            if not manual_lookup.get("matches"):
+                flash("No delivered stock matched this manual report text.", "info")
+        return render_template(
+            "replacements.html",
+            reports=reports,
+            status=status,
+            counts=counts,
+            page=page,
+            total_pages=total_pages,
+            total=total,
+            manual_lookup=manual_lookup,
+            manual_report_text=manual_report_text,
+        )
+
+    @app.post("/replacements/manual-lookup/add-due")
+    @login_required
+    @owner_required
+    @csrf_required
+    def add_manual_replacement_due():
+        order_id = (request.form.get("order_id") or "").strip().upper()
+        item_hash = (request.form.get("item_hash") or "").strip()
+        submitted_text = (request.form.get("manual_report_text") or "").strip()
+        note = (request.form.get("manual_note") or "").strip()
+        report_id, error = create_manual_replacement_due_from_order_item(
+            app.db,
+            order_id=order_id,
+            item_hash=item_hash,
+            submitted_text=submitted_text,
+            admin_note=note,
+            added_by=current_admin_username() or "owner",
+        )
+        if error:
+            flash(error, "error")
+            return redirect(url_for("replacements"))
+        log_admin_action(app.db, "manual_replacement_due_added", f"{report_id} order={order_id}")
+        flash(f"Manual replacement due added to the original stock manager. Report {report_id} was created.", "success")
+        return redirect(url_for("replacement_detail", report_id=report_id))
 
     @app.get("/replacements/<report_id>")
     @login_required
@@ -1789,10 +1866,18 @@ def register_routes(app: Flask) -> None:
             products = [p for p in products if q_lower in str(p.get("name", "")).lower()]
         if is_stock_manager_role():
             username = current_admin_username()
+            replacement_summary = get_stock_manager_replacement_summary(app.db, username)
+            pending_replacements_by_product = {
+                product_name_key(row.get("product_name")): row
+                for row in replacement_summary.get("pending_by_product", [])
+            }
             for product in products:
                 visibility = get_stock_visibility_summary(product, username)
                 product["visible_stock_count"] = visibility["visible"]
                 product["hidden_stock_count"] = visibility["hidden"]
+                pending_replacement_row = pending_replacements_by_product.get(product_name_key(product.get("name"))) or {}
+                product["pending_replacement_count"] = int(pending_replacement_row.get("count") or 0)
+                product["pending_replacement_report_ids"] = list(pending_replacement_row.get("report_ids") or [])[:4]
 
         rows, total_pages = paginate(products, page, PAGE_SIZE)
 
@@ -3816,6 +3901,311 @@ def stock_item_hash(item: str) -> str:
     return hashlib.sha256(str(item or "").strip().encode("utf-8")).hexdigest()
 
 
+REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def normalize_report_match_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def report_emails_in_text(value: Any) -> set[str]:
+    return {m.group(0).lower() for m in REPORT_EMAIL_RE.finditer(str(value or ""))}
+
+
+def significant_report_tokens(value: Any) -> set[str]:
+    text = normalize_report_match_text(value)
+    email_domains = {email.split("@", 1)[1] for email in report_emails_in_text(text) if "@" in email}
+    tokens = set(report_emails_in_text(text))
+    ignored = {"mail", "email", "pass", "password", "login", "username", "user"}
+    for token in re.findall(r"[a-z0-9._%+\-]{5,}", text, flags=re.IGNORECASE):
+        cleaned = token.strip("._-+% ").lower()
+        if len(cleaned) < 5 or cleaned in ignored:
+            continue
+        if cleaned in email_domains:
+            continue
+        tokens.add(cleaned)
+    return tokens
+
+
+def report_submitted_item_matches(submitted: Any, delivered_item: Any) -> bool:
+    submitted_norm = normalize_report_match_text(submitted)
+    delivered_norm = normalize_report_match_text(delivered_item)
+    if not submitted_norm or not delivered_norm:
+        return False
+    submitted_emails = report_emails_in_text(submitted_norm)
+    delivered_emails = report_emails_in_text(delivered_norm)
+    if submitted_emails and delivered_emails:
+        return bool(submitted_emails.intersection(delivered_emails))
+    submitted_tokens = significant_report_tokens(submitted_norm)
+    delivered_tokens = significant_report_tokens(delivered_norm)
+    if submitted_tokens and delivered_tokens and submitted_tokens.intersection(delivered_tokens):
+        return True
+    if len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
+        return True
+    if len(delivered_norm) >= 6 and delivered_norm in submitted_norm:
+        return True
+    return submitted_norm == delivered_norm
+
+
+def report_submitted_match_snippet(submitted: Any, delivered_item: Any) -> str:
+    submitted_raw = str(submitted or "").strip()
+    delivered_raw = str(delivered_item or "").strip()
+    submitted_norm = normalize_report_match_text(submitted_raw)
+    delivered_norm = normalize_report_match_text(delivered_raw)
+    submitted_emails = report_emails_in_text(submitted_norm)
+    delivered_emails = report_emails_in_text(delivered_norm)
+    common_emails = submitted_emails.intersection(delivered_emails)
+    if common_emails:
+        email = sorted(common_emails, key=len, reverse=True)[0]
+        for line in submitted_raw.splitlines():
+            if email.lower() in line.lower():
+                return line.strip() or email
+        return email
+    if submitted_emails and delivered_emails:
+        return submitted_raw[:1000]
+    common_tokens = significant_report_tokens(submitted_norm).intersection(significant_report_tokens(delivered_norm))
+    if common_tokens:
+        token = sorted(common_tokens, key=len, reverse=True)[0]
+        for line in submitted_raw.splitlines():
+            if token.lower() in line.lower():
+                return line.strip() or token
+        return token
+    for line in submitted_raw.splitlines():
+        clean_line = line.strip()
+        if clean_line and report_submitted_item_matches(clean_line, delivered_raw):
+            return clean_line
+    return submitted_raw[:1000]
+
+
+def replacement_item_already_due(db, *, user_id: int, order_id: str, item_hash: str) -> dict | None:
+    clean_hash = str(item_hash or "").strip()
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_hash:
+        return None
+    active_report = db.replacement_reports.find_one(
+        {
+            "user_id": int(user_id or 0),
+            "$or": [{"item_hash": clean_hash}, {"items.item_hash": clean_hash}],
+            "status": {"$nin": ["cancelled", "rejected", "closed"]},
+        },
+        {"report_id": 1, "status": 1, "created_at": 1},
+        sort=[("created_at", -1)],
+    )
+    if active_report:
+        return {"kind": "report", "id": str(active_report.get("report_id") or ""), "status": str(active_report.get("status") or "")}
+    active_obligation_query = {
+        "item_hash": clean_hash,
+        "$or": [
+            {"source_order_id": clean_order_id},
+            {"order_id": clean_order_id},
+            {"source_order_id": {"$exists": False}},
+        ],
+        "$and": [{"$or": [{"fulfilled_at": {"$exists": False}}, {"fulfilled_at": None}, {"fulfilled_at": ""}]}],
+    }
+    active_obligation = db.stock_manager_replacement_obligations.find_one(
+        active_obligation_query,
+        {"report_id": 1, "created_at": 1},
+        sort=[("created_at", -1)],
+    )
+    if active_obligation:
+        return {"kind": "obligation", "id": str(active_obligation.get("report_id") or ""), "status": "pending"}
+    return None
+
+
+def build_manual_replacement_lookup_results(db, submitted_text: str, *, limit: int = 80) -> dict[str, Any]:
+    lookup = str(submitted_text or "").strip()
+    result: dict[str, Any] = {"query": lookup, "matches": [], "total_matches": 0, "limited": False, "searched_emails": sorted(report_emails_in_text(lookup))}
+    if len(normalize_report_match_text(lookup)) < 3:
+        return result
+    seen: set[tuple[str, str]] = set()
+    projection = {
+        "order_id": 1,
+        "product_name": 1,
+        "items": 1,
+        "status": 1,
+        "user_id": 1,
+        "username": 1,
+        "created_at": 1,
+        "delivered_at": 1,
+        "is_replacement": 1,
+        "manual_replacement_delivery": 1,
+        "admin_stock_delivery": 1,
+        "payment_method": 1,
+        "replacement_report_id": 1,
+    }
+    for order in db.orders.find({"status": "delivered", "items.0": {"$exists": True}}, projection).sort("delivered_at", -1):
+        order_id = str(order.get("order_id") or "").strip().upper()
+        product_name = str(order.get("product_name") or "Unknown product").strip() or "Unknown product"
+        for item in order.get("items", []) or []:
+            item_text = str(item or "").strip()
+            if not item_text or not report_submitted_item_matches(lookup, item_text):
+                continue
+            item_hash = stock_item_hash(item_text)
+            seen_key = (order_id, item_hash)
+            if seen_key in seen:
+                continue
+            seen.add(seen_key)
+            result["total_matches"] = int(result.get("total_matches") or 0) + 1
+            if len(result["matches"]) >= limit:
+                result["limited"] = True
+                continue
+            info = stock_upload_info_for_item(db, product_name, item_text)
+            uploaded_by = str(info.get("uploaded_by") or "").strip()
+            uploaded_role = str(info.get("uploaded_role") or "").strip()
+            existing_due = replacement_item_already_due(db, user_id=int(order.get("user_id", 0) or 0), order_id=order_id, item_hash=item_hash)
+            is_replacement = bool(order.get("is_replacement"))
+            try:
+                endpoint = "replacement_order_detail" if is_replacement else "order_detail"
+                order_url = url_for(endpoint, order_id=order_id)
+            except Exception:
+                order_url = ""
+            can_add_due = (
+                bool(order_id)
+                and bool(item_hash)
+                and uploaded_by
+                and uploaded_by.lower() != "unknown"
+                and not existing_due
+            )
+            result["matches"].append({
+                "order_id": order_id,
+                "order_url": order_url,
+                "product_name": product_name,
+                "user_id": int(order.get("user_id", 0) or 0),
+                "username": str(order.get("username") or ""),
+                "user_label": telegram_user_display(db, order.get("user_id"), order.get("username")),
+                "item": item_text,
+                "submitted_item": report_submitted_match_snippet(lookup, item_text),
+                "item_hash": item_hash,
+                "delivered_at": order.get("delivered_at") or order.get("created_at"),
+                "uploaded_by": uploaded_by or "Unknown",
+                "uploaded_role": uploaded_role,
+                "uploaded_at": info.get("uploaded_at"),
+                "source": "Replacement delivery" if is_replacement else ("Admin stock send" if order.get("admin_stock_delivery") else "Paid order"),
+                "existing_due": existing_due,
+                "can_add_due": can_add_due,
+                "cannot_add_reason": "" if can_add_due else ("Already added to pending replacements" if existing_due else "Original stock manager was not found"),
+            })
+    return result
+
+
+def new_manual_replacement_report_id(db) -> str:
+    for _ in range(40):
+        report_id = "MANUAL-" + secrets.token_hex(4).upper()
+        if not db.replacement_reports.find_one({"report_id": report_id}, {"_id": 1}):
+            return report_id
+    return "MANUAL-" + secrets.token_hex(6).upper()
+
+
+def create_manual_replacement_due_from_order_item(db, *, order_id: str, item_hash: str, submitted_text: str = "", admin_note: str = "", added_by: str = "owner") -> tuple[str | None, str | None]:
+    clean_order_id = str(order_id or "").strip().upper()
+    clean_hash = str(item_hash or "").strip()
+    if not clean_order_id or not clean_hash:
+        return None, "Missing order/item details. Search the manual report again and retry."
+    order = db.orders.find_one({"order_id": clean_order_id, "status": "delivered", "items.0": {"$exists": True}})
+    if not order:
+        return None, "Delivered order was not found."
+    matched_item = ""
+    for item in order.get("items", []) or []:
+        item_text = str(item or "").strip()
+        if item_text and stock_item_hash(item_text) == clean_hash:
+            matched_item = item_text
+            break
+    if not matched_item:
+        return None, "That stock item was not found inside the selected order."
+    user_id = int(order.get("user_id", 0) or 0)
+    existing_due = replacement_item_already_due(db, user_id=user_id, order_id=clean_order_id, item_hash=clean_hash)
+    if existing_due:
+        return None, f"This item is already pending as {existing_due.get('id') or 'a replacement due'}."
+    product_name = str(order.get("product_name") or "").strip()
+    if not product_name:
+        return None, "Order has no product name."
+    upload_info = stock_upload_info_for_item(db, product_name, matched_item)
+    stock_manager = str(upload_info.get("uploaded_by") or "").strip()
+    stock_manager_key = normalize_admin_username(stock_manager)
+    if not stock_manager or stock_manager.lower() == "unknown" or not stock_manager_key:
+        return None, "Original stock manager could not be found for this item."
+    now = utcnow()
+    report_id = new_manual_replacement_report_id(db)
+    submitted_item = report_submitted_match_snippet(submitted_text, matched_item) if submitted_text else matched_item[:1000]
+    clean_note = str(admin_note or "").strip()[:1000]
+    report_doc = {
+        "report_id": report_id,
+        "user_id": user_id,
+        "username": str(order.get("username") or "").strip(),
+        "product_name": product_name,
+        "order_id": clean_order_id,
+        "payment_method": str(order.get("payment_method") or ""),
+        "submitted_item": submitted_item,
+        "delivered_item": matched_item,
+        "item_hash": clean_hash,
+        "sold_at": order.get("delivered_at") or order.get("created_at"),
+        "order_created_at": order.get("created_at"),
+        "stock_added_by_username": stock_manager,
+        "stock_added_by_role": str(upload_info.get("uploaded_role") or ""),
+        "stock_added_at": upload_info.get("uploaded_at"),
+        "status": "pending",
+        "issue_text": clean_note or "Manual report added by owner from pasted user report.",
+        "screenshot_file_id": "",
+        "created_at": now,
+        "manual_report_lookup": True,
+        "manual_report_created_by": added_by or "owner",
+        "approved_at": now,
+        "approved_by": added_by or "owner",
+        "replacement_queued_at": now,
+        "replacement_admin_note": clean_note,
+        "items": [{
+            "order_id": clean_order_id,
+            "product_name": product_name,
+            "payment_method": str(order.get("payment_method") or ""),
+            "submitted_item": submitted_item,
+            "delivered_item": matched_item,
+            "item_hash": clean_hash,
+            "sold_at": order.get("delivered_at") or order.get("created_at"),
+            "order_created_at": order.get("created_at"),
+            "stock_added_by_username": stock_manager,
+            "stock_added_by_role": str(upload_info.get("uploaded_role") or ""),
+            "stock_added_at": upload_info.get("uploaded_at"),
+            "stock_metadata_product_name": product_name,
+        }],
+        "product_names": [product_name],
+        "order_ids": [clean_order_id],
+        "item_count": 1,
+        "replacement_obligation_count": 1,
+        "replacement_obligations_created_at": now,
+    }
+    obligation_key = f"{report_id}:0:{clean_hash}"
+    try:
+        db.replacement_reports.insert_one(report_doc)
+        db.stock_manager_replacement_obligations.insert_one({
+            "obligation_key": obligation_key,
+            "report_id": report_id,
+            "report_item_index": 0,
+            "product_name": product_name,
+            "submitted_item": submitted_item,
+            "delivered_item": matched_item,
+            "item_hash": clean_hash,
+            "stock_added_by_username": stock_manager,
+            "stock_added_by_username_key": stock_manager_key,
+            "stock_added_at": upload_info.get("uploaded_at"),
+            "source": "manual_report_lookup",
+            "manual_report_lookup": True,
+            "source_order_id": clean_order_id,
+            "source_user_id": user_id,
+            "source_username": str(order.get("username") or "").strip(),
+            "approved_at": now,
+            "approved_by": added_by or "owner",
+            "created_at": now,
+            "fulfilled_at": None,
+            "fulfilled_by": "",
+            "fulfilled_product_name": "",
+        })
+    except DuplicateKeyError:
+        return None, "This manual replacement due was already created."
+    return report_id, None
+
+
 def normalize_admin_username(username: str | None) -> str:
     return str(username or "").strip().lower()
 
@@ -4334,11 +4724,18 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
             row["configured_owner_due_rate_usdt"] = current_configured_owner_due
             touch_stock_manager_product_stats(row, record.get("added_at"))
 
-    for order in db.orders.find({"status": "delivered", "items.0": {"$exists": True}}, {
+    for order in db.orders.find({
+        "status": "delivered",
+        "items.0": {"$exists": True},
+        "is_replacement": {"$ne": True},
+        "payment_method": {"$ne": "replacement"},
+    }, {
         "product_name": 1,
         "items": 1,
         "delivered_at": 1,
         "created_at": 1,
+        "is_replacement": 1,
+        "payment_method": 1,
     }):
         order_product_name = str(order.get("product_name") or "")
         for item in order.get("items", []) or []:
@@ -4364,8 +4761,15 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
 
     products = []
     for row in product_rows.values():
-        row["added"] = max(int(row.get("added", 0)), int(row.get("current", 0)) + int(row.get("sold", 0)))
-        inferred_removed = max(0, int(row.get("added", 0)) - int(row.get("current", 0)) - int(row.get("sold", 0)))
+        normal_current = int(row.get("current", 0))
+        normal_sold = int(row.get("sold", 0))
+        normal_visible_total = normal_current + normal_sold
+        lifetime_uploaded_total = max(int(row.get("added", 0)), normal_visible_total)
+        row["uploaded_added"] = lifetime_uploaded_total
+        # Stock-manager totals are based on normal stock submitted by the manager.
+        # Replacement uploads are excluded earlier from add events and metadata.
+        row["added"] = lifetime_uploaded_total
+        inferred_removed = max(0, lifetime_uploaded_total - normal_visible_total)
         row["removed"] = max(int(row.get("removed", 0)), inferred_removed)
         row["manager_earning_usdt"] = round(float(row.get("manager_earning_usdt", 0.0)), 2)
         row["owner_due_usdt"] = round(float(row.get("owner_due_usdt", 0.0)), 2)

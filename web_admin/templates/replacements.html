@@ -8,6 +8,70 @@
   </div>
 </div>
 
+<section class="panel manual-report-panel">
+  <div class="section-heading-row manual-report-heading">
+    <div>
+      <h2>Manual report lookup</h2>
+      <p class="muted">Paste what the user reported manually. The panel will find the delivered stock, product, buyer, and original stock manager, then let you add it to that manager's replacement due count.</p>
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('manual_replacement_lookup') }}" class="manual-report-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="status" value="{{ status }}">
+    <textarea name="manual_report_text" rows="5" placeholder="Paste reported account/code here...">{{ manual_report_text or '' }}</textarea>
+    <div class="manual-report-actions">
+      <button type="submit" class="primary">Find delivered stock</button>
+      {% if manual_report_text %}<a class="small-button" href="{{ url_for('replacements', status=status) }}">Clear</a>{% endif %}
+    </div>
+  </form>
+
+  {% if manual_lookup %}
+    <div class="manual-lookup-summary">
+      <strong>{{ manual_lookup.total_matches }} match{{ '' if manual_lookup.total_matches == 1 else 'es' }} found</strong>
+      {% if manual_lookup.searched_emails %}<span class="muted">{{ manual_lookup.searched_emails|length }} email{{ '' if manual_lookup.searched_emails|length == 1 else 's' }} detected in the pasted report.</span>{% endif %}
+      {% if manual_lookup.limited %}<span class="warning">Showing first {{ manual_lookup.matches|length }} only.</span>{% endif %}
+    </div>
+    {% if manual_lookup.matches %}
+      <div class="manual-lookup-list">
+        {% for match in manual_lookup.matches %}
+          <article class="manual-lookup-card">
+            <div class="manual-lookup-card-main">
+              <div class="manual-lookup-topline">
+                <strong>{{ match.product_name }}</strong>
+                <span class="mini-chip">{{ match.source }}</span>
+              </div>
+              <pre class="manual-lookup-item">{{ match.item }}</pre>
+              <div class="manual-lookup-meta">
+                <div><span>Buyer</span><strong>{{ match.user_label }}</strong></div>
+                <div><span>Order</span><strong>{% if match.order_url %}<a href="{{ match.order_url }}">{{ match.order_id }}</a>{% else %}{{ match.order_id }}{% endif %}</strong></div>
+                <div><span>Delivered</span><strong>{{ fmt_dt(match.delivered_at) }}</strong></div>
+                <div><span>Stock manager</span><strong>{{ match.uploaded_by }}</strong></div>
+                <div><span>Uploaded</span><strong>{{ fmt_dt(match.uploaded_at) if match.uploaded_at else 'Unknown' }}</strong></div>
+                {% if match.existing_due %}<div><span>Already due</span><strong>{{ match.existing_due.id }}</strong></div>{% endif %}
+              </div>
+            </div>
+            <div class="manual-lookup-action">
+              {% if match.can_add_due %}
+                <form method="post" action="{{ url_for('add_manual_replacement_due') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="order_id" value="{{ match.order_id }}">
+                  <input type="hidden" name="item_hash" value="{{ match.item_hash }}">
+                  <textarea name="manual_report_text" hidden>{{ manual_report_text or '' }}</textarea>
+                  <label>Note (optional)<input name="manual_note" placeholder="Example: reported on Telegram"></label>
+                  <button type="submit" class="primary">Add due to manager</button>
+                </form>
+              {% else %}
+                <span class="badge badge-muted">Cannot add</span>
+                <small class="muted">{{ match.cannot_add_reason }}</small>
+              {% endif %}
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+</section>
+
 <section class="panel">
   <div class="toolbar replacement-toolbar">
     <form method="get" class="search-form replacement-filter-form">

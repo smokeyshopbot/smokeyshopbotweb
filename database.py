@@ -1875,6 +1875,7 @@ async def clear_pending(user_id: int):
 # ───────────────────── REPLACEMENT REPORTS ─────────────────────
 
 _REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_REPORT_ORDER_ID_RE = re.compile(r"\border\s*id\s*[:#\-]?\s*([A-Z0-9]{6,16})\b", re.IGNORECASE)
 
 
 def stock_item_hash(item: str) -> str:
@@ -1891,14 +1892,130 @@ def _emails_in_text(value: str) -> set[str]:
     return {m.group(0).lower() for m in _REPORT_EMAIL_RE.finditer(str(value or ""))}
 
 
+def _order_ids_in_report(value: str) -> set[str]:
+    return {m.group(1).upper() for m in _REPORT_ORDER_ID_RE.finditer(str(value or ""))}
+
+
+def _report_has_items_section(value: str) -> bool:
+    return any(re.match(r"^items\s*:?\s*$", str(line or "").strip(), flags=re.IGNORECASE) for line in str(value or "").splitlines())
+
+
+def _clean_report_candidate_line(line: str) -> str:
+    raw = str(line or "").strip()
+    raw = re.sub(r"^\s*[•*\-]+\s*", "", raw)
+    raw = re.sub(r"^\s*\d+[.)]\s*", "", raw)
+    raw = raw.strip(" `\t\r\n")
+    if not raw:
+        return ""
+
+    lowered = raw.lower().strip()
+    if lowered in {"order items", "items", "item", "stock items", "accounts", "account", "codes", "code"}:
+        return ""
+    if re.match(r"^(order\s*id|product|quantity|qty)\s*[:#\-]?", lowered, flags=re.IGNORECASE):
+        return ""
+    if re.match(r"^(mail|email|pass|password|mail\s*pass|username|login)\s*[:#\-]?", lowered, flags=re.IGNORECASE):
+        # Mail-format reports are handled by exact email extraction. Password-only
+        # lines must never be treated as simple-code stock identifiers.
+        return ""
+
+    labeled = re.match(r"^(?:code|item|account|account\s*id|stock)\s*[:#\-]\s*(.+)$", raw, flags=re.IGNORECASE)
+    if labeled:
+        raw = labeled.group(1).strip()
+
+    return raw.strip(" `\t\r\n")
+
+
+def _report_candidate_values(value: str) -> list[str]:
+    """Return exact report identifiers submitted by the user.
+
+    For mail-format stock this returns exact emails. For simple-code stock it
+    returns exact item/code lines. When the user forwards an order file, only
+    lines under the ``Items:`` section are used so headers like Order ID,
+    Product and Quantity cannot create extra false matches.
+    """
+    raw = str(value or "")
+    emails = sorted(_emails_in_text(raw), key=lambda x: raw.lower().find(x))
+    if emails:
+        seen: set[str] = set()
+        result: list[str] = []
+        for email in emails:
+            if email not in seen:
+                seen.add(email)
+                result.append(email)
+        return result
+
+    lines = raw.splitlines()
+    item_section_lines: list[str] = []
+    in_items = False
+    for line in lines:
+        stripped = str(line or "").strip()
+        if re.match(r"^items\s*:?\s*$", stripped, flags=re.IGNORECASE):
+            in_items = True
+            continue
+        if in_items:
+            item_section_lines.append(stripped)
+
+    candidate_lines = item_section_lines if item_section_lines else lines
+    seen_norms: set[str] = set()
+    result: list[str] = []
+    for line in candidate_lines:
+        cleaned = _clean_report_candidate_line(line)
+        if not cleaned:
+            continue
+        # Ignore very short/generic fragments; exact simple-code stock should be
+        # at least 5 chars to avoid matching words from notes or headers.
+        if len(_normalize_report_match_text(cleaned)) < 5:
+            continue
+        norm = _normalize_report_match_text(cleaned)
+        if norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        result.append(cleaned)
+    return result
+
+
+def _report_exact_candidate_match(submitted_candidates: list[str], delivered_item: str) -> bool:
+    """Strictly match one delivered item against exact submitted items/emails.
+
+    Used for forwarded order text that contains an Order ID or an Items section.
+    In that case, labels like Product/Quantity and fuzzy token matching must not
+    create extra replacement matches from another product/order.
+    """
+    if not submitted_candidates:
+        return False
+
+    delivered_values = _report_candidate_values(delivered_item)
+    delivered_norms = {_normalize_report_match_text(v) for v in delivered_values}
+    delivered_norm = _normalize_report_match_text(delivered_item)
+
+    for candidate in submitted_candidates:
+        candidate_norm = _normalize_report_match_text(candidate)
+        if not candidate_norm:
+            continue
+        if candidate_norm == delivered_norm or candidate_norm in delivered_norms:
+            return True
+    return False
+
+
 def _significant_report_tokens(value: str) -> set[str]:
     text = _normalize_report_match_text(value)
+    email_domains = {email.split("@", 1)[1] for email in _emails_in_text(text) if "@" in email}
     tokens = set(_emails_in_text(text))
     # Account IDs / usernames / short IDs are often pasted without separators.
+    # Skip generic labels and email-domain fragments so a multi-account report
+    # does not match every account from the same domain (example: example.com).
+    ignored = {
+        "mail", "email", "pass", "password", "login", "username", "user",
+        "order", "items", "item", "product", "quantity", "qty", "stock",
+        "format", "account", "accounts", "code", "codes",
+    }
     for token in re.findall(r"[a-z0-9._%+\-]{5,}", text, flags=re.IGNORECASE):
         cleaned = token.strip("._-+% ").lower()
-        if len(cleaned) >= 5:
-            tokens.add(cleaned)
+        if len(cleaned) < 5 or cleaned in ignored:
+            continue
+        if cleaned in email_domains:
+            continue
+        tokens.add(cleaned)
     return tokens
 
 
@@ -1910,20 +2027,41 @@ def _report_submitted_item_matches(submitted: str, delivered_item: str) -> bool:
 
     submitted_emails = _emails_in_text(submitted_norm)
     delivered_emails = _emails_in_text(delivered_norm)
-    if submitted_emails and delivered_emails and submitted_emails.intersection(delivered_emails):
-        return True
+    if submitted_emails and delivered_emails:
+        # Mail-format stock should match by the exact email only. Without this,
+        # shared domains like example.com can make a 10-account report count as
+        # 20+ accounts when the user bought many accounts from the same domain.
+        return bool(submitted_emails.intersection(delivered_emails))
 
-    # One pasted message can contain many emails/account IDs. Match any useful token
+    submitted_values = _report_candidate_values(submitted)
+    delivered_values = _report_candidate_values(delivered_item)
+    delivered_value_norms = {_normalize_report_match_text(v) for v in delivered_values}
+
+    if submitted_values:
+        for value in submitted_values:
+            value_norm = _normalize_report_match_text(value)
+            if not value_norm:
+                continue
+            if value_norm == delivered_norm or value_norm in delivered_value_norms:
+                return True
+            # Allow a pasted code to match a labeled delivered item such as
+            # "Code: ABCD-1234", but do not use the full report header text for
+            # broad substring matching.
+            if len(value_norm) >= 6 and value_norm in delivered_norm:
+                return True
+        submitted_token_source = "\n".join(submitted_values)
+    else:
+        submitted_token_source = submitted_norm
+
+    # One pasted message can contain many account IDs/codes. Match useful tokens
     # from the delivered stock item instead of requiring the whole message to match.
-    submitted_tokens = _significant_report_tokens(submitted_norm)
+    submitted_tokens = _significant_report_tokens(submitted_token_source)
     delivered_tokens = _significant_report_tokens(delivered_norm)
     if submitted_tokens and delivered_tokens and submitted_tokens.intersection(delivered_tokens):
         return True
 
-    # Let users send only the email/account ID or a copied part of the stock text.
-    if len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
-        return True
-    if len(delivered_norm) >= 6 and delivered_norm in submitted_norm:
+    # Let users send only the account ID/code or a copied part of the stock text.
+    if not submitted_values and len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
         return True
     return submitted_norm == delivered_norm
 
@@ -1948,8 +2086,14 @@ def _report_submitted_match_snippet(submitted: str, delivered_item: str) -> str:
             if email.lower() in line.lower():
                 return line.strip() or email
         return email
+    if submitted_emails and delivered_emails:
+        return submitted_raw[:1000]
 
-    submitted_tokens = _significant_report_tokens(submitted_norm)
+    for candidate in _report_candidate_values(submitted_raw):
+        if _report_submitted_item_matches(candidate, delivered_raw):
+            return candidate
+
+    submitted_tokens = _significant_report_tokens("\n".join(_report_candidate_values(submitted_raw)) or submitted_norm)
     delivered_tokens = _significant_report_tokens(delivered_norm)
     common_tokens = submitted_tokens.intersection(delivered_tokens)
     if common_tokens:
@@ -1988,7 +2132,7 @@ async def _find_stock_owner_record_for_item(product_name: str, item: str) -> dic
     return {"item_hash": item_hash}
 
 
-async def find_user_delivered_stock_items_for_report(user_id: int, submitted_text: str, limit: int = 20) -> list[dict]:
+async def find_user_delivered_stock_items_for_report(user_id: int, submitted_text: str, limit: int = 200) -> list[dict]:
     """Find delivered items belonging to this user from one pasted report message.
 
     The user can paste one item, only an email/account ID, or multiple account
@@ -1999,8 +2143,24 @@ async def find_user_delivered_stock_items_for_report(user_id: int, submitted_tex
     """
     matches: list[dict] = []
     seen_hashes: set[str] = set()
+    seen_submitted_keys: set[str] = set()
+    try:
+        max_matches = max(1, min(int(limit or 200), 500))
+    except Exception:
+        max_matches = 200
+
+    order_query: dict = {"user_id": int(user_id), "status": "delivered", "items.0": {"$exists": True}}
+    explicit_order_ids = _order_ids_in_report(submitted_text)
+    submitted_candidates = _report_candidate_values(submitted_text)
+    strict_order_report = bool(explicit_order_ids or _report_has_items_section(submitted_text))
+    if explicit_order_ids:
+        # When the user forwards an order TXT/caption, only search that order.
+        # This prevents the same simple code or a fuzzy token from counting an
+        # extra item from some older delivered order.
+        order_query["order_id"] = {"$in": sorted(explicit_order_ids)}
+
     cursor = get_db().orders.find(
-        {"user_id": int(user_id), "status": "delivered", "items.0": {"$exists": True}},
+        order_query,
         {"order_id": 1, "product_name": 1, "items": 1, "created_at": 1, "delivered_at": 1, "payment_method": 1},
     ).sort("delivered_at", -1)
     async for order in cursor:
@@ -2008,12 +2168,21 @@ async def find_user_delivered_stock_items_for_report(user_id: int, submitted_tex
             item_text = str(item or "").strip()
             if not item_text:
                 continue
-            if not _report_submitted_item_matches(submitted_text, item_text):
+            if strict_order_report:
+                if not _report_exact_candidate_match(submitted_candidates, item_text):
+                    continue
+            elif not _report_submitted_item_matches(submitted_text, item_text):
                 continue
             item_hash = stock_item_hash(item_text)
             if item_hash in seen_hashes:
                 continue
+            submitted_snippet = _report_submitted_match_snippet(submitted_text, item_text)
+            submitted_key = _normalize_report_match_text(submitted_snippet)
+            if submitted_key and submitted_key in seen_submitted_keys:
+                continue
             seen_hashes.add(item_hash)
+            if submitted_key:
+                seen_submitted_keys.add(submitted_key)
             owner_record = await _find_stock_owner_record_for_item(str(order.get("product_name") or ""), item_text)
             existing_report = await get_db().replacement_reports.find_one(
                 {
@@ -2029,7 +2198,7 @@ async def find_user_delivered_stock_items_for_report(user_id: int, submitted_tex
                 "product_name": str(order.get("product_name") or ""),
                 "payment_method": str(order.get("payment_method") or ""),
                 "delivered_item": item_text,
-                "submitted_item": _report_submitted_match_snippet(submitted_text, item_text),
+                "submitted_item": submitted_snippet,
                 "item_hash": item_hash,
                 "already_reported": bool(existing_report),
                 "existing_report_id": str((existing_report or {}).get("report_id") or ""),
@@ -2041,7 +2210,7 @@ async def find_user_delivered_stock_items_for_report(user_id: int, submitted_tex
                 "stock_added_at": owner_record.get("added_at"),
                 "stock_metadata_product_name": str(owner_record.get("product_name") or ""),
             })
-            if len(matches) >= max(1, int(limit or 20)):
+            if len(matches) >= max_matches:
                 return matches
     return matches
 
