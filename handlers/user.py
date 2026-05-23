@@ -91,6 +91,7 @@ def _price_label(product: dict, settings: dict, *, quantity: int = 1, lang: str 
     parts = []
     usdt_enabled = (
         _payment_enabled(settings, "usdt")
+        or _payment_enabled(settings, "polygon")
         or _payment_enabled(settings, "binance")
         or _payment_enabled(settings, "wallet_usdt")
     )
@@ -313,6 +314,8 @@ async def _load_wallet_keyboard(lang: str = "en") -> tuple[InlineKeyboardMarkup,
     rows: list[list[InlineKeyboardButton]] = []
     if _payment_enabled(settings, "usdt"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_usdt"), callback_data="wallet_currency:usdt")])
+    if _payment_enabled(settings, "polygon"):
+        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_polygon"), callback_data="wallet_currency:polygon_usdt")])
     if _payment_enabled(settings, "binance"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_binance"), callback_data="wallet_currency:binance_usdt")])
     if _payment_enabled(settings, "upi"):
@@ -1090,6 +1093,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     if not (
         _payment_enabled(payment_settings, "usdt")
         or _payment_enabled(payment_settings, "upi")
+        or _payment_enabled(payment_settings, "polygon")
         or _payment_enabled(payment_settings, "binance")
         or _payment_enabled(payment_settings, "wallet_usdt")
         or _payment_enabled(payment_settings, "wallet_inr")
@@ -1224,6 +1228,8 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
         )])
     if _payment_enabled(payment_settings, "usdt"):
         buttons.append([InlineKeyboardButton(tr(lang, "pay_usdt"), callback_data="pay:usdt")])
+    if _payment_enabled(payment_settings, "polygon"):
+        buttons.append([InlineKeyboardButton(tr(lang, "pay_polygon"), callback_data="pay:polygon")])
     if _payment_enabled(payment_settings, "binance"):
         buttons.append([InlineKeyboardButton(tr(lang, "pay_binance"), callback_data="pay:binance")])
     if wallet_inr_ok:
@@ -1364,7 +1370,7 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         return
 
     # ── External payment ──
-    if method == "usdt":
+    if method in {"usdt", "polygon"}:
         try:
             unique_usdt = await generate_unique_usdt_amount(total_usdt)
         except UniqueUsdtAmountUnavailable:
@@ -1377,14 +1383,14 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
-            method="usdt", expected_inr=total_inr, expected_usdt=total_usdt,
+            method=method, expected_inr=total_inr, expected_usdt=total_usdt,
             unique_usdt=unique_usdt
         )
         from handlers.payment import initiate_usdt_payment
         await initiate_usdt_payment(
             None, context, user_id, order_id,
             amount_inr=total_inr, unique_usdt=unique_usdt,
-            description=description
+            description=description, method=method
         )
 
     elif method == "upi":

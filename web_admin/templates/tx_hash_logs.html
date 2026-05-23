@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Tx Hash Logs{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Tx Hash Logs</h1>
+    <p>Only USDT on-chain transaction hashes are shown here. Normal UPI, Binance Pay, admin wallet adds, expired unpaid requests without a hash, and other non-hash records are hidden.</p>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="toolbar">
+    <form method="get" class="search-form">
+      <input type="text" name="q" value="{{ q }}" placeholder="Search ref / tx hash / user">
+      <select name="network">
+        <option value="all" {% if network == 'all' %}selected{% endif %}>All networks</option>
+        <option value="bep20" {% if network == 'bep20' %}selected{% endif %}>USDT (BEP20)</option>
+        <option value="polygon" {% if network == 'polygon' %}selected{% endif %}>USDT (POLYGON)</option>
+      </select>
+      <select name="result">
+        <option value="all" {% if result == 'all' %}selected{% endif %}>All results</option>
+        <option value="auto_approved" {% if result == 'auto_approved' %}selected{% endif %}>Auto-approved</option>
+        <option value="needs_review" {% if result == 'needs_review' %}selected{% endif %}>Needs review</option>
+        <option value="failed" {% if result == 'failed' %}selected{% endif %}>Failed / duplicate</option>
+        <option value="rejected" {% if result == 'rejected' %}selected{% endif %}>Rejected</option>
+        <option value="expired" {% if result == 'expired' %}selected{% endif %}>Expired</option>
+      </select>
+      <button type="submit">Filter</button>
+    </form>
+    <span class="muted">{{ total }} tx hash record(s)</span>
+  </div>
+
+  {% if payments %}
+  <div class="table-wrap">
+    <table class="tx-log-table">
+      <thead>
+        <tr>
+          <th>Order / Wallet</th>
+          {% if show_payment_user_identity %}<th>User</th>{% endif %}
+          <th>Network</th>
+          <th>Tx Hash</th>
+          <th class="status-col">Status</th>
+          <th>Expected</th>
+          <th>Received</th>
+          <th>Check details</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for p in payments %}
+        {% set tx_hash = tx_hash_log_tx_hash(p) %}
+        {% set tx_url = tx_hash_external_url(p) %}
+        {% set is_open_manual_review = p.status == 'usdt_manual_submitted' %}
+        <tr>
+          <td>
+            {% if p.pay_type == 'order' and p.order_detail_exists and can_access('order_detail') %}
+              <a href="{{ url_for('order_detail', order_id=p.ref_id) }}"><strong>{{ p.ref_id }}</strong></a>
+            {% elif p.pay_type == 'wallet' and p.user_id and can_access('user_detail') %}
+              <a href="{{ url_for('user_detail', user_id=p.user_id) }}#wallet-log-{{ p.ref_id }}"><strong>{{ p.ref_id }}</strong></a>
+            {% else %}
+              <strong>{{ p.ref_id }}</strong>
+            {% endif %}
+            <br><small>{{ p.pay_type|title }} · {{ fmt_dt(p.usdt_manual_auto_checked_at or p.confirmed_at or p.created_at) }}</small>
+            {% if p.pay_type == 'order' and p.order_product_name %}<br><small>{{ p.order_product_name }}{% if p.order_quantity %} x {{ p.order_quantity }}{% endif %}</small>{% endif %}
+          </td>
+          {% if show_payment_user_identity %}<td><a href="{{ url_for('user_detail', user_id=p.user_id) }}">{{ telegram_user_label(p.user_id, p.username) }}</a></td>{% endif %}
+          <td>{{ tx_hash_log_network_label(p) }}</td>
+          <td class="break-anywhere"><code>{% if tx_hash and tx_url %}<a href="{{ tx_url }}" target="_blank" rel="noopener noreferrer">{{ tx_hash }}</a>{% elif tx_hash %}{{ tx_hash }}{% else %}—{% endif %}</code></td>
+          <td class="status-cell"><span class="{{ payment_status_badge_class(p.status) }}">{{ payment_status_label(p.status) }}</span></td>
+          <td>{{ tx_hash_log_expected_amount(p) }}</td>
+          <td>{{ tx_hash_log_received_amount(p) }}</td>
+          <td>
+            <span class="badge">{{ tx_hash_log_result_label(p) }}</span>
+            {% if p.usdt_match_type %}<span class="badge">{{ p.usdt_match_type|replace('_', ' ')|title }}</span>{% endif %}
+            {% set diff_amount = tx_hash_log_diff_amount(p.usdt_amount_difference) %}
+            {% if diff_amount %}<span class="badge">Diff: {{ diff_amount }}</span>{% endif %}
+            {% set auto_reason = payment_auto_check_reason_display(p.usdt_manual_auto_check_reason) %}
+            {% if is_open_manual_review and auto_reason %}<div class="tx-log-warning tx-log-warning-compact"><strong>Why it needs review:</strong> {{ auto_reason }}</div>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No USDT transaction hash logs found.</p>
+  {% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}

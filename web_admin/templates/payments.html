@@ -53,7 +53,15 @@
                     {% if p.binance_name %}<div class="proof-detail-row"><span>Binance name / ID</span><strong>{{ p.binance_name }}</strong></div>{% endif %}
                     {% if p.binance_transaction_id %}<div class="proof-detail-row"><span>Auto Binance Tx ID</span><strong class="break-anywhere">{{ p.binance_transaction_id }}</strong></div>{% endif %}
                     {% if p.binance_payer_name %}<div class="proof-detail-row"><span>Auto Binance payer</span><strong>{{ p.binance_payer_name }}</strong></div>{% endif %}
-                    {% if p.usdt_txn_hash %}<div class="proof-detail-row"><span>USDT Tx hash</span><strong class="break-anywhere">{{ p.usdt_txn_hash }}</strong></div>{% endif %}
+                    {% set proof_tx_hash = tx_hash_log_tx_hash(p) %}
+                    {% set proof_tx_url = tx_hash_external_url(p) %}
+                    {% if proof_tx_hash %}<div class="proof-detail-row"><span>USDT Tx hash</span><strong class="break-anywhere">{% if proof_tx_url %}<a href="{{ proof_tx_url }}" target="_blank" rel="noopener noreferrer">{{ proof_tx_hash }}</a>{% else %}{{ proof_tx_hash }}{% endif %}</strong></div>{% endif %}
+                    {% if p.usdt_manual_auto_check_result %}<div class="proof-detail-row"><span>TxHash auto-check</span><strong>{{ tx_hash_log_result_label(p) }}</strong></div>{% endif %}
+                    {% if p.status == 'usdt_manual_submitted' %}
+                      {% set auto_reason = payment_auto_check_reason_display(p.usdt_manual_auto_check_reason) %}
+                      {% if auto_reason %}<div class="proof-detail-row"><span>Why it needs review</span><strong class="break-anywhere warning-text">{{ auto_reason }}</strong></div>{% endif %}
+                      {% if p.usdt_manual_auto_check_expected_usdt %}<div class="proof-detail-row"><span>Expected / tolerance</span><strong>{{ p.usdt_manual_auto_check_expected_usdt }} USDT ± {{ p.usdt_manual_auto_check_tolerance_usdt or '0.01' }} USDT</strong></div>{% endif %}
+                    {% endif %}
                     {% if p.notes %}<div class="proof-detail-row"><span>Notes</span><strong>{{ p.notes }}</strong></div>{% endif %}
                   </div>
                 </div>

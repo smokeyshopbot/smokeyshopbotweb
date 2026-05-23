@@ -190,12 +190,12 @@
   {% else %}<p class="muted">No replacements for this user.</p>{% endif %}
 </section>
 
-<section class="panel">
+<section class="panel" id="wallet-logs">
   <h2>Wallet top-up logs</h2>
   {% if logs %}
   <div class="table-wrap"><table class="payments-log-table"><thead><tr><th>Ref</th><th>Date</th><th>Method</th><th>Amount</th><th class="center-cell status-col">Status</th></tr></thead><tbody>
   {% for log in logs %}
-    <tr>
+    <tr id="wallet-log-{{ log.ref_id }}">
       <td>{{ log.ref_id }}{% if log.admin_wallet_adjustment and log.notes %}<br><small class="muted">{{ log.notes }}</small>{% endif %}</td>
       <td>{{ fmt_dt(log.created_at) }}</td>
       <td>{{ method_label(log.method) }}</td>

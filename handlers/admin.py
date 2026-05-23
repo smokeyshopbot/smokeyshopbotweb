@@ -36,6 +36,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from utils.messages import admin_commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text, aggregate_amount_text
 from utils.admin_notify import send_admin_message, send_admin_photo
+from utils.bscscan import get_usdt_network_label, normalize_usdt_network
 from utils.wallet_history import (
     WALLET_HISTORY_PAGE_SIZE,
     format_wallet_history_text,
@@ -1722,16 +1723,21 @@ async def send_usdt_manual_approval_request(
     """Sends admin an approval request for manual USDT verification with screenshot proof."""
     ref_id = pending["ref_id"]
     screenshot_file_id = screenshot_file_id or pending.get("usdt_screenshot_file_id")
+    network = normalize_usdt_network(pending.get("usdt_network") or pending.get("method"))
+    network_label = get_usdt_network_label(network)
+    explorer_name = "PolygonScan" if network == "polygon" else "BSCScan"
+    explorer_url = "https://polygonscan.com/tx" if network == "polygon" else "https://bscscan.com/tx"
     caption = (
         f"🔍 *Manual USDT Verification Request*\n\n"
         f"👤 User ID: `{pending['user_id']}`\n"
         f"📝 Ref: `{ref_id}`\n"
+        f"🌐 Network: *{network_label}*\n"
         f"💰 Expected Amount: ${pending['expected_usdt']:.2f} USDT\n"
         f"💰 Unique Amount: ${pending.get('unique_usdt', pending['expected_usdt']):.3f} USDT\n"
         f"📋 {order_or_wallet_info}\n\n"
         f"🔗 TxHash: `{txn_hash}`\n\n"
-        f"Verify on BSCScan:\n"
-        f"https://bscscan.com/tx/{txn_hash}"
+        f"Verify on {explorer_name}:\n"
+        f"{explorer_url}/{txn_hash}"
     )
     keyboard = InlineKeyboardMarkup([
         [

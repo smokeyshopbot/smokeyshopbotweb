@@ -43,6 +43,7 @@ from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
+from utils.bscscan import public_usdt_error_text, extract_usdt_received_amount_from_error
 
 load_dotenv()
 
@@ -59,6 +60,7 @@ LOGIN_LOCK_SECONDS = 15 * 60
 SENSITIVE_SECRET_SETTING_KEYS = {
     "bot_token",
     "bscscan_api_key",
+    "polygonscan_api_key",
     "etherscan_api_key",
     "binance_api_key",
     "binance_api_secret",
@@ -84,7 +86,7 @@ ADMIN_ROLE_DESCRIPTIONS = {
 }
 STOCK_MANAGER_PAYMENT_METHOD_LABELS = {
     "upi": "UPI",
-    "bep20": "USDT BEP20",
+    "bep20": "USDT (BEP20)",
     "binance": "Binance Pay",
 }
 ROLE_HOME_ENDPOINTS = {
@@ -185,7 +187,7 @@ ROLE_ENDPOINTS: dict[str, set[str]] = {
         "products", "product_manage", "add_stock", "remove_stock", "export_stock_csv",
     },
     ADMIN_ROLE_PAYMENT_MANAGER: {
-        "payments", "decide_payment", "telegram_file",
+        "payments", "decide_payment", "tx_hash_logs", "legacy_payment_audit_redirect", "telegram_file",
     },
     ADMIN_ROLE_ORDERS_MANAGER: {
         "orders", "order_detail", "pending_orders", "expire_stale_orders_now", "expire_order_now", "resend_order", "revoke_order_delivery",
@@ -290,11 +292,15 @@ SECRET_DEFAULTS: dict[str, Any] = {
     "support_usernames": "",
     "admin_ids": "",
     "bscscan_api_key": "",
+    "polygonscan_api_key": "",
     "etherscan_api_key": "",
     "bsc_rpc_url": "https://bsc-rpc.publicnode.com",
     "bsc_rpc_urls": "https://bsc-rpc.publicnode.com,https://bsc.drpc.org,https://rpc.ankr.com/bsc",
+    "polygon_rpc_url": "https://polygon-rpc.com",
+    "polygon_rpc_urls": "https://polygon-rpc.com,https://polygon-bor-rpc.publicnode.com,https://rpc.ankr.com/polygon",
     "usdt_lookback_seconds": "3600",
     "bsc_rpc_block_chunk_size": "450",
+    "polygon_rpc_block_chunk_size": "500",
     "binance_api_key": "",
     "binance_api_secret": "",
     "binance_api_base_url": "https://api.binance.com",
@@ -304,6 +310,7 @@ SECRET_DEFAULTS: dict[str, Any] = {
     "payment_reminder_minutes": "20",
     "usdt_verify_interval_seconds": "30",
     "bep20_required_confirmations": "3",
+    "polygon_required_confirmations": "20",
     "usdt_manual_verify_delay_minutes": "5",
     "low_stock_alert_threshold": "10",
     "restock_notification_cooldown_minutes": "60",
@@ -746,6 +753,15 @@ def create_app() -> Flask:
             "status_badge_class": status_badge_class,
             "payment_status_label": payment_status_label,
             "payment_status_badge_class": payment_status_badge_class,
+            "tx_hash_log_tx_hash": tx_hash_log_tx_hash,
+            "tx_hash_external_url": tx_hash_external_url,
+            "tx_hash_log_network_label": tx_hash_log_network_label,
+            "tx_hash_log_expected_amount": tx_hash_log_expected_amount,
+            "tx_hash_log_received_amount": tx_hash_log_received_amount,
+            "tx_hash_log_diff_amount": tx_hash_log_diff_amount,
+            "tx_hash_log_result_label": tx_hash_log_result_label,
+            "payment_auto_check_failed": payment_auto_check_failed,
+            "payment_auto_check_reason_display": payment_auto_check_reason_display,
             "user_status_badge_class": user_status_badge_class,
             "method_label": method_label,
             "order_amount_text": order_amount_text,
@@ -830,6 +846,9 @@ def ensure_admin_indexes(db) -> None:
     db.pending_payments.create_index([("user_id", 1), ("created_at", -1)])
     db.pending_payments.create_index([("reviewed_at", -1)])
     db.pending_payments.create_index([("confirmed_at", -1)])
+    db.pending_payments.create_index([("usdt_txn_hash_key", 1)])
+    db.pending_payments.create_index([("method", 1), ("created_at", -1)])
+    db.pending_payments.create_index([("usdt_manual_auto_check_result", 1), ("created_at", -1)])
 
     db.admin_activity.create_index([("created_at", -1)])
     db.replacement_reports.create_index([("status", 1), ("created_at", -1)])
@@ -878,7 +897,21 @@ def _clear_login_attempts(app: Flask, username: str) -> None:
 
 
 def _normalize_usdt_tx_hash(txn_hash: Any) -> str:
-    return str(txn_hash or "").strip().lower()
+    raw = str(txn_hash or "").strip()
+    match = re.search(r"0x[a-fA-F0-9]{64}", raw)
+    return match.group(0).lower() if match else raw.lower()
+
+
+def _normalize_usdt_network_key(network: Any = None) -> str:
+    value = str(network or "").strip().lower()
+    return "polygon" if value in {"polygon", "matic", "polygon_pos", "usdt_polygon", "polygon_usdt"} else "bep20"
+
+
+def _make_usdt_tx_hash_key(network: Any, txn_hash: Any) -> str:
+    normalized_hash = _normalize_usdt_tx_hash(txn_hash)
+    if not normalized_hash:
+        return ""
+    return f"{_normalize_usdt_network_key(network)}:{normalized_hash}"
 
 
 def _usdt_tx_hash_exact_query(txn_hash: Any) -> dict:
@@ -890,6 +923,7 @@ def _usdt_tx_hash_exact_query(txn_hash: Any) -> dict:
         "$or": [
             {"usdt_transaction_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
             {"usdt_txn_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
+            {"usdt_txn_hash_key": {"$regex": f":{escaped}$", "$options": "i"}},
         ]
     }
 
@@ -903,6 +937,104 @@ def _find_used_usdt_tx_hash(db, txn_hash: Any, *, exclude_ref_id: str | None = N
         query = {"$and": [query, {"ref_id": {"$ne": exclude_ref_id}}]}
     return db.pending_payments.find_one(query)
 
+
+
+
+def tx_hash_log_tx_hash(payment: dict) -> str:
+    """Return the saved USDT transaction hash for the Tx Hash Logs page."""
+    for key in ("usdt_transaction_hash", "usdt_txn_hash"):
+        value = str((payment or {}).get(key) or "").strip()
+        if value:
+            return value
+    key_value = str((payment or {}).get("usdt_txn_hash_key") or "").strip()
+    if ":" in key_value:
+        maybe_hash = key_value.rsplit(":", 1)[-1].strip()
+        if maybe_hash:
+            return maybe_hash
+    return ""
+
+
+def tx_hash_log_network_key(payment: dict) -> str:
+    network = str((payment or {}).get("usdt_network") or "").strip().lower()
+    key_value = str((payment or {}).get("usdt_txn_hash_key") or "").strip().lower()
+    method = str((payment or {}).get("method") or "").strip().lower()
+    if network == "polygon" or key_value.startswith("polygon:") or method in {"polygon", "usdt_polygon"}:
+        return "polygon"
+    return "bep20"
+
+
+def tx_hash_log_network_label(payment: dict) -> str:
+    return "USDT (POLYGON)" if tx_hash_log_network_key(payment) == "polygon" else "USDT (BEP20)"
+
+
+def tx_hash_external_url(payment: dict) -> str:
+    tx_hash = tx_hash_log_tx_hash(payment)
+    if not tx_hash:
+        return ""
+    if tx_hash_log_network_key(payment) == "polygon":
+        return f"https://polygonscan.com/tx/{tx_hash}"
+    return f"https://bscscan.com/tx/{tx_hash}"
+
+
+def tx_hash_log_usdt(value: Any) -> str:
+    """Format USDT amounts with 3 decimals only on the Tx Hash Logs page."""
+    try:
+        return f"${float(value or 0):.3f} USDT"
+    except (TypeError, ValueError):
+        return "$0.000 USDT"
+
+
+def tx_hash_log_expected_amount(payment: dict) -> str:
+    return tx_hash_log_usdt((payment or {}).get("unique_usdt") or (payment or {}).get("expected_usdt") or (payment or {}).get("load_amount") or 0)
+
+
+def tx_hash_log_received_amount(payment: dict) -> str:
+    value = (payment or {}).get("usdt_transaction_amount") or (payment or {}).get("usdt_manual_auto_check_received_usdt")
+    if not str(value or "").strip():
+        value = extract_usdt_received_amount_from_error((payment or {}).get("usdt_manual_auto_check_reason"))
+    return tx_hash_log_usdt(value) if str(value or "").strip() else "—"
+
+
+def tx_hash_log_diff_amount(value: Any) -> str:
+    """Format Tx Hash Logs difference values with 3 decimals."""
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        return f"{float(raw):.3f} USDT"
+    except (TypeError, ValueError):
+        return ""
+
+
+def tx_hash_log_result_label(payment: dict) -> str:
+    status = str((payment or {}).get("status") or "").strip().lower()
+
+    # Once an admin or auto flow has reached a final payment status, show that
+    # final status instead of an older manual-hash failure/check label.
+    if status in {"confirmed", "approved", "completed", "rejected", "expired"}:
+        return payment_status_label(status)
+
+    manual_result = str((payment or {}).get("usdt_manual_auto_check_result") or "").strip().lower()
+    if manual_result == "passed":
+        return "Manual TxHash auto-approved"
+    if manual_result == "duplicate":
+        return "Duplicate TxHash blocked"
+    if manual_result in {"failed", "error"}:
+        return "Manual TxHash needs review"
+    if (payment or {}).get("usdt_auto_verified"):
+        return "USDT auto-approved"
+    if status == "usdt_manual_submitted":
+        return "Waiting for admin review"
+    return payment_status_label(status)
+
+
+def payment_auto_check_failed(payment: dict) -> bool:
+    return str((payment or {}).get("usdt_manual_auto_check_result") or "").strip().lower() in {"failed", "error", "duplicate"}
+
+
+def payment_auto_check_reason_display(reason: str | None) -> str:
+    """Compact old and new manual TxHash failure reasons for WebAdmin."""
+    return public_usdt_error_text(reason or "") if str(reason or "").strip() else ""
 
 def _count_duplicate_field_values(db, collection_name: str, field_name: str, *, non_empty_string_only: bool = True) -> int:
     match: dict[str, Any] = {field_name: {"$exists": True}}
@@ -929,7 +1061,7 @@ def build_system_health(db) -> dict[str, Any]:
     settings = get_secret_settings(db)
     payment_settings = get_payment_settings(db)
     enabled_methods = [
-        label for key, label in [("upi", "UPI"), ("usdt", "USDT BEP20"), ("binance", "Binance Pay"), ("wallet_inr", "INR Wallet"), ("wallet_usdt", "USDT Wallet")]
+        label for key, label in [("upi", "UPI"), ("usdt", "USDT (BEP20)"), ("binance", "Binance Pay"), ("wallet_inr", "INR Wallet"), ("wallet_usdt", "USDT Wallet")]
         if payment_method_enabled(payment_settings, key)
     ]
 
@@ -953,7 +1085,7 @@ def build_system_health(db) -> dict[str, Any]:
     usdt_cfg = payment_settings.get("usdt_bep20", {}) if isinstance(payment_settings, dict) else {}
     if usdt_cfg.get("enabled"):
         checks.append({
-            "name": "USDT BEP20 wallet",
+            "name": "USDT (BEP20) wallet",
             "status": "ok" if usdt_cfg.get("wallet_address") else "error",
             "detail": "Wallet address saved" if usdt_cfg.get("wallet_address") else "Enabled but wallet address missing",
         })
@@ -969,7 +1101,8 @@ def build_system_health(db) -> dict[str, Any]:
     duplicate_order_ids = _count_duplicate_field_values(db, "orders", "order_id", non_empty_string_only=True)
     duplicate_usdt_hashes = _count_duplicate_field_values(db, "pending_payments", "usdt_transaction_hash", non_empty_string_only=True)
     duplicate_usdt_manual_hashes = _count_duplicate_field_values(db, "pending_payments", "usdt_txn_hash", non_empty_string_only=True)
-    duplicate_usdt_hashes += duplicate_usdt_manual_hashes
+    duplicate_usdt_key_hashes = _count_duplicate_field_values(db, "pending_payments", "usdt_txn_hash_key", non_empty_string_only=True)
+    duplicate_usdt_hashes += duplicate_usdt_manual_hashes + duplicate_usdt_key_hashes
     checks.append({
         "name": "Order ID uniqueness",
         "status": "ok" if duplicate_order_ids == 0 else "warning",
@@ -1109,11 +1242,12 @@ def register_routes(app: Flask) -> None:
         def build_dashboard_state() -> dict[str, Any]:
             stats = get_bot_stats(app.db)
             low_stock_rows = get_low_stock_products(app.db, limit=8)
-            recent_orders = _attach_order_display_status(list(
-                app.db.orders.find({"is_replacement": {"$ne": True}})
-                .sort("created_at", -1)
-                .limit(5)
-            ))
+            recent_orders = _attach_order_display_status(
+                recent_created_rows(
+                    app.db.orders.find({"is_replacement": {"$ne": True}}),
+                    limit=5,
+                )
+            )
             return {
                 "stats": stats,
                 "maintenance": bool(get_setting(app.db, "maintenance_mode", False)),
@@ -1191,10 +1325,10 @@ def register_routes(app: Flask) -> None:
         if request.form.get("spanish_enabled") == "1":
             enabled_languages.append("es")
         plain_secret_form_keys = [
-            "support_usernames", "admin_ids", "bsc_rpc_url", "bsc_rpc_urls", "usdt_lookback_seconds", "bsc_rpc_block_chunk_size",
+            "support_usernames", "admin_ids", "bsc_rpc_url", "bsc_rpc_urls", "polygon_rpc_url", "polygon_rpc_urls", "usdt_lookback_seconds", "bsc_rpc_block_chunk_size", "polygon_rpc_block_chunk_size",
             "binance_api_base_url", "binance_recv_window_ms", "binance_pay_history_lookback_seconds",
             "payment_timeout_minutes", "payment_reminder_minutes", "usdt_verify_interval_seconds",
-            "bep20_required_confirmations", "usdt_manual_verify_delay_minutes", "low_stock_alert_threshold",
+            "bep20_required_confirmations", "polygon_required_confirmations", "usdt_manual_verify_delay_minutes", "low_stock_alert_threshold",
             "restock_notification_cooldown_minutes", "admin_panel_username",
         ]
         for key in plain_secret_form_keys:
@@ -1213,6 +1347,7 @@ def register_routes(app: Flask) -> None:
             ("payment_reminder_minutes", "Payment reminder minutes", 1),
             ("usdt_verify_interval_seconds", "USDT verify interval seconds", 5),
             ("bep20_required_confirmations", "BEP20 required confirmations", 1),
+            ("polygon_required_confirmations", "Polygon required confirmations", 1),
             ("usdt_manual_verify_delay_minutes", "Manual verification delay minutes", 0),
             ("low_stock_alert_threshold", "Low stock alert threshold", 1),
             ("restock_notification_cooldown_minutes", "Restock notification cooldown minutes", 1),
@@ -1683,6 +1818,10 @@ def register_routes(app: Flask) -> None:
                 "enabled": request.form.get("usdt_bep20_enabled") == "1",
                 "wallet_address": request.form.get("usdt_wallet_address", "").strip(),
             },
+            "usdt_polygon": {
+                "enabled": request.form.get("usdt_polygon_enabled") == "1",
+                "wallet_address": request.form.get("usdt_polygon_wallet_address", "").strip(),
+            },
             "upi": {
                 "enabled": request.form.get("upi_enabled") == "1",
                 "upi_id": request.form.get("upi_id", "").strip(),
@@ -1700,7 +1839,9 @@ def register_routes(app: Flask) -> None:
         }
         errors = []
         if settings["usdt_bep20"]["enabled"] and not settings["usdt_bep20"]["wallet_address"]:
-            errors.append("USDT BEP20 wallet address is required when USDT BEP20 is enabled.")
+            errors.append("USDT (BEP20) wallet address is required when USDT (BEP20) is enabled.")
+        if settings["usdt_polygon"]["enabled"] and not settings["usdt_polygon"]["wallet_address"]:
+            errors.append("USDT (POLYGON) wallet address is required when USDT (POLYGON) is enabled.")
         if settings["upi"]["enabled"] and not settings["upi"]["upi_id"]:
             errors.append("UPI ID is required when UPI is enabled.")
         if settings["binance"]["enabled"] and not settings["binance"]["binance_pay_id"]:
@@ -1708,7 +1849,7 @@ def register_routes(app: Flask) -> None:
         wallet_limit_checks = []
         if settings["upi"].get("enabled"):
             wallet_limit_checks.append(("min_inr", "Minimum INR wallet top-up"))
-        if settings["usdt_bep20"].get("enabled") or settings["binance"].get("enabled"):
+        if settings["usdt_bep20"].get("enabled") or settings["usdt_polygon"].get("enabled") or settings["binance"].get("enabled"):
             wallet_limit_checks.append(("min_usdt", "Minimum USDT wallet top-up"))
         for key, label in wallet_limit_checks:
             try:
@@ -2428,9 +2569,9 @@ def register_routes(app: Flask) -> None:
             flash("User not found.", "error")
             return redirect(url_for("users"))
         stats = get_user_order_stats(app.db, user_id)
-        orders = list(app.db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}).sort("created_at", -1).limit(10))
-        recent_replacements = list(app.db.orders.find({"user_id": user_id, "is_replacement": True}).sort("created_at", -1).limit(10))
-        logs = list(app.db.pending_payments.find({"user_id": user_id, "pay_type": "wallet"}).sort("created_at", -1).limit(10))
+        orders = recent_created_rows(app.db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}), limit=10)
+        recent_replacements = recent_created_rows(app.db.orders.find({"user_id": user_id, "is_replacement": True}), limit=10)
+        logs = recent_created_rows(app.db.pending_payments.find({"user_id": user_id, "pay_type": "wallet"}), limit=10)
         user_language = lang_from_user(user)
         products_for_send = get_products_with_availability(app.db, include_disabled=True)
         send_stock_duplicate_warning = session.pop("send_stock_duplicate_warning", None)
@@ -3178,7 +3319,13 @@ def register_routes(app: Flask) -> None:
             query["payment_method"] = method
         page = int_arg("page", 1, minimum=1)
         total = app.db.orders.count_documents(query)
-        rows = _attach_order_display_status(list(app.db.orders.find(query).sort("created_at", -1).skip((page - 1) * PAGE_SIZE).limit(PAGE_SIZE)))
+        rows = _attach_order_display_status(
+            recent_created_rows(
+                app.db.orders.find(query),
+                skip=(page - 1) * PAGE_SIZE,
+                limit=PAGE_SIZE,
+            )
+        )
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         filter_value = f"status:{status}" if status else (f"method:{method}" if method else "")
         return render_template("orders.html", orders=rows, page=page, total_pages=total_pages, total=total, q=q, status=status, method=method, methods=methods, filter_value=filter_value)
@@ -3500,7 +3647,11 @@ def register_routes(app: Flask) -> None:
             query = {"$or": manual_review_query()} if current_admin_role() == ADMIN_ROLE_PAYMENT_MANAGER else {}
         page = int_arg("page", 1, minimum=1)
         total = app.db.pending_payments.count_documents(query)
-        rows = list(app.db.pending_payments.find(query).sort("created_at", -1).skip((page - 1) * PAGE_SIZE).limit(PAGE_SIZE))
+        rows = recent_created_rows(
+            app.db.pending_payments.find(query),
+            skip=(page - 1) * PAGE_SIZE,
+            limit=PAGE_SIZE,
+        )
         order_refs = [
             str(p.get("ref_id") or "").upper()
             for p in rows
@@ -3522,6 +3673,117 @@ def register_routes(app: Flask) -> None:
                 payment["order_quantity"] = order.get("quantity")
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         return render_template("payments.html", payments=rows, status=status, page=page, total_pages=total_pages, total=total)
+
+
+    @app.get("/payment-audit")
+    @login_required
+    def legacy_payment_audit_redirect():
+        return redirect(url_for("tx_hash_logs"))
+
+    @app.get("/tx-hash-logs")
+    @login_required
+    def tx_hash_logs():
+        network = request.args.get("network", "all")
+        result = request.args.get("result", "all")
+        q = str(request.args.get("q", "") or "").strip()
+        allowed_networks = {"all", "bep20", "polygon"}
+        allowed_results = {"all", "auto_approved", "needs_review", "failed", "rejected", "expired"}
+        if network not in allowed_networks:
+            network = "all"
+        if result not in allowed_results:
+            result = "all"
+
+        tx_hash_filter = {"$or": [
+            {"usdt_transaction_hash": {"$exists": True, "$type": "string", "$gt": ""}},
+            {"usdt_txn_hash": {"$exists": True, "$type": "string", "$gt": ""}},
+            {"usdt_txn_hash_key": {"$regex": r":0x[a-fA-F0-9]{64}$"}},
+        ]}
+        filters: list[dict[str, Any]] = [tx_hash_filter]
+
+        if network == "polygon":
+            filters.append({"$or": [
+                {"method": {"$in": ["polygon", "usdt_polygon"]}},
+                {"usdt_network": "polygon"},
+                {"usdt_txn_hash_key": {"$regex": "^polygon:", "$options": "i"}},
+            ]})
+        elif network == "bep20":
+            filters.append({"$or": [
+                {"method": {"$in": ["usdt", "bep20"]}},
+                {"usdt_network": {"$in": ["bep20", "bsc", "bscscan"]}},
+                {"usdt_txn_hash_key": {"$regex": "^bep20:", "$options": "i"}},
+                {"usdt_txn_hash_key": {"$regex": "^bsc:", "$options": "i"}},
+            ]})
+
+        if result == "auto_approved":
+            filters.append({"$or": [
+                {"usdt_auto_verified": True},
+                {"usdt_manual_auto_check_result": "passed"},
+            ]})
+        elif result == "needs_review":
+            filters.append({"status": "usdt_manual_submitted"})
+        elif result == "failed":
+            filters.append({"$and": [
+                {"usdt_manual_auto_check_result": {"$in": ["failed", "error", "duplicate"]}},
+                {"status": {"$nin": ["confirmed", "approved", "completed", "rejected", "expired"]}},
+            ]})
+        elif result == "rejected":
+            filters.append({"status": "rejected"})
+        elif result == "expired":
+            filters.append({"status": "expired"})
+
+        if q:
+            escaped = re.escape(q)
+            search_filter: dict[str, Any] = {"$or": [
+                {"ref_id": {"$regex": escaped, "$options": "i"}},
+                {"usdt_transaction_hash": {"$regex": escaped, "$options": "i"}},
+                {"usdt_txn_hash": {"$regex": escaped, "$options": "i"}},
+                {"usdt_txn_hash_key": {"$regex": escaped, "$options": "i"}},
+            ]}
+            if q.isdigit():
+                search_filter["$or"].append({"user_id": int(q)})
+            if show_payment_user_identity():
+                username_q = q.lstrip("@").strip()
+                if username_q:
+                    username_regex = {"$regex": re.escape(username_q), "$options": "i"}
+                    search_filter["$or"].append({"username": username_regex})
+                    matching_user_ids = [
+                        int(user.get("user_id"))
+                        for user in app.db.users.find({"username": username_regex}, {"user_id": 1})
+                        if user.get("user_id") is not None
+                    ]
+                    if matching_user_ids:
+                        search_filter["$or"].append({"user_id": {"$in": sorted(set(matching_user_ids))}})
+            filters.append(search_filter)
+
+        query = {"$and": filters} if len(filters) > 1 else filters[0]
+        page = int_arg("page", 1, minimum=1)
+        total = app.db.pending_payments.count_documents(query)
+        rows = recent_created_rows(
+            app.db.pending_payments.find(query),
+            skip=(page - 1) * PAGE_SIZE,
+            limit=PAGE_SIZE,
+        )
+        order_refs = [str(p.get("ref_id") or "").upper() for p in rows if p.get("pay_type") == "order" and p.get("ref_id")]
+        if order_refs:
+            order_rows = app.db.orders.find({"order_id": {"$in": order_refs}}, {"order_id": 1, "product_name": 1, "quantity": 1})
+            orders_by_id = {str(order.get("order_id") or "").upper(): order for order in order_rows}
+            for payment in rows:
+                order = orders_by_id.get(str(payment.get("ref_id") or "").upper())
+                if order:
+                    payment["order_detail_exists"] = True
+                    payment["order_product_name"] = order.get("product_name")
+                    payment["order_quantity"] = order.get("quantity")
+        total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
+        return render_template(
+            "tx_hash_logs.html",
+            payments=rows,
+            network=network,
+            result=result,
+            q=q,
+            page=page,
+            total_pages=total_pages,
+            total=total,
+        )
 
 
     @app.get("/api/live-state")
@@ -3575,7 +3837,15 @@ def register_routes(app: Flask) -> None:
 
         # Match the bot's semantics: UPI/Binance become approved; manual USDT becomes confirmed.
         approved_status = "confirmed" if current_status == "usdt_manual_submitted" else "approved"
-        app.db.pending_payments.update_one({"ref_id": ref_id}, {"$set": {"status": approved_status, "reviewed_at": utcnow()}})
+        update_fields = {"status": approved_status, "reviewed_at": utcnow()}
+        if current_status == "usdt_manual_submitted" and txn_hash:
+            network = pending.get("usdt_network") or pending.get("method")
+            update_fields.update({
+                "usdt_txn_hash": txn_hash,
+                "usdt_txn_hash_key": _make_usdt_tx_hash_key(network, txn_hash),
+                "usdt_network": _normalize_usdt_network_key(network),
+            })
+        app.db.pending_payments.update_one({"ref_id": ref_id}, {"$set": update_fields})
         if pending.get("pay_type") == "order":
             complete_order(app.db, int(pending.get("user_id", 0) or 0), ref_id)
         else:
@@ -5466,6 +5736,7 @@ PAYMENT_SETTINGS_KEY = "payment_settings"
 
 DEFAULT_PAYMENT_SETTINGS = {
     "usdt_bep20": {"enabled": False, "wallet_address": ""},
+    "usdt_polygon": {"enabled": False, "wallet_address": ""},
     "upi": {"enabled": False, "upi_id": "", "upi_name": ""},
     "binance": {"enabled": False, "binance_pay_id": "", "binance_pay_name": ""},
     "wallet_limits": {"min_inr": "50", "min_usdt": "1"},
@@ -5503,6 +5774,8 @@ def clean_payment_settings(settings: dict | None) -> dict:
             cleaned["usdt_bep20"]["enabled"] = bool(settings.get("usdt_enabled"))
     if not cleaned["usdt_bep20"].get("wallet_address"):
         cleaned["usdt_bep20"]["enabled"] = False
+    if not cleaned["usdt_polygon"].get("wallet_address"):
+        cleaned["usdt_polygon"]["enabled"] = False
     if not cleaned["upi"].get("upi_id"):
         cleaned["upi"]["enabled"] = False
     if not cleaned["binance"].get("binance_pay_id"):
@@ -5531,12 +5804,14 @@ def payment_method_enabled(settings: dict, method: str) -> bool:
     settings = clean_payment_settings(settings)
     if method in {"usdt", "usdt_bep20", "bep20"}:
         return bool(settings["usdt_bep20"].get("enabled") and settings["usdt_bep20"].get("wallet_address"))
+    if method in {"polygon", "usdt_polygon", "polygon_usdt"}:
+        return bool(settings["usdt_polygon"].get("enabled") and settings["usdt_polygon"].get("wallet_address"))
     if method in {"upi", "inr", "wallet_inr"}:
         return bool(settings["upi"].get("enabled") and settings["upi"].get("upi_id"))
     if method in {"binance", "binance_pay", "binance_usdt"}:
         return bool(settings["binance"].get("enabled") and settings["binance"].get("binance_pay_id"))
     if method == "wallet_usdt":
-        return payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "binance")
+        return payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "polygon") or payment_method_enabled(settings, "binance")
     return False
 
 
@@ -5545,7 +5820,7 @@ def get_active_payment_currencies(db) -> set[str]:
     currencies: set[str] = set()
     if payment_method_enabled(settings, "upi"):
         currencies.add("inr")
-    if payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "binance"):
+    if payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "polygon") or payment_method_enabled(settings, "binance"):
         currencies.add("usdt")
     return currencies
 
@@ -6234,7 +6509,7 @@ def paid_usdt_expr() -> dict:
     method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
     return {"$cond": [
         {"$or": [
-            {"$in": [method, ["usdt", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"]]},
+            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"]]},
             {"$regexMatch": {"input": method, "regex": "usdt"}},
             {"$regexMatch": {"input": method, "regex": "binance"}},
             {"$regexMatch": {"input": method, "regex": "bep20"}},
@@ -6961,6 +7236,23 @@ def sort_dt(value: Any) -> float:
     return dt.timestamp()
 
 
+def recent_created_rows(rows: Any, *, skip: int = 0, limit: int | None = None) -> list[dict]:
+    """Return rows sorted newest-first using Python date parsing.
+
+    Some older payment/order documents may have ``created_at`` stored as an ISO
+    string while newer/admin-generated rows use Mongo dates. Mongo sorts mixed
+    BSON types separately, which can put a newer wallet top-up below older admin
+    wallet rows. Sorting through ``sort_dt`` keeps WebAdmin lists consistently
+    date-wise regardless of the stored type.
+    """
+    sorted_rows = sorted(list(rows), key=lambda row: sort_dt((row or {}).get("created_at")), reverse=True)
+    start = max(0, int(skip or 0))
+    if limit is None:
+        return sorted_rows[start:]
+    end = start + max(0, int(limit or 0))
+    return sorted_rows[start:end]
+
+
 def money_inr(value: Any) -> str:
     try:
         return f"₹{float(value or 0):.2f}"
@@ -7001,7 +7293,7 @@ def order_paid_amounts(order: dict) -> tuple[float, float]:
     usdt = float(order.get("amount_usdt") or 0)
     if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
         return inr, 0.0
-    if method in {"usdt", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"} or "usdt" in method or "binance" in method or "bep20" in method or "admin_stock" in method:
+    if method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"} or "usdt" in method or "polygon" in method or "binance" in method or "bep20" in method or "admin_stock" in method:
         return 0.0, usdt
     if usdt and not inr:
         return 0.0, usdt
@@ -7080,7 +7372,9 @@ def method_label(method: str | None) -> str:
     method = (method or "").lower()
     return {
         "upi": "UPI",
-        "usdt": "USDT BEP20",
+        "usdt": "USDT (BEP20)",
+        "polygon": "USDT (POLYGON)",
+        "usdt_polygon": "USDT (POLYGON)",
         "binance": "Binance Pay",
         "replacement": "Replacement",
         "admin": "Admin wallet adjustment",

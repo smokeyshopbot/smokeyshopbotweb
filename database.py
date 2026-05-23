@@ -866,7 +866,7 @@ def _order_paid_amounts(order: dict) -> tuple[float, float]:
     if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
         return amount_inr, 0.0
     if (
-        method in {"usdt", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"}
+        method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"}
         or "usdt" in method
         or "binance" in method
         or "bep20" in method
@@ -897,7 +897,7 @@ def _paid_usdt_mongo_expr() -> dict:
     method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
     return {"$cond": [
         {"$or": [
-            {"$in": [method, ["usdt", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"]]},
+            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"]]},
             {"$regexMatch": {"input": method, "regex": "usdt"}},
             {"$regexMatch": {"input": method, "regex": "binance"}},
             {"$regexMatch": {"input": method, "regex": "bep20"}},
@@ -1079,6 +1079,10 @@ DEFAULT_PAYMENT_SETTINGS = {
         "enabled": False,
         "wallet_address": "",
     },
+    "usdt_polygon": {
+        "enabled": False,
+        "wallet_address": "",
+    },
     "upi": {
         "enabled": False,
         "upi_id": "",
@@ -1140,6 +1144,8 @@ def _clean_payment_settings(settings: dict | None) -> dict:
     # Do not allow a method to be enabled without the details required for users.
     if not cleaned["usdt_bep20"].get("wallet_address"):
         cleaned["usdt_bep20"]["enabled"] = False
+    if not cleaned["usdt_polygon"].get("wallet_address"):
+        cleaned["usdt_polygon"]["enabled"] = False
     if not cleaned["upi"].get("upi_id"):
         cleaned["upi"]["enabled"] = False
     if not cleaned["binance"].get("binance_pay_id"):
@@ -1169,12 +1175,14 @@ def payment_method_enabled(settings: dict, method: str) -> bool:
     settings = _clean_payment_settings(settings)
     if method in {"usdt", "usdt_bep20", "bep20"}:
         return bool(settings["usdt_bep20"].get("enabled") and settings["usdt_bep20"].get("wallet_address"))
+    if method in {"polygon", "usdt_polygon", "polygon_usdt"}:
+        return bool(settings["usdt_polygon"].get("enabled") and settings["usdt_polygon"].get("wallet_address"))
     if method in {"upi", "inr", "wallet_inr"}:
         return bool(settings["upi"].get("enabled") and settings["upi"].get("upi_id"))
     if method in {"binance", "binance_pay", "binance_usdt"}:
         return bool(settings["binance"].get("enabled") and settings["binance"].get("binance_pay_id"))
     if method == "wallet_usdt":
-        return payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "binance")
+        return payment_method_enabled(settings, "usdt") or payment_method_enabled(settings, "polygon") or payment_method_enabled(settings, "binance")
     return False
 
 
@@ -1182,6 +1190,7 @@ async def get_enabled_payment_methods() -> dict:
     settings = await get_payment_settings()
     return {
         "usdt": payment_method_enabled(settings, "usdt"),
+        "polygon": payment_method_enabled(settings, "polygon"),
         "upi": payment_method_enabled(settings, "upi"),
         "binance": payment_method_enabled(settings, "binance"),
         "wallet_inr": payment_method_enabled(settings, "wallet_inr"),
@@ -1377,12 +1386,30 @@ async def confirm_pending_payment_if_waiting(ref_id: str) -> Optional[dict]:
 
 
 def normalize_usdt_tx_hash(txn_hash: str | None) -> str:
-    """Normalize BEP20 tx hashes for duplicate checks.
+    """Normalize EVM USDT tx hashes for duplicate checks.
 
-    BSC transaction hashes are hexadecimal and should be treated
-    case-insensitively. Keep only surrounding whitespace removed.
+    Users often paste a full explorer URL. Extract the first 0x-prefixed
+    32-byte transaction hash when present and store it lowercase.
     """
-    return str(txn_hash or "").strip().lower()
+    raw = str(txn_hash or "").strip()
+    match = re.search(r"0x[a-fA-F0-9]{64}", raw)
+    return match.group(0).lower() if match else raw.lower()
+
+
+def is_valid_usdt_tx_hash(txn_hash: str | None) -> bool:
+    return bool(re.fullmatch(r"0x[a-f0-9]{64}", normalize_usdt_tx_hash(txn_hash)))
+
+
+def normalize_usdt_network_key(network: str | None = None) -> str:
+    value = str(network or "").strip().lower()
+    return "polygon" if value in {"polygon", "matic", "polygon_pos", "usdt_polygon", "polygon_usdt"} else "bep20"
+
+
+def make_usdt_tx_hash_key(network: str | None, txn_hash: str | None) -> str:
+    normalized_hash = normalize_usdt_tx_hash(txn_hash)
+    if not normalized_hash:
+        return ""
+    return f"{normalize_usdt_network_key(network)}:{normalized_hash}"
 
 
 def _usdt_tx_hash_from_transaction(transaction: dict | None) -> str:
@@ -1399,6 +1426,7 @@ def _usdt_tx_hash_exact_query(txn_hash: str) -> dict:
         "$or": [
             {"usdt_transaction_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
             {"usdt_txn_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
+            {"usdt_txn_hash_key": {"$regex": f":{escaped}$", "$options": "i"}},
         ]
     }
 
@@ -1440,6 +1468,8 @@ async def confirm_pending_usdt_payment_if_waiting(ref_id: str, transaction: dict
         update.update({
             "usdt_auto_verified": True,
             "usdt_transaction_hash": tx_hash,
+            "usdt_txn_hash_key": make_usdt_tx_hash_key((transaction or {}).get("network"), tx_hash),
+            "usdt_network": normalize_usdt_network_key((transaction or {}).get("network")),
             "usdt_transaction_amount": str((transaction or {}).get("match_actual_usdt") or (transaction or {}).get("value_usdt") or ""),
             "usdt_expected_amount": str((transaction or {}).get("match_expected_usdt") or ""),
             "usdt_amount_difference": str((transaction or {}).get("match_difference_usdt") or ""),
@@ -1473,6 +1503,8 @@ async def confirm_expired_usdt_payment(ref_id: str, transaction: dict | None = N
         update.update({
             "usdt_auto_verified": True,
             "usdt_transaction_hash": tx_hash,
+            "usdt_txn_hash_key": make_usdt_tx_hash_key((transaction or {}).get("network"), tx_hash),
+            "usdt_network": normalize_usdt_network_key((transaction or {}).get("network")),
             "usdt_transaction_amount": str((transaction or {}).get("match_actual_usdt") or (transaction or {}).get("value_usdt") or ""),
             "usdt_expected_amount": str((transaction or {}).get("match_expected_usdt") or ""),
             "usdt_amount_difference": str((transaction or {}).get("match_difference_usdt") or ""),
@@ -1487,6 +1519,99 @@ async def confirm_expired_usdt_payment(ref_id: str, transaction: dict | None = N
         )
     except DuplicateKeyError:
         return None
+
+
+async def confirm_manual_usdt_payment_if_waiting(ref_id: str, transaction: dict | None = None) -> Optional[dict]:
+    """Atomically confirm a waiting payment from a manually submitted tx hash.
+
+    Used only after the submitted transaction hash has been verified on-chain
+    against the correct network, USDT contract, receiver wallet, confirmations,
+    payment creation time, and manual amount tolerance.
+    """
+    tx_hash = _usdt_tx_hash_from_transaction(transaction)
+    if not tx_hash:
+        return None
+
+    duplicate = await find_used_usdt_tx_hash(tx_hash, exclude_ref_id=ref_id)
+    if duplicate:
+        return None
+
+    network = normalize_usdt_network_key((transaction or {}).get("network"))
+    update = {
+        "status": "confirmed",
+        "confirmed_at": datetime.now(timezone.utc),
+        "usdt_auto_verified": True,
+        "usdt_manual_hash_auto_verified": True,
+        "usdt_txn_hash": tx_hash,
+        "usdt_transaction_hash": tx_hash,
+        "usdt_txn_hash_key": make_usdt_tx_hash_key(network, tx_hash),
+        "usdt_network": network,
+        "usdt_transaction_amount": str((transaction or {}).get("match_actual_usdt") or (transaction or {}).get("value_usdt") or ""),
+        "usdt_expected_amount": str((transaction or {}).get("match_expected_usdt") or ""),
+        "usdt_amount_difference": str((transaction or {}).get("match_difference_usdt") or ""),
+        "usdt_match_type": str((transaction or {}).get("match_type") or ""),
+        "usdt_transaction_source": str((transaction or {}).get("source") or ""),
+        "usdt_manual_auto_check_result": "passed",
+        "usdt_manual_auto_check_reason": "",
+        "usdt_manual_auto_checked_at": datetime.now(timezone.utc),
+    }
+
+    try:
+        return await get_db().pending_payments.find_one_and_update(
+            {"ref_id": ref_id, "status": "waiting"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return None
+
+
+
+
+async def record_usdt_manual_auto_check_result(
+    ref_id: str,
+    *,
+    result: str,
+    reason: str = "",
+    txn_hash: str | None = None,
+    network: str | None = None,
+    extra: dict | None = None,
+) -> bool:
+    """Store why a submitted USDT TxHash was or was not auto-verified.
+
+    The row can still continue to manual screenshot/admin review afterwards.
+    Keeping this reason in the payment record makes WebAdmin reviews safer and
+    keeps the WebAdmin Tx Hash Logs and Payment Reviews clear.
+    """
+    clean_result = str(result or "unknown").strip().lower()[:40] or "unknown"
+    clean_reason = str(reason or "").strip()[:1200]
+    normalized_hash = normalize_usdt_tx_hash(txn_hash)
+    update = {
+        "usdt_manual_auto_check_result": clean_result,
+        "usdt_manual_auto_check_reason": clean_reason,
+        "usdt_manual_auto_checked_at": datetime.now(timezone.utc),
+    }
+    if normalized_hash:
+        update["usdt_txn_hash"] = normalized_hash
+        update["usdt_txn_hash_key"] = make_usdt_tx_hash_key(network, normalized_hash)
+    if network:
+        update["usdt_network"] = normalize_usdt_network_key(network)
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if not key:
+                continue
+            clean_key = str(key)[:80]
+            clean_value = str(value or "")[:500]
+            if clean_key == "received_usdt" and clean_value:
+                update["usdt_transaction_amount"] = clean_value
+            elif clean_key == "expected_usdt" and clean_value:
+                update["usdt_expected_amount"] = clean_value
+            update[f"usdt_manual_auto_check_{clean_key}"] = clean_value
+    result_obj = await get_db().pending_payments.update_one(
+        {"ref_id": ref_id},
+        {"$set": update},
+    )
+    return bool(result_obj.matched_count)
 
 
 async def confirm_pending_binance_payment_if_waiting(ref_id: str, transaction: dict) -> Optional[dict]:
@@ -1540,7 +1665,7 @@ async def get_confirmed_usdt_payments_needing_completion() -> list[dict]:
     delivery/credit. This lets the bot recover automatically after restart.
     """
     return await get_db().pending_payments.find({
-        "method": "usdt",
+        "method": {"$in": ["usdt", "polygon"]},
         "status": {"$in": ["confirmed", "approved"]},
     }).to_list(length=None)
 
@@ -1618,14 +1743,19 @@ async def clear_pending_payment_message(ref_id: str):
     )
 
 
-async def set_usdt_manual_details(ref_id: str, txn_hash: str, screenshot_file_id: str | None = None) -> bool:
+async def set_usdt_manual_details(ref_id: str, txn_hash: str, screenshot_file_id: str | None = None, network: str | None = None) -> bool:
     normalized_hash = normalize_usdt_tx_hash(txn_hash)
     if not normalized_hash:
         return False
     duplicate = await find_used_usdt_tx_hash(normalized_hash, exclude_ref_id=ref_id)
     if duplicate:
         return False
-    update = {"usdt_txn_hash": normalized_hash, "status": "usdt_manual_submitted"}
+    update = {
+        "usdt_txn_hash": normalized_hash,
+        "usdt_txn_hash_key": make_usdt_tx_hash_key(network, normalized_hash),
+        "usdt_network": normalize_usdt_network_key(network),
+        "status": "usdt_manual_submitted",
+    }
     if screenshot_file_id:
         update["usdt_screenshot_file_id"] = screenshot_file_id
     try:
@@ -1636,6 +1766,10 @@ async def set_usdt_manual_details(ref_id: str, txn_hash: str, screenshot_file_id
     except DuplicateKeyError:
         return False
     return bool(result.modified_count or result.matched_count)
+
+
+def created_at_to_timestamp(value) -> float | None:
+    return _created_at_ts(value)
 
 
 async def set_upi_details(ref_id: str, payee_name: str, txn_id: str, screenshot_file_id: str | None = None):
@@ -1822,7 +1956,7 @@ async def get_all_waiting_payments() -> list[dict]:
 
 async def get_all_pending_usdt() -> list[dict]:
     return await get_db().pending_payments.find(
-        {"method": "usdt", "status": "waiting"}
+        {"method": {"$in": ["usdt", "polygon"]}, "status": "waiting"}
     ).to_list(length=None)
 
 
@@ -1835,7 +1969,7 @@ async def get_all_pending_binance() -> list[dict]:
 async def get_all_pending_unique_usdt_payments() -> list[dict]:
     """Rows whose unique_usdt amount should not collide across auto-verifiers."""
     return await get_db().pending_payments.find({
-        "method": {"$in": ["usdt", "binance"]},
+        "method": {"$in": ["usdt", "polygon", "binance"]},
         "status": "waiting",
         "unique_usdt": {"$gt": 0},
     }).to_list(length=None)

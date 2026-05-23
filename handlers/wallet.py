@@ -74,6 +74,8 @@ async def _load_wallet_keyboard(lang: str = "en") -> tuple[InlineKeyboardMarkup,
     rows: list[list[InlineKeyboardButton]] = []
     if _payment_enabled(settings, "usdt"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_usdt"), callback_data="wallet_currency:usdt")])
+    if _payment_enabled(settings, "polygon"):
+        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_polygon"), callback_data="wallet_currency:polygon_usdt")])
     if _payment_enabled(settings, "binance"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_binance"), callback_data="wallet_currency:binance_usdt")])
     if _payment_enabled(settings, "upi"):
@@ -186,12 +188,12 @@ async def handle_wallet_currency_select(update: Update, context: ContextTypes.DE
     lang = await db.get_user_language(user_id)
     currency = query.data.split(":", 1)[1]
 
-    if currency not in {"inr", "usdt", "binance_usdt"}:
+    if currency not in {"inr", "usdt", "polygon_usdt", "binance_usdt"}:
         await query.edit_message_text(tr(lang, "invalid_topup"))
         return
 
     settings = await db.get_payment_settings()
-    method_key = {"inr": "upi", "usdt": "usdt", "binance_usdt": "binance"}[currency]
+    method_key = {"inr": "upi", "usdt": "usdt", "polygon_usdt": "polygon", "binance_usdt": "binance"}[currency]
     if not _payment_enabled(settings, method_key):
         await query.edit_message_text(tr(lang, "topup_unavailable"))
         return
@@ -205,6 +207,10 @@ async def handle_wallet_currency_select(update: Update, context: ContextTypes.DE
     elif currency == "binance_usdt":
         unit = "$ (USDT)"
         method_note = tr(lang, "method_binance_pay")
+        minimum = _fmt_amount(min_amount, "usdt")
+    elif currency == "polygon_usdt":
+        unit = "$ (USDT)"
+        method_note = tr(lang, "method_polygon_auto")
         minimum = _fmt_amount(min_amount, "usdt")
     else:
         unit = "$ (USDT)"
@@ -233,7 +239,7 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
 
     currency = state["currency"]
     settings = await db.get_payment_settings()
-    method_key = {"inr": "upi", "usdt": "usdt", "binance_usdt": "binance"}.get(currency, "")
+    method_key = {"inr": "upi", "usdt": "usdt", "polygon_usdt": "polygon", "binance_usdt": "binance"}.get(currency, "")
     if not _payment_enabled(settings, method_key):
         _wallet_flow.pop(user_id, None)
         await update.message.reply_text(tr(lang, "topup_no_longer"))
@@ -284,8 +290,9 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
             description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.2f} USDT"
         )
 
-    else:  # usdt via BEP20
+    else:  # usdt via BEP20 or Polygon
         amount_usdt = round(amount, 2)
+        method = "polygon" if currency == "polygon_usdt" else "usdt"
         try:
             unique_usdt = await generate_unique_usdt_amount(amount_usdt)
         except UniqueUsdtAmountUnavailable:
@@ -295,14 +302,15 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
             return True
         await db.create_pending_payment(
             user_id=user_id, ref_id=ref_id, pay_type="wallet",
-            method="usdt", expected_inr=0.0, expected_usdt=amount_usdt,
+            method=method, expected_inr=0.0, expected_usdt=amount_usdt,
             unique_usdt=unique_usdt, currency="usdt", load_amount=amount_usdt
         )
         from handlers.payment import initiate_usdt_payment
         await initiate_usdt_payment(
             update, context, user_id, ref_id,
             amount_inr=0, unique_usdt=unique_usdt,
-            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.2f} USDT"
+            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.2f} USDT",
+            method=method
         )
 
     return True

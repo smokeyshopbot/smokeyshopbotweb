@@ -16,7 +16,7 @@
       <div class="setting-card payment-method-card" data-payment-method>
         <div class="payment-method-header">
           <div>
-            <strong>USDT BEP20</strong>
+            <strong>USDT (BEP20)</strong>
           </div>
           <button type="button" class="payment-toggle-button" data-payment-toggle-button></button>
           <input class="sr-only payment-toggle-input" type="checkbox" name="usdt_bep20_enabled" value="1" data-payment-toggle {% if settings.usdt_bep20.enabled %}checked{% endif %}>
@@ -26,7 +26,24 @@
           <label>BEP20 wallet address
             <input name="usdt_wallet_address" value="{{ settings.usdt_bep20.wallet_address }}" placeholder="0x...">
           </label>
-          <small class="muted">Used for USDT BEP20 payments and shown to users. Adding this in .env will not enable USDT; save it here and switch USDT BEP20 on.</small>
+          <small class="muted">Used for USDT (BEP20) payments and shown to users. Adding this in .env will not enable USDT; save it here and switch USDT (BEP20) on.</small>
+        </div>
+      </div>
+
+      <div class="setting-card payment-method-card" data-payment-method>
+        <div class="payment-method-header">
+          <div>
+            <strong>USDT (POLYGON)</strong>
+          </div>
+          <button type="button" class="payment-toggle-button" data-payment-toggle-button></button>
+          <input class="sr-only payment-toggle-input" type="checkbox" name="usdt_polygon_enabled" value="1" data-payment-toggle {% if settings.usdt_polygon.enabled %}checked{% endif %}>
+        </div>
+        <p class="method-off-note muted">Disabled — users will not see this option.</p>
+        <div class="method-details" data-payment-details>
+          <label>Polygon wallet address
+            <input name="usdt_polygon_wallet_address" value="{{ settings.usdt_polygon.wallet_address }}" placeholder="0x...">
+          </label>
+          <small class="muted">Used for USDT (POLYGON) payments and shown to users. This is separate from the BEP20 wallet setting.</small>
         </div>
       </div>
 
@@ -97,13 +114,14 @@
 function syncWalletTopupLimits() {
   const upiEnabled = Boolean(document.querySelector('input[name="upi_enabled"]')?.checked);
   const bep20Enabled = Boolean(document.querySelector('input[name="usdt_bep20_enabled"]')?.checked);
+  const polygonEnabled = Boolean(document.querySelector('input[name="usdt_polygon_enabled"]')?.checked);
   const binanceEnabled = Boolean(document.querySelector('input[name="binance_enabled"]')?.checked);
   const inrLimit = document.querySelector('[data-wallet-limit="inr"]');
   const usdtLimit = document.querySelector('[data-wallet-limit="usdt"]');
   if (inrLimit) inrLimit.hidden = !upiEnabled;
-  if (usdtLimit) usdtLimit.hidden = !(bep20Enabled || binanceEnabled);
+  if (usdtLimit) usdtLimit.hidden = !(bep20Enabled || polygonEnabled || binanceEnabled);
   const section = document.getElementById('wallet-topup-limits');
-  if (section) section.hidden = !upiEnabled && !bep20Enabled && !binanceEnabled;
+  if (section) section.hidden = !upiEnabled && !bep20Enabled && !polygonEnabled && !binanceEnabled;
 }
 
 function syncPaymentMethodCards() {

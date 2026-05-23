@@ -42,6 +42,7 @@
         {% if pending_payment_review_count %}<span class="nav-badge">{{ pending_payment_review_count }}</span>{% endif %}
       </a>
       {% endif %}
+      {% if can_access('tx_hash_logs') %}<a href="{{ url_for('tx_hash_logs') }}">Tx Hash Logs</a>{% endif %}
       {% if can_access('replacements') %}
       <a href="{{ url_for('replacements') }}" class="nav-with-badge">
         <span>Replacements</span>

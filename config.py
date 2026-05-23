@@ -160,18 +160,26 @@ def is_admin_id(user_id: int | str | None) -> bool:
         return False
 
 
-# USDT BEP20 verification providers. Managed in WebAdmin → Secret Settings.
+# USDT on-chain verification providers. Managed in WebAdmin → Secret Settings.
 BSCSAN_API_KEY_COMPAT = _secret_str("bscscan_api_key")
 BSCSCAN_API_KEY: str = BSCSAN_API_KEY_COMPAT
-ETHERSCAN_API_KEY: str = _secret_str("etherscan_api_key", BSCSCAN_API_KEY)
+POLYGONSCAN_API_KEY: str = _secret_str("polygonscan_api_key")
+ETHERSCAN_API_KEY: str = _secret_str("etherscan_api_key", BSCSCAN_API_KEY or POLYGONSCAN_API_KEY)
 BSC_RPC_URL: str = _secret_str("bsc_rpc_url", "https://bsc-rpc.publicnode.com") or "https://bsc-rpc.publicnode.com"
 BSC_RPC_URLS: str = _secret_str(
     "bsc_rpc_urls",
     "https://bsc-rpc.publicnode.com,https://bsc.drpc.org,https://rpc.ankr.com/bsc",
 )
+POLYGON_RPC_URL: str = _secret_str("polygon_rpc_url", "https://polygon-rpc.com") or "https://polygon-rpc.com"
+POLYGON_RPC_URLS: str = _secret_str(
+    "polygon_rpc_urls",
+    "https://polygon-rpc.com,https://polygon-bor-rpc.publicnode.com,https://rpc.ankr.com/polygon",
+)
 USDT_LOOKBACK_SECONDS: int = _secret_int("usdt_lookback_seconds", 3600)
 BSC_RPC_BLOCK_CHUNK_SIZE: int = _secret_int("bsc_rpc_block_chunk_size", 450)
+POLYGON_RPC_BLOCK_CHUNK_SIZE: int = _secret_int("polygon_rpc_block_chunk_size", 500)
 BEP20_REQUIRED_CONFIRMATIONS: int = _secret_int("bep20_required_confirmations", 3)
+POLYGON_REQUIRED_CONFIRMATIONS: int = _secret_int("polygon_required_confirmations", 20)
 
 # Binance Pay auto-verification. Managed in WebAdmin → Secret Settings.
 # These are optional at import time so Binance Pay can still be used manually

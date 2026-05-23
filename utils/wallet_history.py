@@ -22,8 +22,10 @@ def format_dt(value) -> str:
 
 def method_label(method: str) -> str:
     method = (method or "").lower()
-    if method == "usdt":
-        return "USDT BEP20"
+    if method in {"usdt", "bep20", "usdt_bep20"}:
+        return "USDT (BEP20)"
+    if method in {"polygon", "usdt_polygon", "polygon_usdt"}:
+        return "USDT (POLYGON)"
     if method == "upi":
         return "UPI"
     if method == "binance":

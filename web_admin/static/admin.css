@@ -3186,3 +3186,23 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
   display: inline-block;
   min-width: 2ch;
 }
+
+/* Tx hash logs / auto-check review details */
+.tx-log-table td, .tx-log-table th { min-width: 130px; }
+.tx-log-table td:nth-child(1), .tx-log-table th:nth-child(1),
+.tx-log-table td:nth-child(7), .tx-log-table th:nth-child(7) { min-width: 240px; }
+.tx-log-warning {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid rgba(245,158,11,.45);
+  border-radius: 10px;
+  background: rgba(245,158,11,.08);
+  color: #fde68a;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+.tx-log-warning-compact {
+  max-width: 320px;
+  font-size: .92rem;
+}
+.warning-text { color: #fde68a; }

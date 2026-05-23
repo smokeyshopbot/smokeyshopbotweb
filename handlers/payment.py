@@ -14,9 +14,17 @@ import database as db
 from utils.i18n import tr
 from config import (
     SUPPORT_USERNAMES, PAYMENT_TIMEOUT_MINUTES, PAYMENT_REMINDER_MINUTES, USDT_VERIFY_INTERVAL, LOW_STOCK_ALERT_THRESHOLD,
-    BEP20_REQUIRED_CONFIRMATIONS, USDT_MANUAL_VERIFY_DELAY_MINUTES, is_admin_id,
+    BEP20_REQUIRED_CONFIRMATIONS, POLYGON_REQUIRED_CONFIRMATIONS, USDT_MANUAL_VERIFY_DELAY_MINUTES, is_admin_id,
 )
-from utils.bscscan import check_usdt_received_detailed
+from utils.bscscan import (
+    check_usdt_received_detailed,
+    get_usdt_network_label,
+    get_usdt_required_confirmations,
+    normalize_usdt_network,
+    public_usdt_error_text,
+    extract_usdt_received_amount_from_error,
+    verify_usdt_tx_hash_detailed,
+)
 from utils.qr import generate_upi_qr
 from utils.crypto import generate_unique_usdt_amount
 from utils.admin_notify import send_admin_message
@@ -32,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 USDT_PAYMENT_QUANT = Decimal("0.001")
 USDT_LEGACY_PAYMENT_QUANT = Decimal("0.000001")
+MANUAL_USDT_HASH_TOLERANCE = Decimal("0.01")
 
 
 def _decimal_usdt(value) -> Decimal | None:
@@ -193,8 +202,35 @@ async def _lang_for_user(user_id: int | str | None) -> str:
         return "en"
 
 
+def _usdt_network_for_method(method: str | None) -> str:
+    return "polygon" if str(method or "").lower() in {"polygon", "usdt_polygon", "polygon_usdt"} else "bep20"
+
+
+def _usdt_network_for_pending(pending: dict | None = None) -> str:
+    details = _details_from_pending(pending)
+    return normalize_usdt_network(details.get("usdt_network") or _usdt_network_for_method((pending or {}).get("method")))
+
+
+def _usdt_method_from_network(network: str | None = None) -> str:
+    return "polygon" if normalize_usdt_network(network) == "polygon" else "usdt"
+
+
+def _usdt_payment_label(method_or_network: str | None = None) -> str:
+    return get_usdt_network_label(method_or_network)
+
+
 async def _get_usdt_wallet_for_pending(pending: dict | None = None) -> str:
     details = _details_from_pending(pending)
+    network = _usdt_network_for_pending(pending)
+    if network == "polygon":
+        wallet = str(details.get("usdt_polygon_wallet_address") or details.get("usdt_wallet_address") or "").strip()
+        if wallet:
+            return wallet
+        settings = await _current_payment_settings()
+        if db.payment_method_enabled(settings, "polygon"):
+            return str(settings["usdt_polygon"].get("wallet_address") or "").strip()
+        return ""
+
     wallet = str(details.get("usdt_wallet_address") or "").strip()
     if wallet:
         return wallet
@@ -278,21 +314,22 @@ async def _try_auto_confirm_before_manual(update: Update, context: ContextTypes.
     query = update.callback_query
     method = str(pending.get("method") or "").lower()
     try:
-        if method == "usdt":
+        if method in {"usdt", "polygon"}:
+            network = _usdt_network_for_pending(pending)
             wallet = await _get_usdt_wallet_for_pending(pending)
-            result = await check_usdt_received_detailed(pending.get("unique_usdt"), wallet_address=wallet)
+            result = await check_usdt_received_detailed(pending.get("unique_usdt"), wallet_address=wallet, network=network)
             if result.found:
-                if await _is_exact_usdt_match(ref_id, "usdt", result.tx or {}):
+                if await _is_exact_usdt_match(ref_id, method, result.tx or {}):
                     try:
                         await query.answer()
                     except Exception:
                         pass
                     await _on_usdt_confirmed(context, int(pending.get("user_id") or query.from_user.id), ref_id, result.tx or {})
                     return True
-                logger.info("Manual Verify pre-check found USDT but amount was not exact ref=%s", ref_id)
+                logger.info("Manual Verify pre-check found %s but amount was not exact ref=%s", _usdt_payment_label(network), ref_id)
             logger.info(
-                "Manual Verify pre-check did not find USDT ref=%s amount=%s reason=%s",
-                ref_id, pending.get("unique_usdt"), result.short_error_text(),
+                "Manual Verify pre-check did not find %s ref=%s amount=%s reason=%s",
+                _usdt_payment_label(network), ref_id, pending.get("unique_usdt"), result.short_error_text(),
             )
         elif method == "binance":
             result = await _check_binance_pending_payment(pending)
@@ -319,7 +356,7 @@ def _payment_keyboard_for_pending(pending: dict) -> InlineKeyboardMarkup | None:
     method = str((pending or {}).get("method") or "").lower()
     if not ref_id:
         return None
-    if method == "usdt":
+    if method in {"usdt", "polygon"}:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton(tr((pending or {}).get("language"), "btn_check_payment"), callback_data=f"check_usdt:{ref_id}"),
             InlineKeyboardButton(tr((pending or {}).get("language"), "btn_manual_verify"), callback_data=f"usdt_manual:{ref_id}"),
@@ -362,20 +399,44 @@ async def initiate_usdt_payment(
     amount_inr: float,
     unique_usdt: float,
     description: str,
+    method: str = "usdt",
 ):
     lang = await _lang_for_user(user_id)
     settings = await _current_payment_settings()
-    if not db.payment_method_enabled(settings, "usdt"):
-        await _payment_method_unavailable(context, user_id, ref_id, "USDT BEP20 payment")
+    method = _usdt_method_from_network(method)
+    network = _usdt_network_for_method(method)
+    method_label = _usdt_payment_label(network)
+    if not db.payment_method_enabled(settings, method):
+        await _payment_method_unavailable(context, user_id, ref_id, f"{method_label} payment")
         return
 
-    usdt_wallet = str(settings["usdt_bep20"].get("wallet_address") or "").strip()
-    await db.set_pending_payment_config(ref_id, {"usdt_wallet_address": usdt_wallet, "language": lang})
+    if network == "polygon":
+        usdt_wallet = str(settings["usdt_polygon"].get("wallet_address") or "").strip()
+        payment_details = {
+            "usdt_network": "polygon",
+            "usdt_polygon_wallet_address": usdt_wallet,
+            "usdt_wallet_address": usdt_wallet,
+            "language": lang,
+        }
+        title = tr(lang, "usdt_polygon_payment_title")
+        network_line = tr(lang, "network_polygon")
+    else:
+        usdt_wallet = str(settings["usdt_bep20"].get("wallet_address") or "").strip()
+        payment_details = {
+            "usdt_network": "bep20",
+            "usdt_wallet_address": usdt_wallet,
+            "language": lang,
+        }
+        title = tr(lang, "usdt_payment_title")
+        network_line = tr(lang, "network_bep20")
+
+    await db.set_pending_payment_config(ref_id, payment_details)
     display_unique_usdt = _format_payment_usdt(unique_usdt)
+    required_confirmations = get_usdt_required_confirmations(network)
 
     wallet_id_line = await _wallet_load_id_line(ref_id, lang)
     text_template = (
-        f"{tr(lang, 'usdt_payment_title')}\n\n"
+        f"{title}\n\n"
         f"📋 {description}\n"
         f"{wallet_id_line}\n"
         f"{tr(lang, 'send_this_amount')}\n"
@@ -383,10 +444,10 @@ async def initiate_usdt_payment(
         f"{tr(lang, 'to_this_wallet')}\n"
         f"`{usdt_wallet}`\n\n"
         f"{tr(lang, 'usdt_exact_warning')}\n"
-        f"{tr(lang, 'network_bep20')}\n\n"
+        f"{network_line}\n\n"
         f"{tr(lang, 'time_left')}\n"
         f"{tr(lang, 'bot_checks_every', seconds=USDT_VERIFY_INTERVAL)}\n"
-        f"{tr(lang, 'confirmations_required', confirmations=BEP20_REQUIRED_CONFIRMATIONS)}\n"
+        f"{tr(lang, 'confirmations_required', confirmations=required_confirmations)}\n"
         f"{tr(lang, 'manual_if_paid')}"
     )
     text = _render_payment_template(text_template, {"created_at": __import__('time').time()})
@@ -408,12 +469,12 @@ async def initiate_usdt_payment(
 
     create_task = getattr(getattr(context, "application", None), "create_task", None)
     if callable(create_task):
-        task = create_task(_poll_usdt(context, user_id, ref_id, unique_usdt, usdt_wallet))
+        task = create_task(_poll_usdt(context, user_id, ref_id, unique_usdt, usdt_wallet, network=network))
     else:
-        task = asyncio.create_task(_poll_usdt(context, user_id, ref_id, unique_usdt, usdt_wallet))
+        task = asyncio.create_task(_poll_usdt(context, user_id, ref_id, unique_usdt, usdt_wallet, network=network))
     _usdt_tasks[ref_id] = task
 
-async def _poll_usdt(context, user_id: int, ref_id: str, unique_usdt: float, usdt_wallet: str | None = None):
+async def _poll_usdt(context, user_id: int, ref_id: str, unique_usdt: float, usdt_wallet: str | None = None, network: str | None = None):
     """Background polling — checks BSCScan until the configured payment window expires."""
     interval = max(5, USDT_VERIFY_INTERVAL)
     attempts = max(1, (PAYMENT_TIMEOUT_MINUTES * 60) // interval)
@@ -423,8 +484,9 @@ async def _poll_usdt(context, user_id: int, ref_id: str, unique_usdt: float, usd
         if not pending or pending["status"] != "waiting":
             return
         try:
+            network_key = normalize_usdt_network(network or _usdt_network_for_pending(pending))
             wallet = usdt_wallet or await _get_usdt_wallet_for_pending(pending)
-            result = await check_usdt_received_detailed(unique_usdt, wallet_address=wallet)
+            result = await check_usdt_received_detailed(unique_usdt, wallet_address=wallet, network=network_key)
             found = result.found
             if not found:
                 logger.info(
@@ -485,10 +547,11 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer(tr(lang, "wallet_topup_already_completed"), show_alert=True)
                 return
 
-        if status == "expired" and pending.get("method") == "usdt":
+        if status == "expired" and pending.get("method") in {"usdt", "polygon"}:
             try:
+                network = _usdt_network_for_pending(pending)
                 wallet = await _get_usdt_wallet_for_pending(pending)
-                result = await check_usdt_received_detailed(pending["unique_usdt"], wallet_address=wallet)
+                result = await check_usdt_received_detailed(pending["unique_usdt"], wallet_address=wallet, network=network)
                 found = result.found
                 if not found:
                     logger.info("Expired Check Payment did not find USDT ref=%s amount=%s reason=%s", ref_id, pending.get("unique_usdt"), result.short_error_text())
@@ -497,7 +560,7 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found = False
 
             if found:
-                if not await _is_exact_usdt_match(ref_id, "usdt", result.tx or {}):
+                if not await _is_exact_usdt_match(ref_id, str(pending.get("method") or "usdt"), result.tx or {}):
                     logger.info("Late USDT payment found but amount was not exact ref=%s", ref_id)
                     await query.answer(tr(lang, "payment_not_found", unlock_text=""), show_alert=True)
                     return
@@ -517,8 +580,9 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        network = _usdt_network_for_pending(pending)
         wallet = await _get_usdt_wallet_for_pending(pending)
-        result = await check_usdt_received_detailed(pending["unique_usdt"], wallet_address=wallet)
+        result = await check_usdt_received_detailed(pending["unique_usdt"], wallet_address=wallet, network=network)
         found = result.found
         if not found:
             logger.info("Manual Check Payment did not find USDT ref=%s amount=%s reason=%s", ref_id, pending.get("unique_usdt"), result.short_error_text())
@@ -527,7 +591,7 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found = False
 
     if found:
-        if not await _is_exact_usdt_match(ref_id, "usdt", result.tx or {}):
+        if not await _is_exact_usdt_match(ref_id, str(pending.get("method") or "usdt"), result.tx or {}):
             logger.info("Manual Check Payment found USDT but amount was not exact ref=%s", ref_id)
             unlock_text = _manual_verify_unlock_message(pending, lang)
             await query.answer(tr(lang, "payment_not_found", unlock_text=unlock_text), show_alert=True)
@@ -539,7 +603,7 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(tr(lang, "payment_not_found", unlock_text=unlock_text), show_alert=True)
 
 async def handle_usdt_manual_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User pressed 'Manual Verify' — ask for txn hash after a short delay."""
+    """User pressed 'Manual Verify' — ask for txn hash when manual verification is unlocked."""
     query = update.callback_query
     ref_id = query.data.split(":", 1)[1]
     user_id = query.from_user.id
@@ -554,9 +618,6 @@ async def handle_usdt_manual_button(update: Update, context: ContextTypes.DEFAUL
         await query.answer(tr(lang, "payment_not_yours"), show_alert=True)
         return
 
-    if await _try_auto_confirm_before_manual(update, context, pending):
-        return
-
     unlock_text = _manual_verify_unlock_message(pending, lang)
     if tr(lang, "manual_unlocked") not in unlock_text:
         await query.answer(tr(lang, "auto_running_unlock", unlock_text=unlock_text), show_alert=True)
@@ -569,6 +630,91 @@ async def handle_usdt_manual_button(update: Update, context: ContextTypes.DEFAUL
         f"{tr(lang, 'manual_usdt_title')}\n\n{tr(lang, 'manual_usdt_body')}",
         parse_mode="Markdown"
     )
+
+async def _try_auto_confirm_submitted_usdt_hash(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict,
+    txn_hash: str,
+    lang: str,
+) -> str:
+    """Try to auto-confirm a manually submitted USDT tx hash.
+
+    Returns: "confirmed", "duplicate", or "review".
+    """
+    ref_id = str(pending.get("ref_id") or "")
+    user_id = int(pending.get("user_id") or update.effective_user.id)
+    network = _usdt_network_for_pending(pending)
+    try:
+        wallet = await _get_usdt_wallet_for_pending(pending)
+        min_ts = db.created_at_to_timestamp(pending.get("created_at"))
+        result = await verify_usdt_tx_hash_detailed(
+            txn_hash,
+            pending.get("unique_usdt") or pending.get("expected_usdt"),
+            wallet_address=wallet,
+            network=network,
+            min_timestamp=min_ts,
+            amount_tolerance=MANUAL_USDT_HASH_TOLERANCE,
+        )
+    except Exception as exc:
+        logger.exception("Manual USDT tx-hash auto-check crashed ref=%s hash=%s: %s", ref_id, txn_hash, exc)
+        await db.record_usdt_manual_auto_check_result(
+            ref_id,
+            result="error",
+            reason="Automatic TxHash check could not finish. Admin review required.",
+            txn_hash=txn_hash,
+            network=network,
+        )
+        return "review"
+
+    if not result.found:
+        reason = public_usdt_error_text(result.errors)
+        extra = {"expected_usdt": pending.get("unique_usdt") or pending.get("expected_usdt"), "tolerance_usdt": MANUAL_USDT_HASH_TOLERANCE}
+        received_usdt = extract_usdt_received_amount_from_error(result.errors)
+        if received_usdt:
+            extra["received_usdt"] = received_usdt
+        await db.record_usdt_manual_auto_check_result(
+            ref_id,
+            result="failed",
+            reason=reason,
+            txn_hash=txn_hash,
+            network=network,
+            extra=extra,
+        )
+        logger.info(
+            "Manual USDT tx-hash auto-check left for review ref=%s hash=%s reason=%s",
+            ref_id, txn_hash, reason,
+        )
+        return "review"
+
+    confirmed_pending = await db.confirm_manual_usdt_payment_if_waiting(ref_id, result.tx or {})
+    if not confirmed_pending:
+        if await db.find_used_usdt_tx_hash(txn_hash, exclude_ref_id=ref_id):
+            await db.record_usdt_manual_auto_check_result(
+                ref_id,
+                result="duplicate",
+                reason="This TxHash is already linked to another payment.",
+                txn_hash=txn_hash,
+                network=network,
+            )
+            return "duplicate"
+        await db.record_usdt_manual_auto_check_result(
+            ref_id,
+            result="failed",
+            reason="TxHash passed the chain check, but the payment was no longer waiting when the bot tried to claim it.",
+            txn_hash=txn_hash,
+            network=network,
+        )
+        logger.info("Manual USDT tx-hash verified but payment could not be claimed ref=%s", ref_id)
+        return "review"
+
+    logger.info("Manual USDT tx-hash auto-verified ref=%s hash=%s", ref_id, txn_hash)
+    if confirmed_pending.get("pay_type") == "order":
+        await complete_order(context.bot, user_id, ref_id)
+    else:
+        await complete_wallet_load(context.bot, user_id, confirmed_pending)
+    return "confirmed"
+
 
 async def handle_usdt_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Collects txn hash for manual USDT verification. Returns True if consumed."""
@@ -585,6 +731,11 @@ async def handle_usdt_manual_input(update: Update, context: ContextTypes.DEFAULT
     txn_hash = db.normalize_usdt_tx_hash(update.message.text)
     ref_id = state["ref_id"]
 
+    if not db.is_valid_usdt_tx_hash(txn_hash):
+        _usdt_manual[user_id]["step"] = "txn_hash"
+        await update.message.reply_text(tr(lang, "usdt_tx_hash_invalid"), parse_mode="Markdown")
+        return True
+
     pending = await db.get_pending_by_ref(ref_id)
     if not pending or pending["status"] != "waiting":
         _usdt_manual.pop(user_id, None)
@@ -592,6 +743,15 @@ async def handle_usdt_manual_input(update: Update, context: ContextTypes.DEFAULT
         return True
 
     if await db.find_used_usdt_tx_hash(txn_hash, exclude_ref_id=ref_id):
+        _usdt_manual[user_id]["step"] = "txn_hash"
+        await update.message.reply_text(tr(lang, "usdt_tx_hash_already_used"), parse_mode="Markdown")
+        return True
+
+    auto_result = await _try_auto_confirm_submitted_usdt_hash(update, context, pending, txn_hash, lang)
+    if auto_result == "confirmed":
+        _usdt_manual.pop(user_id, None)
+        return True
+    if auto_result == "duplicate":
         _usdt_manual[user_id]["step"] = "txn_hash"
         await update.message.reply_text(tr(lang, "usdt_tx_hash_already_used"), parse_mode="Markdown")
         return True
@@ -623,7 +783,8 @@ async def handle_usdt_manual_screenshot(update: Update, context: ContextTypes.DE
         await update.message.reply_text(tr(lang, "session_no_longer_active"))
         return True
 
-    if not await db.set_usdt_manual_details(ref_id, txn_hash, photo.file_id):
+    network = _usdt_network_for_pending(pending)
+    if not await db.set_usdt_manual_details(ref_id, txn_hash, photo.file_id, network=network):
         _usdt_manual[user_id] = {"step": "txn_hash", "ref_id": ref_id, "language": lang}
         await update.message.reply_text(tr(lang, "usdt_tx_hash_already_used"), parse_mode="Markdown")
         return True
@@ -670,7 +831,7 @@ async def _on_usdt_confirmed(context, user_id: int, ref_id: str, transaction: di
         logger.info("USDT confirmation ignored; ref=%s status=%s", ref_id, status)
         return
 
-    await _send_payment_detected_notice(context.bot, pending, method_label="USDT BEP20")
+    await _send_payment_detected_notice(context.bot, pending, method_label=_usdt_payment_label(_usdt_network_for_pending(pending)))
 
     if pending["pay_type"] == "order":
         await complete_order(context.bot, user_id, ref_id)
@@ -996,9 +1157,6 @@ async def handle_binance_paid_button(update: Update, context: ContextTypes.DEFAU
 
     if int(pending.get("user_id", 0)) != int(user_id) and not is_admin_id(user_id):
         await query.answer(tr(lang, "payment_not_yours"), show_alert=True)
-        return
-
-    if await _try_auto_confirm_before_manual(update, context, pending):
         return
 
     unlock_text = _manual_verify_unlock_message(pending, lang)
@@ -1730,8 +1888,9 @@ async def _scan_waiting_usdt_payments(application):
             continue
 
         try:
+            network = _usdt_network_for_pending(pending)
             wallet = await _get_usdt_wallet_for_pending(pending)
-            result = await check_usdt_received_detailed(float(unique_usdt), wallet_address=wallet)
+            result = await check_usdt_received_detailed(float(unique_usdt), wallet_address=wallet, network=network)
         except Exception as exc:
             logger.exception("Global BEP20 check crashed ref=%s: %s", ref_id, exc)
             continue
@@ -1796,7 +1955,7 @@ async def resume_pending_usdt_payments(application):
         if ref_id in _usdt_tasks and not _usdt_tasks[ref_id].done():
             continue
         _usdt_tasks[ref_id] = application.create_task(
-            _poll_usdt(application, int(user_id), ref_id, float(unique_usdt), await _get_usdt_wallet_for_pending(pending))
+            _poll_usdt(application, int(user_id), ref_id, float(unique_usdt), await _get_usdt_wallet_for_pending(pending), network=_usdt_network_for_pending(pending))
         )
         started += 1
 
