@@ -85,6 +85,35 @@ def get_db():
     return _db
 
 
+async def record_admin_activity(
+    action: str,
+    details: str = "",
+    *,
+    username: str = "",
+    role: str = "telegram_admin",
+    user_id: int | None = None,
+    source: str = "telegram_bot",
+) -> None:
+    """Mirror Telegram-side admin actions into WebAdmin Activity Log."""
+    doc = {
+        "action": str(action or "").strip(),
+        "details": str(details or "").strip(),
+        "created_at": datetime.now(timezone.utc),
+        "admin_username": str(username or "").strip().lstrip("@"),
+        "admin_role": str(role or "telegram_admin").strip(),
+        "admin_source": str(source or "telegram_bot").strip(),
+    }
+    if user_id is not None:
+        try:
+            doc["admin_user_id"] = int(user_id)
+        except Exception:
+            pass
+    try:
+        await get_db().admin_activity.insert_one(doc)
+    except Exception:
+        pass
+
+
 # ─────────────────────────── USERS ───────────────────────────
 
 async def get_user(user_id: int) -> Optional[dict]:

@@ -1,18 +1,20 @@
 {% extends "base.html" %}
 {% block title %}Activity Log{% endblock %}
 {% block content %}
-<div class="page-header"><div><h1>Activity Log</h1><p>Recent admin and automation actions.</p></div></div>
+<div class="page-header"><div><h1>Activity Log</h1><p>Recent admin, stock manager, Telegram bot, and automation actions.</p></div></div>
 <section class="panel">
   {% if rows %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead>
+      <thead><tr><th>Time</th><th>User</th><th>Source</th><th>Action</th><th>Details</th></tr></thead>
       <tbody>
       {% for row in rows %}
         <tr>
           <td>{{ fmt_dt(row.created_at) }}</td>
-          <td><strong>{{ row.action }}</strong></td>
-          <td>{{ row.details }}</td>
+          <td><strong>{{ activity_actor_label(row) }}</strong></td>
+          <td><span class="badge">{{ activity_source_label(row) }}</span></td>
+          <td><strong>{{ activity_action_label(row.action) }}</strong><br><span class="muted" style="font-size:.78rem">{{ row.action }}</span></td>
+          <td>{{ row.details or '—' }}</td>
         </tr>
       {% endfor %}
       </tbody>

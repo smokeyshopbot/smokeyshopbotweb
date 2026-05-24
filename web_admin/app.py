@@ -791,6 +791,9 @@ def create_app() -> Flask:
             "replacement_report_items": replacement_report_items,
             "replacement_products_label": replacement_products_label,
             "telegram_user_label": telegram_user_label,
+            "activity_action_label": activity_action_label,
+            "activity_actor_label": activity_actor_label,
+            "activity_source_label": activity_source_label,
             "replacement_orders_label": replacement_orders_label,
             "pending_payment_review_count": int(sidebar_state.get("pending_review_count") or 0),
             "pending_stock_order_count": int(sidebar_state.get("pending_stock_order_count") or 0),
@@ -1946,6 +1949,7 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("stock_manager_dashboard"))
         settings["admin_accounts"] = accounts
         set_secret_settings(app.db, settings)
+        log_admin_action(app.db, "stock_manager_payment_details_saved", f"{username}: method={payment_method}")
         flash("Payment details saved.", "success")
         return redirect(url_for("stock_manager_dashboard"))
 
@@ -6808,6 +6812,76 @@ def paid_usdt_expr() -> dict:
     ]}
 
 
+
+
+def activity_action_label(action: Any) -> str:
+    text = str(action or "").strip()
+    if not text:
+        return "Activity"
+    labels = {
+        "stock_added": "Stock added",
+        "replacement_stock_added": "Replacement stock added",
+        "stock_removed": "Stock removed",
+        "stock_cleared": "Stock cleared",
+        "product_added": "Product added",
+        "product_deleted": "Product deleted",
+        "product_renamed": "Product renamed",
+        "product_price_updated": "Product price updated",
+        "product_enabled": "Product enabled",
+        "product_disabled": "Product disabled",
+        "product_description_saved": "Product details saved",
+        "product_limits_saved": "Product limits saved",
+        "product_display_position_saved": "Product position saved",
+        "stock_manager_rates_saved": "Stock manager rate saved",
+        "approved_stock_pool_saved": "Approved stock pool updated",
+        "approved_stock_rejections_cleared": "Rejected stock logs cleared",
+        "stock_upload_rejected_lines": "Rejected stock upload",
+        "telegram_stock_added": "Stock added from bot",
+        "telegram_stock_removed": "Stock removed from bot",
+        "telegram_stock_cleared": "Stock cleared from bot",
+        "telegram_product_added": "Product added from bot",
+        "telegram_product_removed": "Product removed from bot",
+        "telegram_product_price_updated": "Product price updated from bot",
+        "telegram_product_enabled": "Product enabled from bot",
+        "telegram_product_disabled": "Product disabled from bot",
+        "telegram_stock_upload_rejected_lines": "Rejected bot stock upload",
+        "stock_manager_payment_details_saved": "Stock manager payout details saved",
+    }
+    return labels.get(text, text.replace("_", " ").strip().title())
+
+
+def activity_actor_label(row: dict | None) -> str:
+    row = row or {}
+    username = str(row.get("admin_username") or row.get("username") or "").strip().lstrip("@")
+    user_id = row.get("admin_user_id") or row.get("user_id")
+    role = normalize_admin_role(row.get("admin_role")) if row.get("admin_role") else str(row.get("role") or "").strip()
+    role_label = ADMIN_ROLE_LABELS.get(role, role.replace("_", " ").title() if role else "")
+    if username:
+        label = f"@{username}"
+        if user_id not in (None, ""):
+            try:
+                label += f" ({int(user_id)})"
+            except Exception:
+                label += f" ({user_id})"
+        elif role_label:
+            label += f" ({role_label})"
+        return label
+    if user_id not in (None, ""):
+        return f"ID {user_id}"
+    if role_label:
+        return role_label
+    return "System"
+
+
+def activity_source_label(row: dict | None) -> str:
+    row = row or {}
+    source = str(row.get("admin_source") or row.get("source") or "webadmin").strip().lower()
+    if source in {"telegram", "telegram_bot", "bot"}:
+        return "Telegram Bot"
+    if source in {"system", "automation"}:
+        return "System"
+    return "WebAdmin"
+
 def log_admin_action(db, action: str, details: str = "") -> None:
     try:
         doc = {
@@ -6819,8 +6893,11 @@ def log_admin_action(db, action: str, details: str = "") -> None:
             doc.update({
                 "admin_username": current_admin_username(),
                 "admin_role": current_admin_role(),
+                "admin_source": "webadmin",
                 "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip(),
             })
+        else:
+            doc.setdefault("admin_source", "system")
         db.admin_activity.insert_one(doc)
     except Exception:
         pass

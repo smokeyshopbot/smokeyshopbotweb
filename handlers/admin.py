@@ -79,6 +79,25 @@ def _html_code(value) -> str:
     return f"<code>{html.escape(str(value), quote=False)}</code>"
 
 
+async def _log_telegram_admin_action(update: Update, action: str, details: str = "") -> None:
+    """Record Telegram admin/stock-manager actions in WebAdmin Activity Log."""
+    try:
+        user = update.effective_user if update else None
+        username = (getattr(user, "username", "") or "").strip()
+        if not username and user:
+            username = (getattr(user, "full_name", "") or "").strip()
+        await db.record_admin_activity(
+            action,
+            details,
+            username=username,
+            role="telegram_admin",
+            user_id=getattr(user, "id", None),
+            source="telegram_bot",
+        )
+    except Exception:
+        pass
+
+
 def _compact_amount(value, max_decimals: int = 2) -> str:
     try:
         amount = float(value or 0)
@@ -438,6 +457,11 @@ async def cmd_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         product = await db.get_product(name) or {"name": name, "price_inr": price_inr, "price_usdt": price_usdt, "enabled": True}
         notified = await notify_users_new_product(context.bot, product)
+        await _log_telegram_admin_action(
+            update,
+            "telegram_product_added",
+            f"{name}: price_inr={price_inr} price_usdt={price_usdt} notified={notified}",
+        )
         await update.message.reply_text(
             f"✅ Product *{name}* added!\n💰 ₹{price_inr} / ${price_usdt} USDT\n📦 Stock: 0\n🔔 Notified {notified} user(s).",
             parse_mode="Markdown"
@@ -454,6 +478,7 @@ async def cmd_remove_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
     name = " ".join(context.args)
     success = await db.remove_product(name)
     if success:
+        await _log_telegram_admin_action(update, "telegram_product_removed", name)
         await update.message.reply_text(f"✅ Product *{name}* removed.", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"❌ Product *{name}* not found.", parse_mode="Markdown")
@@ -492,6 +517,11 @@ async def cmd_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_inr=price_inr,
             old_usdt=old_usdt,
             new_usdt=price_usdt,
+        )
+        await _log_telegram_admin_action(
+            update,
+            "telegram_product_price_updated",
+            f"{product['name']}: inr {old_inr} -> {price_inr}; usdt {old_usdt} -> {price_usdt}",
         )
         await update.message.reply_text(
             f"✅ *{product['name']}* prices updated!\n💰 ₹{price_inr} / ${price_usdt} USDT",
@@ -587,6 +617,7 @@ async def cmd_clear_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Product *{name}* not found.", parse_mode="Markdown")
         return
     await db.clear_stock(name)
+    await _log_telegram_admin_action(update, "telegram_stock_cleared", name)
     from handlers.payment import notify_low_stock_if_needed
     await notify_low_stock_if_needed(context.bot, name)
     await update.message.reply_text(f"🗑 Stock cleared for *{name}*.", parse_mode="Markdown")
@@ -603,6 +634,7 @@ async def cmd_disable_product(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Product *{name}* not found.", parse_mode="Markdown")
         return
     await db.set_product_enabled(name, False)
+    await _log_telegram_admin_action(update, "telegram_product_disabled", product["name"])
     await update.message.reply_text(f"🚫 Product *{product['name']}* disabled and hidden from /shop.", parse_mode="Markdown")
 
 
@@ -617,6 +649,7 @@ async def cmd_enable_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Product *{name}* not found.", parse_mode="Markdown")
         return
     await db.set_product_enabled(name, True)
+    await _log_telegram_admin_action(update, "telegram_product_enabled", product["name"])
     await update.message.reply_text(f"✅ Product *{product['name']}* enabled and visible in /shop.", parse_mode="Markdown")
 
 
@@ -1560,6 +1593,11 @@ async def handle_stock_remove_input(update: Update, context: ContextTypes.DEFAUL
         if more > 0:
             lines.append(f"...and {more} more.")
 
+    await _log_telegram_admin_action(
+        update,
+        "telegram_stock_removed",
+        f"{product_name}: removed={removed_count} not_found={not_found_count} remaining={total}",
+    )
     await update.message.reply_text(compact_blank_lines("\n".join(lines)), parse_mode="Markdown")
     from handlers.payment import notify_low_stock_if_needed
     await notify_low_stock_if_needed(context.bot, product_name)
@@ -1606,6 +1644,11 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 accepted_count=len(approved_blocks),
                 rejected_items=approved_pool_rejected_blocks,
             )
+            await _log_telegram_admin_action(
+                update,
+                "telegram_stock_upload_rejected_lines",
+                f"{product_name}: accepted={len(approved_blocks)} rejected={len(approved_pool_rejected_blocks)}",
+            )
         blocks = approved_blocks
         if not blocks:
             _awaiting_stock.pop(user_id, None)
@@ -1649,6 +1692,11 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if should_notify_restock:
         await notify_users_new_stock(context.bot, product_name, available)
 
+    await _log_telegram_admin_action(
+        update,
+        "telegram_stock_added",
+        f"{product_name}: added={count} skipped={skipped_count} rejected_by_pool={rejected_by_pool_count} delivered_orders={delivered_orders} delivered_items={delivered_items} available={available} pending={pending_qty}",
+    )
     skipped_line = f"↩️ Skipped duplicate item(s): *{skipped_count}*\n" if skipped_count else ""
     rejected_line = f"🚫 Rejected not in owner-approved pool: *{rejected_by_pool_count}* item(s).\n" if rejected_by_pool_count else ""
     await update.message.reply_text(
