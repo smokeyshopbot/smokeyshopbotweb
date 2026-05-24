@@ -2210,33 +2210,6 @@ def register_routes(app: Flask) -> None:
                 submitted_items.append(clean)
                 seen_submitted.add(clean)
 
-        if action == "remove_current_stock":
-            stock_blocks = split_stock(raw_items)
-            if not stock_blocks:
-                flash("Paste at least one current stock item to remove.", "error")
-                return redirect(url_for("product_manage", name=product["name"]))
-            result = remove_stock_items(app.db, product["name"], stock_blocks)
-            if result.get("removed"):
-                record_stock_manager_stock_event(
-                    app.db,
-                    "remove",
-                    product["name"],
-                    result.get("removed", []),
-                    username=current_admin_username() or "owner",
-                    role=current_admin_role(),
-                )
-            notify_low_stock_if_needed(app.db, product["name"])
-            log_admin_action(
-                app.db,
-                "stock_removed",
-                f"{product['name']}: source=approved_pool_box removed={len(result['removed'])} not_found={len(result['not_found'])}",
-            )
-            flash(
-                f"Removed {len(result['removed'])} current stock item(s). Not found: {len(result['not_found'])}. Remaining: {result['remaining']}.",
-                "success" if result.get("removed") else "info",
-            )
-            return redirect(url_for("product_manage", name=product["name"]))
-
         existing_items = approved_stock_pool_items(product)
         existing_seen = set(existing_items)
         new_pool = list(existing_items)
@@ -6680,13 +6653,30 @@ def remove_stock_items(db, product_name: str, items: list[str], allowed_added_by
     removed: list[str] = []
     not_found: list[str] = []
     not_allowed: list[str] = []
-    for item in items:
+
+    def find_stock_index(submitted_item: str) -> int | None:
+        # Prefer exact matching first, then fall back to normalized line matching.
+        # This lets admins remove stock copied from the Current stock cards even if
+        # the browser adds CRLF line endings or harmless spaces around lines.
         try:
-            index = stock.index(item)
+            return stock.index(submitted_item)
         except ValueError:
+            pass
+        submitted_key = normalize_approved_stock_item(submitted_item)
+        if not submitted_key:
+            return None
+        for candidate_index, candidate in enumerate(stock):
+            if normalize_approved_stock_item(candidate) == submitted_key:
+                return candidate_index
+        return None
+
+    for item in items:
+        index = find_stock_index(item)
+        if index is None:
             not_found.append(item)
             continue
-        if allowed_added_by and not stock_item_is_owned_by(product, item, allowed_added_by):
+        matched_item = stock[index]
+        if allowed_added_by and not stock_item_is_owned_by(product, matched_item, allowed_added_by):
             not_allowed.append(item)
             continue
         removed.append(stock.pop(index))
