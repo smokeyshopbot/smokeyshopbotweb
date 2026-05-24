@@ -2935,7 +2935,7 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
 }
 .transfer-delivery-form {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.4fr) auto;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.4fr);
   gap: 12px;
   align-items: end;
   border-top: 1px solid var(--line);
@@ -2979,6 +2979,8 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
   white-space: nowrap;
 }
 .transfer-delivery-form button {
+  grid-column: 1 / -1;
+  justify-self: start;
   white-space: nowrap;
 }
 .transfer-complete-box {
