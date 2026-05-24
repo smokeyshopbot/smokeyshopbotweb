@@ -491,18 +491,22 @@ async def add_stock(product_name: str, items: list[str]) -> int:
     if not product:
         return 0
 
-    existing = {str(item).strip() for item in (product.get("stock", []) or []) if str(item).strip()}
+    existing = {
+        normalize_approved_stock_item(item)
+        for item in (product.get("stock", []) or [])
+        if normalize_approved_stock_item(item)
+    }
     cursor = get_db().orders.find(
         {"product_name": _name_regex(product_name), "items.0": {"$exists": True}},
         {"items": 1},
     )
     async for order in cursor:
-        existing.update(str(item).strip() for item in (order.get("items", []) or []) if str(item).strip())
+        existing.update(normalize_approved_stock_item(item) for item in (order.get("items", []) or []) if normalize_approved_stock_item(item))
 
     seen_in_upload: set[str] = set()
     fresh_items: list[str] = []
     for item in items:
-        clean = str(item).strip()
+        clean = normalize_approved_stock_item(item)
         if not clean:
             continue
         if clean in existing or clean in seen_in_upload:

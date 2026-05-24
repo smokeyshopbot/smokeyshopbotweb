@@ -43,7 +43,20 @@
         <span>New order: <strong><a href="{{ url_for('order_detail', order_id=order.get('delivery_transferred_to_order_id')) }}">{{ order.get('delivery_transferred_to_order_id') }}</a></strong></span>
       </div>
     </div>
+  {% elif order.get('delivery_returned_to_stock') %}
+    <div class="transfer-complete-box">
+      <div>
+        <h3>Added back to stock</h3>
+        <p class="muted">This revoked stock was returned to current stock and can no longer be transferred.</p>
+      </div>
+      <div class="transfer-complete-links">
+        <span>Returned at: <strong>{{ fmt_dt(order.get('delivery_returned_to_stock_at')) }}</strong></span>
+        <span>Returned by: <strong>{{ order.get('delivery_returned_to_stock_by') or 'Admin' }}</strong></span>
+        <span>Items: <strong>{{ order.get('delivery_returned_to_stock_count') or 0 }}</strong></span>
+      </div>
+    </div>
   {% else %}
+    <div class="revoked-delivery-actions">
     <form method="post" action="{{ url_for('transfer_revoked_order', order_id=order.order_id) }}" class="transfer-delivery-form" data-confirm-order-action data-order-action="transfer" data-order-ref="{{ order.order_id }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label>Correct user ID or @username
@@ -55,6 +68,11 @@
       </label>
       <button class="primary" type="submit">Transfer revoked stock</button>
     </form>
+    <form method="post" action="{{ url_for('return_revoked_order_to_stock', order_id=order.order_id) }}" class="return-revoked-stock-form" data-confirm-order-action data-order-action="return_stock" data-order-ref="{{ order.order_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="secondary-button" type="submit">Add back to stock</button>
+    </form>
+    </div>
   {% endif %}
 </section>
 {% endif %}

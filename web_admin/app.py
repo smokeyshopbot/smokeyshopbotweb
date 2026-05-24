@@ -192,7 +192,7 @@ ROLE_ENDPOINTS: dict[str, set[str]] = {
         "payments", "decide_payment", "tx_hash_logs", "legacy_payment_audit_redirect", "telegram_file",
     },
     ADMIN_ROLE_ORDERS_MANAGER: {
-        "orders", "order_detail", "pending_orders", "expire_stale_orders_now", "expire_order_now", "resend_order", "revoke_order_delivery",
+        "orders", "order_detail", "pending_orders", "expire_stale_orders_now", "expire_order_now", "resend_order", "revoke_order_delivery", "return_revoked_order_to_stock",
         "replacement_orders", "replacement_order_detail",
     },
 }
@@ -3720,6 +3720,10 @@ def register_routes(app: Flask) -> None:
                     return redirect(url_for(endpoint, order_id=new_id))
             return redirect(old_detail_url)
 
+        if order.get("delivery_returned_to_stock"):
+            flash("This revoked delivery was already added back to stock, so it cannot be transferred.", "info")
+            return redirect(old_detail_url)
+
         items = [str(item).strip() for item in (order.get("items") or []) if str(item).strip()]
         if order.get("status") != "delivered" or not items:
             flash("Only revoked delivered orders with saved stock/items can be transferred.", "error")
@@ -3793,6 +3797,95 @@ def register_routes(app: Flask) -> None:
 
         endpoint = "replacement_order_detail" if new_order.get("is_replacement") else "order_detail"
         return redirect(url_for(endpoint, order_id=new_order["order_id"]))
+
+    @app.post("/orders/<order_id>/return-to-stock")
+    @login_required
+    @csrf_required
+    def return_revoked_order_to_stock(order_id: str):
+        ref_id = str(order_id or "").strip().upper()
+        order = app.db.orders.find_one({"order_id": ref_id}) if ref_id else None
+        if not order:
+            flash("Order not found.", "error")
+            return redirect(url_for("orders"))
+
+        detail_url = url_for("replacement_order_detail" if order.get("is_replacement") else "order_detail", order_id=order.get("order_id", ref_id))
+
+        if not order.get("delivery_revoked"):
+            flash("Only revoked deliveries can be added back to stock.", "error")
+            return redirect(detail_url)
+        if order.get("delivery_transferred_to_order_id"):
+            flash("This revoked delivery was already transferred, so it cannot be added back to stock.", "error")
+            return redirect(detail_url)
+        if order.get("delivery_returned_to_stock"):
+            flash("This revoked delivery was already added back to stock.", "info")
+            return redirect(detail_url)
+
+        product_name = str(order.get("product_name") or "").strip()
+        product = app.db.products.find_one({"name": name_regex(product_name)}) if product_name else None
+        if not product:
+            flash("Product not found, so the revoked stock could not be added back.", "error")
+            return redirect(detail_url)
+
+        returned_items: list[str] = []
+        current_keys = {
+            normalize_approved_stock_item(item)
+            for item in (product.get("stock") or [])
+            if normalize_approved_stock_item(item)
+        }
+        seen_keys: set[str] = set()
+        for raw_item in (order.get("items") or []):
+            clean_item = normalize_approved_stock_item(raw_item)
+            if not clean_item:
+                continue
+            if clean_item in current_keys or clean_item in seen_keys:
+                continue
+            returned_items.append(clean_item)
+            seen_keys.add(clean_item)
+
+        if not returned_items:
+            flash("No stock was added back. These item(s) are already in current stock or no saved item text was found.", "info")
+            return redirect(detail_url)
+
+        returned_by = current_admin_username() or current_admin_role() or "owner"
+        stock_meta_records = build_stock_added_by_records(
+            returned_items,
+            username=returned_by,
+            role=current_admin_role(),
+            manager_earning_rate_usdt=0.0,
+            owner_due_rate_usdt=0.0,
+            stock_upload_kind="returned_revoked_delivery",
+        )
+        app.db.products.update_one(
+            {"_id": product["_id"]},
+            {"$push": {"stock": {"$each": returned_items}, "stock_added_by": {"$each": stock_meta_records}}},
+        )
+        pending_summary = process_pending_stock_orders(app.db, product_name)
+        now = utcnow()
+        app.db.orders.update_one(
+            {"order_id": ref_id},
+            {"$set": {
+                "delivery_returned_to_stock": True,
+                "delivery_returned_to_stock_at": now,
+                "delivery_returned_to_stock_by": returned_by,
+                "delivery_returned_to_stock_count": len(returned_items),
+                "delivery_returned_to_stock_pending_orders_delivered": int(pending_summary.get("orders_delivered", 0) or 0),
+                "delivery_returned_to_stock_pending_items_delivered": int(pending_summary.get("items_delivered", 0) or 0),
+            }},
+        )
+
+        label = "Replacement" if order.get("is_replacement") else "Order"
+        log_action = "revoked_replacement_returned_to_stock" if order.get("is_replacement") else "revoked_order_returned_to_stock"
+        log_admin_action(
+            app.db,
+            log_action,
+            f"{ref_id}: product={product_name} added={len(returned_items)} pending_orders_delivered={pending_summary.get('orders_delivered', 0)} by={returned_by}",
+        )
+        delivered_count = int(pending_summary.get("orders_delivered", 0) or 0)
+        if delivered_count:
+            flash(f"{label} {ref_id} stock added back. Auto-delivered {delivered_count} pending order(s).", "success")
+        else:
+            flash(f"{label} {ref_id} stock added back to current stock.", "success")
+        return redirect(detail_url)
 
     @app.get("/replacement-orders")
     @login_required
@@ -4379,7 +4472,7 @@ def get_used_stock_items(db, product_name: str) -> list[str]:
         {"product_name": name_regex(product_name), "items.0": {"$exists": True}},
         {"items": 1},
     ):
-        used.extend([str(item).strip() for item in (order.get("items", []) or []) if str(item).strip()])
+        used.extend([normalize_approved_stock_item(item) for item in (order.get("items", []) or []) if normalize_approved_stock_item(item)])
     return used
 
 
@@ -4390,12 +4483,16 @@ def filter_fresh_stock_items(existing_stock: list[str], new_items: list[str]) ->
     current stock, already delivered stock, and duplicates repeated in the same
     upload. The same stock text can still be used for a different product.
     """
-    existing = {str(item).strip() for item in (existing_stock or []) if str(item).strip()}
+    existing = {
+        normalize_approved_stock_item(item)
+        for item in (existing_stock or [])
+        if normalize_approved_stock_item(item)
+    }
     seen_in_upload: set[str] = set()
     fresh: list[str] = []
     duplicates: list[str] = []
     for item in new_items:
-        clean = str(item).strip()
+        clean = normalize_approved_stock_item(item)
         if not clean:
             continue
         if clean in existing or clean in seen_in_upload:

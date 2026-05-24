@@ -3648,3 +3648,13 @@ button.small-button,
 
 .product-row-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .stock-rejection-row-badge { border-color: rgba(139, 92, 246, .55); color: #d8b4fe; }
+
+.revoked-delivery-actions {
+  display: grid;
+  gap: 14px;
+}
+
+.return-revoked-stock-form {
+  display: flex;
+  justify-content: flex-start;
+}

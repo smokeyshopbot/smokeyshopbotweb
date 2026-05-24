@@ -531,18 +531,21 @@
       const isResend = action === 'resend';
       const isRevoke = action === 'revoke';
       const isTransfer = action === 'transfer';
-      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : 'Confirm')));
+      const isReturnStock = action === 'return_stock';
+      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : (isReturnStock ? 'Add back to stock' : 'Confirm'))));
 
       title.textContent = isRevoke
         ? 'Delete Telegram file and revoke?'
-        : (isTransfer ? 'Transfer revoked delivery?' : (label + ' order?'));
+        : (isTransfer ? 'Transfer revoked delivery?' : (isReturnStock ? 'Add revoked delivery back to stock?' : (label + ' order?')));
       message.textContent = isExpire
         ? 'This will expire pending order ' + orderRef + '.'
         : (isRevoke
           ? 'This will try to delete the sent Telegram file/message for order ' + orderRef + ' and disable /getorder refetch. Telegram may refuse deletion after about 48 hours.'
           : (isTransfer
             ? 'This will send the exact revoked stock/items from ' + orderRef + ' to the corrected user and create a new delivery history record.'
-            : 'This will resend the delivered product for order ' + orderRef + ' to the user.'));
+            : (isReturnStock
+              ? 'This will add the exact revoked stock/items from ' + orderRef + ' back to current stock. After this, the delivery cannot be transferred to another user.'
+              : 'This will resend the delivered product for order ' + orderRef + ' to the user.')));
       submitButton.textContent = label;
       submitButton.classList.toggle('danger', isExpire || isRevoke);
       submitButton.classList.toggle('primary', !(isExpire || isRevoke));
