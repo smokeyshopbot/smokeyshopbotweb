@@ -82,7 +82,7 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="stock_upload_kind" value="normal">
       <label>Stock items
-        <textarea id="normal-stock-items" name="items" rows="10" placeholder="item1&#10;---&#10;item2&#10;---&#10;username&#10;password"></textarea>
+        <textarea id="normal-stock-items" name="items" rows="10" placeholder="item 1&#10;---&#10;item 2"></textarea>
       </label>
       <button class="success" type="submit">Add stock</button>
     </form>
@@ -106,12 +106,9 @@
     <form method="post" action="{{ url_for('remove_stock', name=product.name) }}" class="stacked-form" data-product-danger-confirm data-confirm-title="Remove stock item(s)?" data-confirm-action="Remove stock" data-confirm-message="This will remove the pasted matching item(s) from this product's current stock. Copy from the Current stock section and paste here. Items not found are skipped." data-confirm-button="Remove items">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label>Stock item text to remove
-        <textarea name="items" rows="10" placeholder="Paste stock copied from Current stock, for example:
-Mail:- user@example.com
-Pass:- accountpass
-Mail Pass:- mailpass
+        <textarea name="items" rows="10" placeholder="item 1
 ---
-CODE-123"></textarea>
+item 2"></textarea>
       </label>
       <button class="danger" type="submit">Remove items</button>
     </form>
