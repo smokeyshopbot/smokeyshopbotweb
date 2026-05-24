@@ -4,7 +4,7 @@
 <div class="page-header">
   <div>
     <h1>System Health</h1>
-    <p>Quick safety checks for database, payments, duplicate protection, stock alerts, and pending work.</p>
+    <p>Quick safety checks for database, BEP20/Polygon payments, duplicate protection, stock alerts, and pending work.</p>
   </div>
 </div>
 
@@ -32,10 +32,13 @@
   <h2>Live counters</h2>
   <div class="stats-grid">
     <div class="stat"><span>Payment reviews</span><strong>{{ health.counters.pending_payment_reviews }}</strong></div>
+    <div class="stat"><span>Manual TxHash reviews</span><strong>{{ health.counters.manual_txhash_reviews }}</strong></div>
+    <div class="stat"><span>Tx hash records</span><strong>{{ health.counters.tx_hash_records }}</strong></div>
     <div class="stat"><span>Pending stock orders</span><strong>{{ health.counters.pending_stock_orders }}</strong></div>
     <div class="stat"><span>Waiting payments</span><strong>{{ health.counters.waiting_payments }}</strong></div>
     <div class="stat"><span>Payout requests</span><strong>{{ health.counters.pending_payout_requests }}</strong></div>
     <div class="stat"><span>Replacement reports</span><strong>{{ health.counters.pending_replacement_reports }}</strong></div>
+    <div class="stat"><span>Rejected stock uploads</span><strong>{{ health.counters.rejected_stock_uploads }}</strong></div>
     <div class="stat"><span>Low/out of stock</span><strong>{{ health.counters.low_or_out_of_stock_products }}</strong></div>
   </div>
   <p class="muted">Generated {{ fmt_dt(health.generated_at) }}.</p>

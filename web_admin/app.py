@@ -1073,9 +1073,25 @@ def build_system_health(db) -> dict[str, Any]:
     settings = get_secret_settings(db)
     payment_settings = get_payment_settings(db)
     enabled_methods = [
-        label for key, label in [("upi", "UPI"), ("usdt", "USDT (BEP20)"), ("binance", "Binance Pay"), ("wallet_inr", "INR Wallet"), ("wallet_usdt", "USDT Wallet")]
+        label for key, label in [
+            ("upi", "UPI"),
+            ("usdt", "USDT (BEP20)"),
+            ("polygon", "USDT (POLYGON)"),
+            ("binance", "Binance Pay"),
+            ("wallet_inr", "INR Wallet"),
+            ("wallet_usdt", "USDT Wallet"),
+        ]
         if payment_method_enabled(payment_settings, key)
     ]
+
+    def _int_setting(key: str, default: int) -> int:
+        try:
+            return int(str(settings.get(key) or SECRET_DEFAULTS.get(key) or default).strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _configured_rpc_count(list_key: str, single_key: str) -> int:
+        return len(_split_csv(str(settings.get(list_key) or settings.get(single_key) or "")))
 
     saved_bot_token = get_bot_token(db)
     checks.append({
@@ -1094,13 +1110,61 @@ def build_system_health(db) -> dict[str, Any]:
         "detail": ", ".join(enabled_methods) if enabled_methods else "No payment methods enabled",
     })
 
-    usdt_cfg = payment_settings.get("usdt_bep20", {}) if isinstance(payment_settings, dict) else {}
-    if usdt_cfg.get("enabled"):
+    usdt_networks = [
+        {
+            "key": "usdt_bep20",
+            "label": "USDT (BEP20)",
+            "rpc_list_key": "bsc_rpc_urls",
+            "rpc_single_key": "bsc_rpc_url",
+            "confirmations_key": "bep20_required_confirmations",
+            "scan_key": "bscscan_api_key",
+            "scan_label": "BscScan API",
+            "default_confirmations": 3,
+        },
+        {
+            "key": "usdt_polygon",
+            "label": "USDT (POLYGON)",
+            "rpc_list_key": "polygon_rpc_urls",
+            "rpc_single_key": "polygon_rpc_url",
+            "confirmations_key": "polygon_required_confirmations",
+            "scan_key": "polygonscan_api_key",
+            "scan_label": "PolygonScan API",
+            "default_confirmations": 20,
+        },
+    ]
+    for network in usdt_networks:
+        cfg = payment_settings.get(network["key"], {}) if isinstance(payment_settings, dict) else {}
+        enabled = bool(cfg.get("enabled"))
+        wallet_saved = bool(str(cfg.get("wallet_address") or "").strip())
+        if enabled:
+            payment_status = "ok" if wallet_saved else "error"
+            payment_detail = "Enabled, wallet address saved" if wallet_saved else "Enabled but wallet address missing"
+        else:
+            payment_status = "ok"
+            payment_detail = "Disabled; wallet address saved" if wallet_saved else "Disabled"
+        checks.append({"name": f"{network['label']} payment", "status": payment_status, "detail": payment_detail})
+
+        rpc_count = _configured_rpc_count(network["rpc_list_key"], network["rpc_single_key"])
         checks.append({
-            "name": "USDT (BEP20) wallet",
-            "status": "ok" if usdt_cfg.get("wallet_address") else "error",
-            "detail": "Wallet address saved" if usdt_cfg.get("wallet_address") else "Enabled but wallet address missing",
+            "name": f"{network['label']} RPC providers",
+            "status": "ok" if rpc_count else ("error" if enabled else "warning"),
+            "detail": f"{rpc_count} RPC provider(s) configured" if rpc_count else "No RPC providers configured",
         })
+
+        confirmations = _int_setting(network["confirmations_key"], int(network["default_confirmations"]))
+        checks.append({
+            "name": f"{network['label']} confirmations",
+            "status": "ok" if confirmations >= 1 else ("error" if enabled else "warning"),
+            "detail": f"Requires {confirmations} confirmation(s)" if confirmations >= 1 else "Invalid confirmation setting",
+        })
+
+        api_key_saved = bool(str(settings.get(network["scan_key"]) or "").strip())
+        checks.append({
+            "name": f"{network['label']} {network['scan_label']}",
+            "status": "ok",
+            "detail": "API key saved" if api_key_saved else "Optional API key not saved; RPC verification can still run",
+        })
+
     binance_enabled = bool((payment_settings.get("binance", {}) if isinstance(payment_settings, dict) else {}).get("enabled"))
     if binance_enabled:
         binance_ready = bool(settings.get("binance_api_key") and settings.get("binance_api_secret"))
@@ -1123,16 +1187,27 @@ def build_system_health(db) -> dict[str, Any]:
     checks.append({
         "name": "USDT transaction reuse",
         "status": "ok" if duplicate_usdt_hashes == 0 else "warning",
-        "detail": "No duplicate auto-verified USDT transaction hashes found" if duplicate_usdt_hashes == 0 else f"{duplicate_usdt_hashes} duplicate transaction hash value(s) found",
+        "detail": "No duplicate USDT transaction hashes found" if duplicate_usdt_hashes == 0 else f"{duplicate_usdt_hashes} duplicate transaction hash value(s) found",
     })
 
     product_alert = get_product_stock_alert_summary(db)
+    tx_hash_present = {"$nin": [None, ""]}
     counters = {
         "pending_payment_reviews": count_pending_payment_reviews(db),
+        "manual_txhash_reviews": db.pending_payments.count_documents({
+            "status": "usdt_manual_submitted",
+            "usdt_manual_auto_check_result": {"$in": ["failed", "error", "duplicate"]},
+        }),
+        "tx_hash_records": db.pending_payments.count_documents({"$or": [
+            {"usdt_transaction_hash": tx_hash_present},
+            {"usdt_txn_hash": tx_hash_present},
+            {"usdt_txn_hash_key": tx_hash_present},
+        ]}),
         "pending_stock_orders": db.orders.count_documents({"status": "pending_stock"}),
         "waiting_payments": db.pending_payments.count_documents({"status": "waiting"}),
         "pending_payout_requests": count_pending_stock_manager_payout_requests(db),
         "pending_replacement_reports": count_pending_replacement_reports(db),
+        "rejected_stock_uploads": db.stock_upload_rejections.count_documents({}),
         "low_or_out_of_stock_products": int(product_alert.get("count") or 0),
     }
     return {"checks": checks, "counters": counters, "generated_at": utcnow()}
