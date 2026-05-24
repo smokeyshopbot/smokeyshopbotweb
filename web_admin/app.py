@@ -2634,11 +2634,8 @@ def register_routes(app: Flask) -> None:
         notified = notify_users_new_stock(app.db, product["name"], available) if should_notify_restock else 0
         log_action_name = "replacement_stock_added" if is_replacement_upload else "stock_added"
         log_admin_action(app.db, log_action_name, f"{product['name']}: added={len(fresh_blocks)} skipped={skipped} rejected_by_pool={rejected_by_pool} notified={notified} replacement_sent={replacement_summary['replacements_sent']}")
-        replacement_text = f" Sent {replacement_summary['replacements_sent']} pending replacement(s)." if replacement_summary.get("replacements_sent") else ""
-        notify_text = " Users were not notified for replacement stock." if is_replacement_upload else ""
-        fulfilled_text = f" Cleared {fulfilled_replacement_owed_count} pending replacement obligation(s)." if fulfilled_replacement_owed_count else ""
         flash(
-            f"Added {len(fresh_blocks)} {'replacement ' if is_replacement_upload else ''}fresh stock item(s).{skipped_text}{rejected_text}{replacement_text}{notify_text}{fulfilled_text} Auto-delivered {summary['orders_delivered']} pending order(s). Total stock: {total}, available: {available}.",
+            f"Added {len(fresh_blocks)} {'replacement ' if is_replacement_upload else ''}fresh stock item(s).{skipped_text}{rejected_text}",
             "success",
         )
         return redirect(url_for("product_manage", name=product["name"]))

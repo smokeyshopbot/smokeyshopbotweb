@@ -1654,11 +1654,7 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ Added *{count}* fresh item(s) to *{product_name}*\n"
         f"{skipped_line}"
-        f"{rejected_line}"
-        f"🚚 Auto-delivered pending orders: *{delivered_orders}* order(s), *{delivered_items}* item(s)\n"
-        f"⏳ Still pending stock quantity: *{pending_qty}*\n"
-        f"📦 Total stock now: *{total}*\n"
-        f"🛒 Available for new buyers: *{available}*",
+        f"{rejected_line}",
         parse_mode="Markdown"
     )
     return True
