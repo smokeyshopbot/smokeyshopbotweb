@@ -57,21 +57,23 @@
     </div>
   {% else %}
     <div class="revoked-delivery-actions">
-    <form method="post" action="{{ url_for('transfer_revoked_order', order_id=order.order_id) }}" class="transfer-delivery-form" data-confirm-order-action data-order-action="transfer" data-order-ref="{{ order.order_id }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>Correct user ID or @username
-        <input name="target_user_id" placeholder="123456789 or @username" required>
-      </label>
-      <label>
-        Transfer note (optional)
-        <input name="transfer_note" maxlength="1000" placeholder="Sent to wrong user by mistake">
-      </label>
-      <button class="primary" type="submit">Transfer revoked stock</button>
-    </form>
-    <form method="post" action="{{ url_for('return_revoked_order_to_stock', order_id=order.order_id) }}" class="return-revoked-stock-form" data-confirm-order-action data-order-action="return_stock" data-order-ref="{{ order.order_id }}">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <button class="secondary-button" type="submit">Add back to stock</button>
-    </form>
+      <form id="transfer-revoked-order-form" method="post" action="{{ url_for('transfer_revoked_order', order_id=order.order_id) }}" class="transfer-delivery-form" data-confirm-order-action data-order-action="transfer" data-order-ref="{{ order.order_id }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Correct user ID or @username
+          <input name="target_user_id" placeholder="123456789 or @username" required>
+        </label>
+        <label>
+          Transfer note (optional)
+          <input name="transfer_note" maxlength="1000" placeholder="Sent to wrong user by mistake">
+        </label>
+      </form>
+      <div class="revoked-delivery-button-row">
+        <button class="primary" type="submit" form="transfer-revoked-order-form">Transfer revoked stock</button>
+        <form method="post" action="{{ url_for('return_revoked_order_to_stock', order_id=order.order_id) }}" class="return-revoked-stock-form" data-confirm-order-action data-order-action="return_stock" data-order-ref="{{ order.order_id }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="secondary-button" type="submit">Add back to stock</button>
+        </form>
+      </div>
     </div>
   {% endif %}
 </section>

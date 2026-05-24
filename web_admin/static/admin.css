@@ -3656,7 +3656,15 @@ button.small-button,
   gap: 14px;
 }
 
+.revoked-delivery-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
 .return-revoked-stock-form {
   display: flex;
   justify-content: flex-start;
+  margin: 0;
 }
