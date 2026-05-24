@@ -2152,6 +2152,16 @@ def register_routes(app: Flask) -> None:
                 return redirect(url_for("product_manage", name=product["name"]))
             new_pool = submitted_items
             flash(f"Approved stock pool replaced with {len(new_pool)} item(s).", "success")
+        elif action == "remove":
+            if not submitted_items:
+                flash("Paste at least one approved stock item to remove from the pool.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+            remove_set = set(submitted_items)
+            before_count = len(new_pool)
+            new_pool = [item for item in new_pool if item not in remove_set]
+            removed = before_count - len(new_pool)
+            missing = len(remove_set) - removed
+            flash(f"Removed {removed} approved stock item(s) from the pool. Skipped {max(missing, 0)} item(s) that were not in the pool.", "success" if removed else "info")
         elif action == "clear":
             new_pool = []
             flash("Approved stock pool cleared.", "success")
