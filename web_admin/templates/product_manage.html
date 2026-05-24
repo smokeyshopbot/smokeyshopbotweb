@@ -231,12 +231,14 @@
         <li>Every other character must match exactly.</li>
         <li>Only incorrect stock is skipped; valid stock still gets added.</li>
         <li>Rejected attempts appear below and in Activity Log.</li>
+        <li><b>Remove from current stock</b> uses this same box but removes matching live stock, not approved-pool items.</li>
       </ul>
     </div>
 
     <div class="approved-pool-actions">
       <button class="primary" type="submit" name="pool_action" value="append" data-confirm-title="Add to approved pool?" data-confirm-message="This will add the pasted approved stock item(s) to this product's pool. Duplicate pool items will be skipped." data-confirm-button="Add to pool">Add to pool</button>
       <button type="submit" name="pool_action" value="remove" data-confirm-title="Remove from approved pool?" data-confirm-message="This will remove only the pasted matching approved stock item(s) from this product's pool. Items not found in the pool will be skipped." data-confirm-button="Remove from pool">Remove from pool</button>
+      <button class="danger" type="submit" name="pool_action" value="remove_current_stock" data-confirm-title="Remove from current stock?" data-confirm-message="This will remove the pasted matching item(s) from this product's live/current stock. It will not change the approved pool." data-confirm-button="Remove current stock">Remove from current stock</button>
       <button type="submit" name="pool_action" value="replace" data-confirm-title="Replace approved stock pool?" data-confirm-message="This will replace the approved pool for this product with only the pasted item(s)." data-confirm-button="Replace pool">Replace pool</button>
       <button type="submit" name="pool_action" value="settings" data-confirm-title="Save approved-pool setting?" data-confirm-message="This will save whether stock managers must use the owner-approved stock pool for this product." data-confirm-button="Save setting">Save setting only</button>
       <button class="danger" type="submit" name="pool_action" value="clear" data-confirm-title="Clear approved stock pool?" data-confirm-message="This will clear the approved pool for this product. If restriction remains enabled, stock managers cannot add stock until you add approved items again." data-confirm-button="Clear pool">Clear pool</button>

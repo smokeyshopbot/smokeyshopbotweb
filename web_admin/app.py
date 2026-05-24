@@ -2210,6 +2210,33 @@ def register_routes(app: Flask) -> None:
                 submitted_items.append(clean)
                 seen_submitted.add(clean)
 
+        if action == "remove_current_stock":
+            stock_blocks = split_stock(raw_items)
+            if not stock_blocks:
+                flash("Paste at least one current stock item to remove.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+            result = remove_stock_items(app.db, product["name"], stock_blocks)
+            if result.get("removed"):
+                record_stock_manager_stock_event(
+                    app.db,
+                    "remove",
+                    product["name"],
+                    result.get("removed", []),
+                    username=current_admin_username() or "owner",
+                    role=current_admin_role(),
+                )
+            notify_low_stock_if_needed(app.db, product["name"])
+            log_admin_action(
+                app.db,
+                "stock_removed",
+                f"{product['name']}: source=approved_pool_box removed={len(result['removed'])} not_found={len(result['not_found'])}",
+            )
+            flash(
+                f"Removed {len(result['removed'])} current stock item(s). Not found: {len(result['not_found'])}. Remaining: {result['remaining']}.",
+                "success" if result.get("removed") else "info",
+            )
+            return redirect(url_for("product_manage", name=product["name"]))
+
         existing_items = approved_stock_pool_items(product)
         existing_seen = set(existing_items)
         new_pool = list(existing_items)
