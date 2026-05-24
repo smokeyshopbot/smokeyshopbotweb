@@ -47,6 +47,17 @@ th { color: var(--muted); font-size: .86rem; font-weight: 600; }
 .badge { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); font-size: .82rem; margin: 2px; }
 .success-badge { color: #86efac; border-color: rgba(34,197,94,.5); }
 .danger-badge { color: #fca5a5; border-color: rgba(239,68,68,.5); }
+
+/* Activity log alignment */
+.activity-table th.source-col,
+.activity-table td.source-cell {
+  text-align: center;
+  vertical-align: middle;
+}
+.activity-table td.source-cell .badge {
+  margin-left: auto;
+  margin-right: auto;
+}
 button, input, textarea, select { font: inherit; }
 input, textarea, select { width: 100%; background: #030712; color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 textarea { resize: vertical; }
