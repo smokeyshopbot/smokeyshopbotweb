@@ -18,6 +18,40 @@
   <div class="card payout-due-card"><span>Payout due to you</span><strong>{{ money_usdt(summary.payable_due_usdt) }}</strong><small>Minimum request: {{ money_usdt(stock_manager_min_payout_usdt) }}.</small></div>
 </section>
 
+{% if stats.replacement_summary.pending_by_product %}
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Pending replacements to submit</h2>
+      <p class="muted">Add replacement stock for these products to clear the pending count.</p>
+    </div>
+    <span class="badge warning">{{ summary.pending_replacement_count }} pending</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Product</th><th class="status-col">Needed</th><th>Source</th></tr></thead>
+      <tbody>
+      {% for row in stats.replacement_summary.pending_by_product %}
+        <tr>
+          <td><strong>{{ row.product_name }}</strong></td>
+          <td class="center-cell"><span class="badge warning compact-badge">{{ row.count }}</span></td>
+          <td>
+            {% if row.report_ids %}
+              {% for report_id in row.report_ids %}<span class="badge compact-badge">{{ report_id }}</span>{% endfor %}
+            {% endif %}
+            {% if row.manual_due_ids %}
+              {% for due_id in row.manual_due_ids %}<span class="badge compact-badge">{{ due_id }}</span>{% endfor %}
+            {% endif %}
+            {% if not row.report_ids and not row.manual_due_ids %}<span class="muted">Owner manual due</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
 <section class="panel payout-request-panel">
   <div class="toolbar">
     <div>

@@ -18,6 +18,16 @@
     <div><span>Created</span><strong>{{ fmt_dt(account.created_at) }}</strong></div>
   </div>
   <p class="muted">{{ admin_role_descriptions.get(account.role, '') }}</p>
+  <form method="post" action="{{ url_for('update_admin_account_credentials', account_id=account.id) }}" class="form-grid admin-credentials-form" data-account-credentials-form data-account-username="{{ account.username|e }}" data-account-role="{{ admin_role_labels.get(account.role, account.role)|e }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Username
+      <input name="admin_username" value="{{ account.username }}" required autocomplete="off">
+    </label>
+    <label>New password optional
+      <input name="admin_password" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password">
+    </label>
+    <button class="secondary-button" type="submit">Update login</button>
+  </form>
 </section>
 
 {% if account.role == 'stock_manager' %}
@@ -62,6 +72,36 @@
   {% endif %}
 </section>
 
+<section class="panel manual-replacement-due-panel">
+  <div class="toolbar">
+    <div>
+      <h2>Add manual replacement due</h2>
+      <p class="muted">Owner can add replacement quantity directly to this stock manager dashboard.</p>
+    </div>
+  </div>
+  {% if all_products %}
+  <form method="post" action="{{ url_for('add_owner_manual_replacement_due', account_id=account.id) }}" class="form-grid manual-replacement-due-form" data-manual-replacement-due-form data-manager-username="{{ account.username|e }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Product
+      <select name="product_name" required>
+        {% for product in all_products %}
+          <option value="{{ product.name }}">{{ product.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Replacements needed
+      <input name="quantity" type="number" min="1" max="500" step="1" value="1" required>
+    </label>
+    <label>Owner note optional
+      <input name="note" placeholder="Reason / batch note">
+    </label>
+    <button class="success" type="submit">Add replacement due</button>
+  </form>
+  {% else %}
+    <p class="muted">Create a product first, then you can assign manual replacement due.</p>
+  {% endif %}
+</section>
+
 <section class="panel">
   <div class="toolbar">
     <div>
@@ -73,7 +113,7 @@
   {% if replacement_summary.pending_by_product %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Product</th><th class="status-col">Needed</th><th>Replacement reports</th></tr></thead>
+      <thead><tr><th>Product</th><th class="status-col">Needed</th><th>Reports / manual due</th></tr></thead>
       <tbody>
       {% for row in replacement_summary.pending_by_product %}
         <tr>
@@ -83,6 +123,12 @@
             {% for report_id in row.report_ids %}
               <a class="small-button" href="{{ url_for('replacement_detail', report_id=report_id) }}">{{ report_id }}</a>
             {% endfor %}
+            {% for due_id in row.manual_due_ids %}
+              <span class="badge compact-badge">{{ due_id }}</span>
+            {% endfor %}
+            {% if not row.report_ids and not row.manual_due_ids %}
+              <span class="muted">Owner manual due</span>
+            {% endif %}
           </td>
         </tr>
       {% endfor %}
@@ -205,6 +251,42 @@
   {% endif %}
 </section>
 
+<div id="account-credentials-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-account-credentials-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="account-credentials-confirm-title">
+    <h3 id="account-credentials-confirm-title">Update admin login?</h3>
+    <p class="muted">This changes the WebAdmin login for this account. Existing stock-manager history stays attached if the username changes.</p>
+    <div class="action-confirm-summary">
+      <div><span>Account</span><strong id="account-credentials-confirm-admin">-</strong></div>
+      <div><span>Role</span><strong id="account-credentials-confirm-role">-</strong></div>
+      <div><span>New username</span><strong id="account-credentials-confirm-username">-</strong></div>
+      <div><span>Password</span><strong id="account-credentials-confirm-password">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-account-credentials-confirm>Cancel</button>
+      <button type="button" class="action-button success" id="account-credentials-confirm-submit">Update login</button>
+    </div>
+  </div>
+</div>
+
+<div id="manual-replacement-due-confirm-modal" class="action-confirm-shell" hidden>
+  <div class="action-confirm-backdrop" data-close-manual-replacement-due-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="manual-replacement-due-confirm-title">
+    <h3 id="manual-replacement-due-confirm-title">Add manual replacement due?</h3>
+    <p class="muted">This adds pending replacement obligation(s) to the stock manager dashboard. It does not add stock.</p>
+    <div class="action-confirm-summary">
+      <div><span>Stock manager</span><strong id="manual-replacement-due-confirm-admin">-</strong></div>
+      <div><span>Product</span><strong id="manual-replacement-due-confirm-product">-</strong></div>
+      <div><span>Quantity</span><strong id="manual-replacement-due-confirm-quantity">-</strong></div>
+      <div><span>Note</span><strong id="manual-replacement-due-confirm-note">-</strong></div>
+    </div>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-manual-replacement-due-confirm>Cancel</button>
+      <button type="button" class="action-button success" id="manual-replacement-due-confirm-submit">Add due</button>
+    </div>
+  </div>
+</div>
+
 <div id="clear-payout-confirm-modal" class="action-confirm-shell" hidden>
   <div class="action-confirm-backdrop" data-close-clear-payout-confirm></div>
   <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="clear-payout-confirm-title">
@@ -235,47 +317,136 @@
 {% endblock %}
 
 {% block scripts %}
-{% if account.role == 'stock_manager' %}
 <script>
 (function () {
+  let pendingCredentialsForm = null;
+  let pendingManualDueForm = null;
   let pendingClearPayoutForm = null;
-  const modal = document.getElementById('clear-payout-confirm-modal');
+  const credentialsModal = document.getElementById('account-credentials-confirm-modal');
+  const manualDueModal = document.getElementById('manual-replacement-due-confirm-modal');
+  const clearPayoutModal = document.getElementById('clear-payout-confirm-modal');
 
   function setText(id, value) {
     const el = document.getElementById(id);
     if (el) el.textContent = value || '-';
   }
 
+  function closeCredentialsConfirm() {
+    if (credentialsModal) credentialsModal.hidden = true;
+    pendingCredentialsForm = null;
+    document.body.classList.remove('modal-open');
+  }
+
+  function openCredentialsConfirm(form) {
+    if (!credentialsModal) return false;
+    pendingCredentialsForm = form;
+    const usernameInput = form.querySelector('input[name="admin_username"]');
+    const passwordInput = form.querySelector('input[name="admin_password"]');
+    setText('account-credentials-confirm-admin', form.dataset.accountUsername);
+    setText('account-credentials-confirm-role', form.dataset.accountRole);
+    setText('account-credentials-confirm-username', usernameInput && usernameInput.value.trim() ? usernameInput.value.trim() : '-');
+    setText('account-credentials-confirm-password', passwordInput && passwordInput.value.trim() ? 'Will be changed' : 'No change');
+    credentialsModal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
+  function closeManualDueConfirm() {
+    if (manualDueModal) manualDueModal.hidden = true;
+    pendingManualDueForm = null;
+    document.body.classList.remove('modal-open');
+  }
+
+  function openManualDueConfirm(form) {
+    if (!manualDueModal) return false;
+    pendingManualDueForm = form;
+    const productInput = form.querySelector('select[name="product_name"]');
+    const quantityInput = form.querySelector('input[name="quantity"]');
+    const noteInput = form.querySelector('input[name="note"]');
+    setText('manual-replacement-due-confirm-admin', form.dataset.managerUsername);
+    setText('manual-replacement-due-confirm-product', productInput && productInput.value ? productInput.value : '-');
+    setText('manual-replacement-due-confirm-quantity', quantityInput && quantityInput.value ? quantityInput.value : '-');
+    setText('manual-replacement-due-confirm-note', noteInput && noteInput.value.trim() ? noteInput.value.trim() : 'No note');
+    manualDueModal.hidden = false;
+    document.body.classList.add('modal-open');
+    return true;
+  }
+
   function closeClearPayoutConfirm() {
-    if (modal) modal.hidden = true;
+    if (clearPayoutModal) clearPayoutModal.hidden = true;
     pendingClearPayoutForm = null;
     document.body.classList.remove('modal-open');
   }
 
   function openClearPayoutConfirm(form) {
-    if (!modal) return false;
+    if (!clearPayoutModal) return false;
     pendingClearPayoutForm = form;
     const noteInput = form.querySelector('input[name="note"]');
     setText('clear-payout-confirm-admin', form.dataset.payoutAdmin);
     setText('clear-payout-confirm-amount', form.dataset.payoutAmount);
     setText('clear-payout-confirm-method', form.dataset.payoutMethod);
     setText('clear-payout-confirm-note', noteInput && noteInput.value.trim() ? noteInput.value.trim() : 'No note');
-    modal.hidden = false;
+    clearPayoutModal.hidden = false;
     document.body.classList.add('modal-open');
     return true;
   }
 
   document.addEventListener('submit', (event) => {
-    const form = event.target.closest && event.target.closest('[data-clear-payout-form]');
-    if (!form || form.dataset.confirmed === '1') return;
-    event.preventDefault();
-    if (!openClearPayoutConfirm(form)) {
-      form.dataset.confirmed = '1';
-      form.submit();
+    const credentialsForm = event.target.closest && event.target.closest('[data-account-credentials-form]');
+    if (credentialsForm && credentialsForm.dataset.confirmed !== '1') {
+      event.preventDefault();
+      if (!openCredentialsConfirm(credentialsForm)) {
+        credentialsForm.dataset.confirmed = '1';
+        credentialsForm.submit();
+      }
+      return;
+    }
+
+    const manualDueForm = event.target.closest && event.target.closest('[data-manual-replacement-due-form]');
+    if (manualDueForm && manualDueForm.dataset.confirmed !== '1') {
+      event.preventDefault();
+      if (!openManualDueConfirm(manualDueForm)) {
+        manualDueForm.dataset.confirmed = '1';
+        manualDueForm.submit();
+      }
+      return;
+    }
+
+    const clearPayoutForm = event.target.closest && event.target.closest('[data-clear-payout-form]');
+    if (clearPayoutForm && clearPayoutForm.dataset.confirmed !== '1') {
+      event.preventDefault();
+      if (!openClearPayoutConfirm(clearPayoutForm)) {
+        clearPayoutForm.dataset.confirmed = '1';
+        clearPayoutForm.submit();
+      }
     }
   });
 
   document.addEventListener('click', (event) => {
+    if (event.target.hasAttribute('data-close-account-credentials-confirm')) {
+      closeCredentialsConfirm();
+      return;
+    }
+    if (event.target.closest && event.target.closest('#account-credentials-confirm-submit') && pendingCredentialsForm) {
+      const form = pendingCredentialsForm;
+      form.dataset.confirmed = '1';
+      closeCredentialsConfirm();
+      form.submit();
+      return;
+    }
+
+    if (event.target.hasAttribute('data-close-manual-replacement-due-confirm')) {
+      closeManualDueConfirm();
+      return;
+    }
+    if (event.target.closest && event.target.closest('#manual-replacement-due-confirm-submit') && pendingManualDueForm) {
+      const form = pendingManualDueForm;
+      form.dataset.confirmed = '1';
+      closeManualDueConfirm();
+      form.submit();
+      return;
+    }
+
     if (event.target.hasAttribute('data-close-clear-payout-confirm')) {
       closeClearPayoutConfirm();
       return;
@@ -289,9 +460,11 @@
   });
 
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && modal && !modal.hidden) closeClearPayoutConfirm();
+    if (event.key !== 'Escape') return;
+    if (credentialsModal && !credentialsModal.hidden) closeCredentialsConfirm();
+    if (manualDueModal && !manualDueModal.hidden) closeManualDueConfirm();
+    if (clearPayoutModal && !clearPayoutModal.hidden) closeClearPayoutConfirm();
   });
 })();
 </script>
-{% endif %}
 {% endblock %}

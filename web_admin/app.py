@@ -405,6 +405,74 @@ def get_stock_manager_account(db, username: str | None) -> dict | None:
     return None
 
 
+def migrate_stock_manager_username_references(db, old_username: str, new_username: str) -> None:
+    """Move stock-manager ownership/history rows when the owner renames an account.
+
+    Stock-manager stats are keyed by username. Renaming the login account without
+    moving historical keys would make the manager look empty, so keep the old
+    stock, payout, and replacement history attached to the new username.
+    """
+    old_clean = str(old_username or "").strip()
+    new_clean = str(new_username or "").strip()
+    old_key = normalize_admin_username(old_clean)
+    new_key = normalize_admin_username(new_clean)
+    if not old_key or not new_key or old_key == new_key:
+        return
+    try:
+        db.stock_manager_stock_events.update_many(
+            {"username_key": old_key},
+            {"$set": {"username": new_clean, "username_key": new_key}},
+        )
+        db.stock_manager_payment_requests.update_many(
+            {"username_key": old_key},
+            {"$set": {"username": new_clean, "username_key": new_key}},
+        )
+        db.stock_manager_payouts.update_many(
+            {"username_key": old_key},
+            {"$set": {"username": new_clean, "username_key": new_key}},
+        )
+        db.stock_manager_replacement_obligations.update_many(
+            {"stock_added_by_username_key": old_key},
+            {"$set": {"stock_added_by_username": new_clean, "stock_added_by_username_key": new_key}},
+        )
+        db.stock_manager_replacement_obligations.update_many(
+            {"username_key": old_key},
+            {"$set": {"username": new_clean, "username_key": new_key}},
+        )
+        db.stock_manager_replacement_obligations.update_many(
+            {"fulfilled_by": old_clean},
+            {"$set": {"fulfilled_by": new_clean}},
+        )
+        db.stock_upload_rejections.update_many(
+            {"username_key": old_key},
+            {"$set": {"username": new_clean, "username_key": new_key}},
+        )
+        db.stock_item_ledger.update_many(
+            {"first_added_by_username": old_clean},
+            {"$set": {"first_added_by_username": new_clean}},
+        )
+        db.stock_item_ledger.update_many(
+            {"last_added_by_username": old_clean},
+            {"$set": {"last_added_by_username": new_clean}},
+        )
+        db.replacement_reports.update_many(
+            {"stock_added_by_username": old_clean},
+            {"$set": {"stock_added_by_username": new_clean}},
+        )
+        db.replacement_reports.update_many(
+            {"items.stock_added_by_username": old_clean},
+            {"$set": {"items.$[item].stock_added_by_username": new_clean}},
+            array_filters=[{"item.stock_added_by_username": old_clean}],
+        )
+        db.products.update_many(
+            {"stock_added_by.added_by_username": old_clean},
+            {"$set": {"stock_added_by.$[record].added_by_username": new_clean}},
+            array_filters=[{"record.added_by_username": old_clean}],
+        )
+    except Exception as exc:
+        current_app.logger.warning("Could not fully migrate stock-manager username %s -> %s: %s", old_clean, new_clean, exc)
+
+
 def get_stock_manager_assigned_product_names(db, username: str | None) -> list[str]:
     account = get_stock_manager_account(db, username)
     if not account:
@@ -1560,6 +1628,99 @@ def register_routes(app: Flask) -> None:
         set_secret_settings(app.db, settings)
         log_admin_action(app.db, "stock_manager_products_assigned", f"{account.get('username')}: {len(assigned)} product(s)")
         flash(f"Assigned {len(assigned)} product(s) to {account.get('username')}.", "success")
+        return redirect(url_for("admin_account_detail", account_id=account_id))
+
+
+    @app.post("/admins/<account_id>/credentials")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_admin_account_credentials(account_id: str):
+        settings = get_secret_settings(app.db)
+        accounts = get_admin_accounts(settings)
+        account = next((a for a in accounts if str(a.get("id") or "") == str(account_id or "")), None)
+        if not account:
+            flash("Admin account not found.", "error")
+            return redirect(url_for("admins_panel"))
+
+        old_username = str(account.get("username") or "").strip()
+        new_username = (request.form.get("admin_username") or "").strip()
+        new_password = (request.form.get("admin_password") or "").strip()
+        if not new_username:
+            flash("Username is required.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        owner_username, _, _ = get_admin_login_config(app.db)
+        new_key = new_username.lower()
+        if new_key == str(owner_username or "").strip().lower():
+            flash("That WebAdmin username is already used by the owner account.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        for other in accounts:
+            if str(other.get("id") or "") == str(account_id or ""):
+                continue
+            if new_key == str(other.get("username") or "").strip().lower():
+                flash("That WebAdmin username already exists.", "error")
+                return redirect(url_for("admin_account_detail", account_id=account_id))
+
+        changed_parts: list[str] = []
+        if new_username != old_username:
+            if account.get("role") == ADMIN_ROLE_STOCK_MANAGER:
+                migrate_stock_manager_username_references(app.db, old_username, new_username)
+            account["username"] = new_username
+            changed_parts.append("username")
+        if new_password:
+            account["password_hash"] = generate_password_hash(new_password)
+            changed_parts.append("password")
+        if not changed_parts:
+            flash("No account changes were made.", "info")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+
+        settings["admin_accounts"] = accounts
+        set_secret_settings(app.db, settings)
+        log_admin_action(app.db, "webadmin_account_credentials_updated", f"{old_username} -> {new_username}: {', '.join(changed_parts)}")
+        flash(f"Updated {', '.join(changed_parts)} for {new_username}.", "success")
+        return redirect(url_for("admin_account_detail", account_id=account_id))
+
+
+    @app.post("/admins/<account_id>/manual-replacement-due")
+    @login_required
+    @owner_required
+    @csrf_required
+    def add_owner_manual_replacement_due(account_id: str):
+        settings = get_secret_settings(app.db)
+        accounts = get_admin_accounts(settings)
+        account = next((a for a in accounts if str(a.get("id") or "") == str(account_id or "")), None)
+        if not account or account.get("role") != ADMIN_ROLE_STOCK_MANAGER:
+            flash("Stock manager account not found.", "error")
+            return redirect(url_for("admins_panel"))
+        product_name = (request.form.get("product_name") or "").strip()
+        try:
+            quantity = int(str(request.form.get("quantity") or "0").strip())
+        except ValueError:
+            quantity = 0
+        note = (request.form.get("note") or "").strip()
+        if quantity <= 0:
+            flash("Replacement quantity must be at least 1.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        if quantity > 500:
+            flash("You can add at most 500 manual replacements at once.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        product = app.db.products.find_one({"name": name_regex(product_name)}, {"name": 1}) if product_name else None
+        if not product:
+            flash("Select a valid product for the replacement due.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        created = create_owner_manual_replacement_obligations(
+            app.db,
+            username=str(account.get("username") or "").strip(),
+            product_name=str(product.get("name") or product_name).strip(),
+            quantity=quantity,
+            note=note,
+            added_by=current_admin_username() or "owner",
+        )
+        if created <= 0:
+            flash("Could not add manual replacement due.", "error")
+            return redirect(url_for("admin_account_detail", account_id=account_id))
+        log_admin_action(app.db, "manual_replacement_due_assigned", f"{account.get('username')}: {created} x {product.get('name') or product_name}")
+        flash(f"Added {created} manual replacement due item(s) for {account.get('username')}.", "success")
         return redirect(url_for("admin_account_detail", account_id=account_id))
 
 
@@ -6196,6 +6357,49 @@ def create_stock_manager_replacement_obligations(db, report: dict, approved_by: 
     return created
 
 
+def create_owner_manual_replacement_obligations(db, *, username: str, product_name: str, quantity: int, note: str = "", added_by: str = "owner") -> int:
+    clean_username = str(username or "").strip()
+    username_key = normalize_admin_username(clean_username)
+    clean_product = str(product_name or "").strip()
+    qty = max(0, int(quantity or 0))
+    if not username_key or not clean_product or qty <= 0:
+        return 0
+    now = utcnow()
+    due_id = "OWNER-DUE-" + secrets.token_hex(4).upper()
+    clean_note = str(note or "").strip()[:1000]
+    docs = []
+    for index in range(qty):
+        docs.append({
+            "obligation_key": f"{due_id}:{index}",
+            "manual_due_id": due_id,
+            "report_id": "",
+            "report_item_index": index,
+            "product_name": clean_product,
+            "submitted_item": "",
+            "delivered_item": "",
+            "item_hash": "",
+            "stock_added_by_username": clean_username,
+            "stock_added_by_username_key": username_key,
+            "stock_added_at": None,
+            "source": "owner_manual",
+            "owner_note": clean_note,
+            "approved_at": now,
+            "approved_by": added_by or "owner",
+            "created_at": now,
+            "fulfilled_at": None,
+            "fulfilled_by": "",
+            "fulfilled_product_name": "",
+        })
+    if not docs:
+        return 0
+    try:
+        result = db.stock_manager_replacement_obligations.insert_many(docs, ordered=False)
+        return len(result.inserted_ids)
+    except Exception as exc:
+        current_app.logger.warning("Could not add owner manual replacement due: %s", exc)
+        return 0
+
+
 def count_stock_manager_pending_replacements(db, username: str) -> int:
     username_key = normalize_admin_username(username)
     if not username_key:
@@ -6229,11 +6433,16 @@ def get_stock_manager_replacement_summary(db, username: str) -> dict[str, Any]:
     by_product: dict[str, dict[str, Any]] = {}
     for obligation in obligations:
         product_name = str(obligation.get("product_name") or "Unknown product")
-        row = by_product.setdefault(product_name, {"product_name": product_name, "count": 0, "report_ids": []})
+        row = by_product.setdefault(product_name, {"product_name": product_name, "count": 0, "report_ids": [], "manual_due_ids": [], "manual_count": 0})
         row["count"] += 1
         report_id = str(obligation.get("report_id") or "")
+        manual_due_id = str(obligation.get("manual_due_id") or "")
         if report_id and report_id not in row["report_ids"]:
             row["report_ids"].append(report_id)
+        if obligation.get("source") == "owner_manual":
+            row["manual_count"] += 1
+            if manual_due_id and manual_due_id not in row["manual_due_ids"]:
+                row["manual_due_ids"].append(manual_due_id)
     pending_by_product = sorted(by_product.values(), key=lambda row: row["product_name"].lower())
     return {
         "pending_count": len(obligations),
