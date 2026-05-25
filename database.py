@@ -821,16 +821,86 @@ async def get_order(order_id: str) -> Optional[dict]:
     return await get_db().orders.find_one({"order_id": order_id})
 
 
-async def update_order_status(order_id: str, status: str, items: list[str] = None):
+async def claim_order_delivery(order_id: str, *, lock_seconds: int = 300) -> Optional[dict]:
+    """Atomically claim an order before removing stock.
+
+    Payment confirmation can be reached by more than one worker/button at the
+    same time (background scanner, Check Payment, startup recovery). Without a
+    per-order delivery lock, two workers can both try to finalize the same paid
+    order; one may remove stock while the other marks the same order pending.
+    This claim makes order delivery idempotent and prevents double stock pops.
+    """
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return None
     now = datetime.now(timezone.utc)
-    update = {"$set": {"status": status}}
+    try:
+        seconds = max(30, int(lock_seconds or 300))
+    except Exception:
+        seconds = 300
+    cutoff = now - timedelta(seconds=seconds)
+    token = uuid.uuid4().hex
+    order = await get_db().orders.find_one_and_update(
+        {
+            "order_id": clean_order_id,
+            "status": {"$in": ["pending", "pending_stock"]},
+            "$or": [
+                {"delivery_lock_token": {"$exists": False}},
+                {"delivery_lock_token": None},
+                {"delivery_lock_at": {"$exists": False}},
+                {"delivery_lock_at": None},
+                {"delivery_lock_at": {"$lte": cutoff}},
+            ],
+        },
+        {"$set": {"delivery_lock_token": token, "delivery_lock_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return order
+
+
+async def clear_order_delivery_lock(order_id: str, delivery_token: str | None = None) -> bool:
+    query = {"order_id": str(order_id or "").strip().upper()}
+    if delivery_token:
+        query["delivery_lock_token"] = delivery_token
+    res = await get_db().orders.update_one(
+        query,
+        {"$unset": {"delivery_lock_token": "", "delivery_lock_at": ""}},
+    )
+    return bool(res.modified_count)
+
+
+async def update_order_status(
+    order_id: str,
+    status: str,
+    items: list[str] = None,
+    *,
+    delivery_token: str | None = None,
+) -> bool:
+    now = datetime.now(timezone.utc)
+    clean_order_id = str(order_id or "").strip().upper()
+    query: dict[str, Any] = {"order_id": clean_order_id}
+    if delivery_token:
+        query["delivery_lock_token"] = delivery_token
+    if status == "pending_stock":
+        # Never let a late duplicate worker overwrite an already-delivered order
+        # or an order that another worker is actively finalizing.
+        query["status"] = {"$nin": ["delivered", "expired", "cancelled", "rejected"]}
+        if not delivery_token:
+            query["$or"] = [
+                {"delivery_lock_token": {"$exists": False}},
+                {"delivery_lock_token": None},
+            ]
+    update: dict[str, Any] = {"$set": {"status": status}}
     if items is not None:
         update["$set"]["items"] = items
     if status == "delivered":
         update["$set"]["delivered_at"] = now
     if status == "pending_stock":
         update["$set"].setdefault("pending_stock_at", now)
-    await get_db().orders.update_one({"order_id": order_id}, update)
+    if status in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
+        update["$unset"] = {"delivery_lock_token": "", "delivery_lock_at": ""}
+    res = await get_db().orders.update_one(query, update)
+    return bool(res.matched_count)
 
 
 async def record_order_delivery_message(
@@ -875,8 +945,8 @@ async def record_order_delivery_message(
     )
 
 
-async def mark_order_pending_stock(order_id: str):
-    await update_order_status(order_id, "pending_stock")
+async def mark_order_pending_stock(order_id: str, *, delivery_token: str | None = None) -> bool:
+    return await update_order_status(order_id, "pending_stock", delivery_token=delivery_token)
 
 
 async def has_pending_stock_ahead(product_name: str, created_at, order_id: str | None = None) -> bool:

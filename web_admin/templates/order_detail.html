@@ -92,6 +92,12 @@
   <p>{{ order.admin_stock_note }}</p>
 </section>
 {% endif %}
+{% if (order.admin_created_order or order.payment_method == "admin_created_order") and order.admin_created_order_note %}
+<section class="panel">
+  <h2>Admin-created order note</h2>
+  <p>{{ order.admin_created_order_note }}</p>
+</section>
+{% endif %}
 <section class="panel">
   <h2>Delivered items</h2>
   {% set delivered_items = order.get("items", []) %}

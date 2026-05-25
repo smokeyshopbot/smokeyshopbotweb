@@ -1240,17 +1240,61 @@ def _support_markup(lang: str = "en") -> InlineKeyboardMarkup | None:
             buttons.append([InlineKeyboardButton(label, url=url)])
     return InlineKeyboardMarkup(buttons) if buttons else None
 
+def _is_admin_created_order(order: dict | None) -> bool:
+    """Return True for admin-created orders, including older rows saved before the flag existed."""
+    if not order:
+        return False
+    if bool(order.get("admin_created_order")):
+        return True
+    method = str(order.get("payment_method") or "").strip().lower()
+    return method in {"admin_created_order", "admin_created"} or "admin_created" in method
+
+
 async def _send_pending_stock_notice(bot, user_id: int, order: dict, *, queued: bool = False):
     lang = await _lang_for_user(user_id)
     product_name = order.get("product_name", "Product")
     order_id = order.get("order_id", "N/A")
-    queue_note = tr(lang, "pending_stock_queued") if queued else tr(lang, "pending_stock_waiting")
+    quantity = int(order.get("quantity", 0) or 0)
+    if _is_admin_created_order(order):
+        queue_note = tr(lang, "admin_created_order_stock_queued") if queued else tr(lang, "admin_created_order_stock_waiting")
+        message = tr(
+            lang,
+            "admin_created_order_pending_stock_notice",
+            product=product_name,
+            order_id=order_id,
+            quantity=quantity,
+            queue_note=queue_note,
+        )
+    else:
+        queue_note = tr(lang, "pending_stock_queued") if queued else tr(lang, "pending_stock_waiting")
+        message = tr(lang, "pending_stock_notice", product=product_name, order_id=order_id, queue_note=queue_note)
     await bot.send_message(
         user_id,
-        tr(lang, "pending_stock_notice", product=product_name, order_id=order_id, queue_note=queue_note),
+        message,
         parse_mode="Markdown",
         reply_markup=_support_markup(lang),
     )
+
+
+async def _send_admin_created_order_created_notice(bot, user_id: int, order: dict) -> None:
+    if not _is_admin_created_order(order):
+        return
+    lang = await _lang_for_user(user_id)
+    try:
+        await bot.send_message(
+            user_id,
+            tr(
+                lang,
+                "admin_created_order_created_notice",
+                product=order.get("product_name", "Product"),
+                order_id=order.get("order_id", "N/A"),
+                quantity=int(order.get("quantity", 0) or 0),
+            ),
+            parse_mode="Markdown",
+            reply_markup=_support_markup(lang),
+        )
+    except Exception:
+        logger.exception("Could not send admin-created order notice for order=%s", order.get("order_id"))
 
 def _delivery_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
@@ -1290,9 +1334,12 @@ def _delivery_caption(order: dict, *, from_pending: bool = False, lang: str = "e
             f"📦 {tr(lang, 'product')}: {product_name}\n"
             f"🔢 {tr(lang, 'quantity')}: {quantity}"
         )
-    title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
     if order.get("resent_by_admin"):
         title = tr(lang, "order_resent_admin")
+    elif _is_admin_created_order(order):
+        title = tr(lang, "admin_created_order_delivery_title")
+    else:
+        title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
     return (
         f"{title}\n\n"
         f"🧾 {tr(lang, 'order_id')}: {order_id}\n"
@@ -1327,9 +1374,12 @@ async def _send_order_items(bot, user_id: int, order: dict, items: list[str], *,
     """Deliver purchased stock as one TXT file only."""
     lang = await _lang_for_user(user_id)
     if not items:
-        title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
         if order.get("resent_by_admin"):
             title = tr(lang, "order_resent_admin")
+        elif _is_admin_created_order(order):
+            title = tr(lang, "admin_created_order_delivery_title")
+        else:
+            title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
         await bot.send_message(
             user_id,
             f"{title}\n\n📦 {tr(lang, 'product')}: {order.get('product_name', 'Product')}\n🔢 {tr(lang, 'quantity')}: {int(order.get('quantity', 0) or 0)}\n\n{tr(lang, 'no_items_attached')}",
@@ -1371,10 +1421,21 @@ async def notify_low_stock_if_needed(bot, product_name: str):
 
 
 async def complete_order(bot, user_id: int, ref_id: str):
-    order = await db.get_order(ref_id)
-    if not order or order.get("status") == "delivered":
+    # Claim the order before touching stock. The same paid order can be reached
+    # by the background auto-checker, Check Payment button, startup recovery, or
+    # admin retry at nearly the same time. This lock prevents a duplicate worker
+    # from popping stock and then overwriting the order back to pending_stock.
+    order = await db.claim_order_delivery(ref_id)
+    if not order:
+        latest = await db.get_order(ref_id)
+        if not latest:
+            return
+        if latest.get("status") in {"delivered", "expired", "cancelled", "rejected"}:
+            return
+        logger.info("Order delivery already in progress or not deliverable ref=%s status=%s", ref_id, latest.get("status"))
         return
 
+    delivery_token = order.get("delivery_lock_token")
     product_name = order["product_name"]
     quantity = int(order.get("quantity", 1) or 1)
 
@@ -1382,7 +1443,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
     # a newer payment consume the next stock. Put this order in the same queue.
     if order.get("status") != "pending_stock":
         if await db.has_pending_stock_ahead(product_name, order.get("created_at"), order.get("order_id")):
-            await db.mark_order_pending_stock(ref_id)
+            await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
             order["status"] = "pending_stock"
             await _send_pending_stock_notice(bot, user_id, order, queued=True)
             await send_admin_message(
@@ -1396,7 +1457,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
         items = await db.pop_stock(product_name, quantity)
     except Exception as exc:
         logger.exception("Could not pop stock for paid order %s: %s", ref_id, exc)
-        await db.mark_order_pending_stock(ref_id)
+        await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
         await _send_pending_stock_notice(bot, user_id, order)
         await send_admin_message(
@@ -1407,7 +1468,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
         return
 
     if not items:
-        await db.mark_order_pending_stock(ref_id)
+        await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
         await _send_pending_stock_notice(bot, user_id, order)
         await send_admin_message(
@@ -1418,11 +1479,28 @@ async def complete_order(bot, user_id: int, ref_id: str):
         )
         return
 
-    await db.update_order_status(ref_id, "delivered", items)
-    await _send_order_items(bot, user_id, order, items, from_pending=(order.get("status") == "pending_stock"))
+    was_pending_stock = order.get("status") == "pending_stock"
+    updated = await db.update_order_status(ref_id, "delivered", items, delivery_token=delivery_token)
+    if not updated:
+        # This should be very rare because this worker holds the lock. Do not
+        # send stock to the user if we could not attach those items to the order.
+        logger.error("Could not finalize delivered order after stock pop ref=%s items=%s", ref_id, len(items))
+        try:
+            await send_admin_message(
+                bot,
+                f"🚨 Stock delivery finalization failed after stock was removed.\n"
+                f"Product: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\n"
+                f"Please inspect this order before taking action."
+            )
+        except Exception:
+            pass
+        return
+
+    if _is_admin_created_order(order) and not was_pending_stock:
+        await _send_admin_created_order_created_notice(bot, user_id, order)
+    await _send_order_items(bot, user_id, order, items, from_pending=was_pending_stock)
     await _delete_payment_msg_by_bot(bot, ref_id)
     await notify_low_stock_if_needed(bot, product_name)
-
 
 async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     """Finalize wallet-paid orders that accidentally stayed plain pending.
@@ -1487,11 +1565,29 @@ async def process_pending_stock_orders(bot, product_name: str) -> dict:
         if stock_now < qty:
             break
 
+        claimed = await db.claim_order_delivery(order.get("order_id"))
+        if not claimed:
+            continue
+        delivery_token = claimed.get("delivery_lock_token")
+
         items = await db.pop_stock(product_name, qty)
         if not items:
+            await db.mark_order_pending_stock(order.get("order_id"), delivery_token=delivery_token)
             break
 
-        await db.update_order_status(order["order_id"], "delivered", items)
+        updated = await db.update_order_status(order["order_id"], "delivered", items, delivery_token=delivery_token)
+        if not updated:
+            logger.error("Could not finalize pending-stock order after stock pop order=%s", order.get("order_id"))
+            try:
+                await send_admin_message(
+                    bot,
+                    f"🚨 Pending-stock finalization failed after stock was removed.\n"
+                    f"Product: {product_name}\nQuantity: {qty}\nRef: {order.get('order_id')}"
+                )
+            except Exception:
+                pass
+            continue
+
         delivered_orders += 1
         delivered_items += len(items)
         try:
@@ -1510,9 +1606,11 @@ async def process_pending_stock_orders(bot, product_name: str) -> dict:
         except Exception:
             pass
 
-    await notify_low_stock_if_needed(bot, product_name)
+    try:
+        await notify_low_stock_if_needed(bot, product_name)
+    except Exception:
+        pass
     return {"orders_delivered": delivered_orders, "items_delivered": delivered_items}
-
 
 async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already: bool = False):
     lang = pending.get("language") or await _lang_for_user(user_id)

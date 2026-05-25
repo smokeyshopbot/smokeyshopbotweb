@@ -1,6 +1,19 @@
 {% extends "base.html" %}
 {% block title %}User {{ telegram_user_label(user.user_id, user.username) }}{% endblock %}
 {% block content %}
+{% macro section_pagination(section_id, page_param, page, total_pages, total, other_args) -%}
+  {% if total_pages and total_pages > 1 %}
+    <div class="pagination">
+      {% if page > 1 %}
+        <a href="{{ url_for('user_detail', user_id=user.user_id, **dict(other_args, **{page_param: page - 1})) }}#{{ section_id }}">← Previous</a>
+      {% endif %}
+      <span>Page {{ page }} of {{ total_pages }}{% if total %} · {{ total }} total{% endif %}</span>
+      {% if page < total_pages %}
+        <a href="{{ url_for('user_detail', user_id=user.user_id, **dict(other_args, **{page_param: page + 1})) }}#{{ section_id }}">Next →</a>
+      {% endif %}
+    </div>
+  {% endif %}
+{%- endmacro %}
 <div class="page-header"><div><h1>User {{ telegram_user_label(user.user_id, user.username) }}</h1><p><a href="{{ url_for('users') }}">← Back to users</a></p><p><span class="{{ user_status_badge_class(user.blocked) }}">{{ 'Blocked' if user.blocked else 'Active' }}</span></p></div></div>
 <section class="grid cards">
   {% if 'usdt' in active_payment_currencies %}
@@ -140,6 +153,33 @@
       <p class="muted">Add a product first before sending a replacement to a user.</p>
     {% endif %}
   </section>
+
+  <section class="panel user-create-order-panel">
+    <h2>Create order for this user</h2>
+    <p class="muted">Creates a normal order for this user. If enough stock is available it is delivered now; otherwise it goes to Pending Stock Orders and will auto-deliver when stock is added.</p>
+    {% if products_for_send %}
+      <form method="post" action="{{ url_for('create_order_for_user', user_id=user.user_id) }}" class="stacked-form user-order-inline-form" id="user-order-create-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Product
+          <select name="product_name" required>
+            <option value="">Select product</option>
+            {% for product in products_for_send %}
+              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.available_stock or 0 }} available</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Quantity
+          <input name="order_quantity" type="number" min="1" max="1000" step="1" value="1" required>
+        </label>
+        <label>Admin note <small class="muted">optional</small>
+          <input name="order_note" maxlength="1000" placeholder="Optional note for this order">
+        </label>
+        <button class="primary" type="submit">Create order</button>
+      </form>
+    {% else %}
+      <p class="muted">Add a product first before creating an order for a user.</p>
+    {% endif %}
+  </section>
 </div>
 
 <section class="panel">
@@ -160,21 +200,24 @@
   </form>
 </section>
 
-<section class="panel">
-  <h2>Recent orders</h2>
+<section class="panel" id="user-orders">
+  <h2>Orders</h2>
   {% if orders %}
+  <p class="muted">Showing {{ ((orders_page - 1) * user_detail_page_size) + 1 }}–{{ ((orders_page - 1) * user_detail_page_size) + (orders|length) }} of {{ orders_total }} order(s).</p>
   <div class="table-wrap"><table class="orders-table"><thead><tr><th>Order</th><th>Date</th><th>Product</th><th class="center-cell status-col">Status</th><th>Amount</th></tr></thead><tbody>
   {% for order in orders %}
     {% set display_status = 'revoked' if order.get('delivery_revoked') else order.status %}
     <tr><td><a href="{{ url_for('order_detail', order_id=order.order_id) }}">{{ order.order_id }}</a></td><td>{{ fmt_dt(order.created_at) }}</td><td>{{ order.product_name }} × {{ order.quantity }}</td><td class="center-cell status-cell"><span class="{{ status_badge_class(display_status) }}">{{ status_label(display_status) }}</span></td><td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td></tr>
   {% endfor %}
   </tbody></table></div>
+  {{ section_pagination('user-orders', 'orders_page', orders_page, orders_total_pages, orders_total, {'replacements_page': replacements_page, 'wallet_page': wallet_page}) }}
   {% else %}<p class="muted">No orders for this user.</p>{% endif %}
 </section>
 
-<section class="panel">
-  <h2>Recent replacements</h2>
+<section class="panel" id="user-replacements">
+  <h2>Replacements</h2>
   {% if recent_replacements %}
+  <p class="muted">Showing {{ ((replacements_page - 1) * user_detail_page_size) + 1 }}–{{ ((replacements_page - 1) * user_detail_page_size) + (recent_replacements|length) }} of {{ replacements_total }} replacement(s).</p>
   <div class="table-wrap"><table class="orders-table"><thead><tr><th>Replacement</th><th>Date</th><th>Product</th><th class="center-cell status-col">Status</th><th>Report</th></tr></thead><tbody>
   {% for replacement in recent_replacements %}
     <tr>
@@ -187,12 +230,14 @@
     </tr>
   {% endfor %}
   </tbody></table></div>
+  {{ section_pagination('user-replacements', 'replacements_page', replacements_page, replacements_total_pages, replacements_total, {'orders_page': orders_page, 'wallet_page': wallet_page}) }}
   {% else %}<p class="muted">No replacements for this user.</p>{% endif %}
 </section>
 
 <section class="panel" id="wallet-logs">
   <h2>Wallet top-up logs</h2>
   {% if logs %}
+  <p class="muted">Showing {{ ((wallet_page - 1) * user_detail_page_size) + 1 }}–{{ ((wallet_page - 1) * user_detail_page_size) + (logs|length) }} of {{ wallet_logs_total }} wallet log(s).</p>
   <div class="table-wrap"><table class="payments-log-table"><thead><tr><th>Ref</th><th>Date</th><th>Method</th><th>Amount</th><th class="center-cell status-col">Status</th></tr></thead><tbody>
   {% for log in logs %}
     <tr id="wallet-log-{{ log.ref_id }}">
@@ -204,6 +249,7 @@
     </tr>
   {% endfor %}
   </tbody></table></div>
+  {{ section_pagination('wallet-logs', 'wallet_page', wallet_page, wallet_logs_total_pages, wallet_logs_total, {'orders_page': orders_page, 'replacements_page': replacements_page}) }}
   {% else %}<p class="muted">No wallet logs for this user.</p>{% endif %}
 </section>
 
@@ -216,6 +262,18 @@
     <div class="action-confirm-buttons">
       <button type="button" class="secondary-button" data-close-wallet-adjust-confirm>Cancel</button>
       <button type="button" class="action-button primary" id="wallet-adjust-confirm-submit">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="action-confirm-shell" id="user-order-confirm-modal" hidden>
+  <div class="action-confirm-backdrop" data-close-user-order-confirm></div>
+  <div class="action-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="user-order-confirm-title">
+    <h3 id="user-order-confirm-title">Create order?</h3>
+    <p id="user-order-confirm-text" class="muted">Please confirm this order.</p>
+    <div class="action-confirm-buttons">
+      <button type="button" class="secondary-button" data-close-user-order-confirm>Cancel</button>
+      <button type="button" class="action-button primary" id="user-order-confirm-submit">Create order</button>
     </div>
   </div>
 </div>
@@ -328,6 +386,74 @@
 
   modal.addEventListener('click', function (event) {
     if (event.target.hasAttribute('data-close-wallet-adjust-confirm')) {
+      closeModal();
+    }
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !modal.hidden) closeModal();
+  });
+})();
+
+(function () {
+  const form = document.getElementById('user-order-create-form');
+  const modal = document.getElementById('user-order-confirm-modal');
+  const confirmText = document.getElementById('user-order-confirm-text');
+  const submitButton = document.getElementById('user-order-confirm-submit');
+  const userLabel = {{ telegram_user_label(user.user_id, user.username)|tojson }};
+  if (!form || !modal || !confirmText || !submitButton) return;
+
+  function closeModal() {
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  function selectedProductOption() {
+    const select = form.querySelector('[name="product_name"]');
+    if (!select) return null;
+    return select.options[select.selectedIndex] || null;
+  }
+
+  function selectedProductName() {
+    const option = selectedProductOption();
+    return option ? option.text.trim() : 'selected product';
+  }
+
+  function selectedAvailableStock() {
+    const option = selectedProductOption();
+    const raw = option ? option.getAttribute('data-available-stock') : '';
+    const parsed = parseInt(raw || '0', 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  form.addEventListener('submit', function (event) {
+    if (form.dataset.confirmed === '1') return;
+    event.preventDefault();
+    if (form.reportValidity && !form.reportValidity()) return;
+
+    const quantityInput = form.querySelector('[name="order_quantity"]');
+    const quantity = parseInt(quantityInput ? quantityInput.value : '0', 10) || 0;
+    if (quantity < 1) {
+      if (quantityInput) quantityInput.focus();
+      return;
+    }
+    const available = selectedAvailableStock();
+    const outcome = available >= quantity
+      ? 'It should deliver immediately if stock has not changed.'
+      : 'It will go to Pending Stock Orders and auto-deliver when enough stock is added.';
+    confirmText.textContent = `Create order for ${quantity} item(s) of ${selectedProductName()} for user ${userLabel}? ${outcome}`;
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+  });
+
+  submitButton.addEventListener('click', function () {
+    form.dataset.confirmed = '1';
+    closeModal();
+    form.submit();
+  });
+
+  modal.addEventListener('click', function (event) {
+    if (event.target.hasAttribute('data-close-user-order-confirm')) {
       closeModal();
     }
   });

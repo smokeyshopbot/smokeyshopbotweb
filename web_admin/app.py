@@ -2801,9 +2801,44 @@ def register_routes(app: Flask) -> None:
             flash("User not found.", "error")
             return redirect(url_for("users"))
         stats = get_user_order_stats(app.db, user_id)
-        orders = recent_created_rows(app.db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}), limit=10)
-        recent_replacements = recent_created_rows(app.db.orders.find({"user_id": user_id, "is_replacement": True}), limit=10)
-        logs = recent_created_rows(app.db.pending_payments.find({"user_id": user_id, "pay_type": "wallet"}), limit=10)
+
+        per_page = PAGE_SIZE
+        orders_page = int_arg("orders_page", 1, minimum=1)
+        replacements_page = int_arg("replacements_page", 1, minimum=1)
+        wallet_page = int_arg("wallet_page", 1, minimum=1)
+
+        orders_query = {"user_id": user_id, "is_replacement": {"$ne": True}}
+        replacements_query = {"user_id": user_id, "is_replacement": True}
+        wallet_logs_query = {"user_id": user_id, "pay_type": "wallet"}
+
+        orders_total = app.db.orders.count_documents(orders_query)
+        replacements_total = app.db.orders.count_documents(replacements_query)
+        wallet_logs_total = app.db.pending_payments.count_documents(wallet_logs_query)
+
+        orders_total_pages = max(1, math.ceil(orders_total / per_page)) if orders_total else 1
+        replacements_total_pages = max(1, math.ceil(replacements_total / per_page)) if replacements_total else 1
+        wallet_logs_total_pages = max(1, math.ceil(wallet_logs_total / per_page)) if wallet_logs_total else 1
+
+        orders_page = min(orders_page, orders_total_pages)
+        replacements_page = min(replacements_page, replacements_total_pages)
+        wallet_page = min(wallet_page, wallet_logs_total_pages)
+
+        orders = recent_created_rows(
+            app.db.orders.find(orders_query),
+            skip=(orders_page - 1) * per_page,
+            limit=per_page,
+        )
+        recent_replacements = recent_created_rows(
+            app.db.orders.find(replacements_query),
+            skip=(replacements_page - 1) * per_page,
+            limit=per_page,
+        )
+        logs = recent_created_rows(
+            app.db.pending_payments.find(wallet_logs_query),
+            skip=(wallet_page - 1) * per_page,
+            limit=per_page,
+        )
+
         user_language = lang_from_user(user)
         products_for_send = get_products_with_availability(app.db, include_disabled=True)
         send_stock_duplicate_warning = session.pop("send_stock_duplicate_warning", None)
@@ -2812,8 +2847,18 @@ def register_routes(app: Flask) -> None:
             user=user,
             stats=stats,
             orders=orders,
+            orders_page=orders_page,
+            orders_total_pages=orders_total_pages,
+            orders_total=orders_total,
             recent_replacements=recent_replacements,
+            replacements_page=replacements_page,
+            replacements_total_pages=replacements_total_pages,
+            replacements_total=replacements_total,
             logs=logs,
+            wallet_page=wallet_page,
+            wallet_logs_total_pages=wallet_logs_total_pages,
+            wallet_logs_total=wallet_logs_total,
+            user_detail_page_size=per_page,
             products_for_send=products_for_send,
             user_language=user_language,
             language_settings=get_language_settings(app.db),
@@ -2946,6 +2991,59 @@ def register_routes(app: Flask) -> None:
             "admin_stock_delivery": True,
             "admin_stock_source": "inventory" if str(source or "").strip().lower() == "inventory" else "manual",
             "admin_stock_note": clean_note,
+            "admin_username": current_admin_username(),
+            "admin_role": current_admin_role(),
+        }
+        for attempt in range(25):
+            order_id_len = 8 if attempt < 20 else 12
+            order_id = uuid.uuid4().hex[:order_id_len].upper()
+            if app.db.orders.find_one({"order_id": order_id}, {"_id": 1}):
+                continue
+            order_doc = {**order_base, "order_id": order_id}
+            try:
+                app.db.orders.insert_one(order_doc)
+                return order_doc, None
+            except DuplicateKeyError:
+                continue
+            except Exception as exc:
+                return None, str(exc)
+        return None, "Could not generate a unique order ID. Please try again."
+
+    def create_admin_created_order(user: dict, product: dict, quantity: int, admin_note: str = "") -> tuple[dict | None, str | None]:
+        """Create a normal user order from WebAdmin.
+
+        The order is treated as already approved by admin. After creation the
+        normal delivery flow decides whether it can be delivered immediately or
+        must wait in the paid pending-stock queue. This keeps older paid
+        pending-stock orders ahead of newly-created admin orders.
+        """
+        now = utcnow()
+        user_id_value = int(user.get("user_id", 0) or 0)
+        username = str(user.get("username") or "").strip().lstrip("@")
+        product_name = str(product.get("name") or "").strip()
+        try:
+            quantity_value = max(1, int(quantity or 1))
+        except Exception:
+            quantity_value = 1
+        clean_note = str(admin_note or "").strip()[:1000]
+        amount_usdt = round(max(0.0, safe_float(product.get("price_usdt"), 0.0)) * quantity_value, 2)
+        amount_inr = round(max(0.0, safe_float(product.get("price_inr"), 0.0)) * quantity_value, 2)
+        order_base = {
+            "user_id": user_id_value,
+            "username": username,
+            "product_name": product_name,
+            "quantity": quantity_value,
+            "items": [],
+            "payment_method": "admin_created_order",
+            "amount_inr": amount_inr,
+            "amount_usdt": amount_usdt,
+            "status": "pending",
+            "created_at": now,
+            "paid_at": now,
+            "payment_verified_at": now,
+            "admin_created_order": True,
+            "admin_created_order_at": now,
+            "admin_created_order_note": clean_note,
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
         }
@@ -3193,6 +3291,65 @@ def register_routes(app: Flask) -> None:
             # Keep this for compatibility with any old template/session state.
             "sample": duplicates,
         }
+
+    @app.post("/users/<int:user_id>/create-order")
+    @login_required
+    @csrf_required
+    def create_order_for_user(user_id: int):
+        user = app.db.users.find_one({"user_id": user_id})
+        if not user:
+            flash("User not found. Ask them to press /start first.", "error")
+            return redirect(url_for("users"))
+        if user.get("blocked"):
+            flash("This user is blocked. Unblock them before creating an order.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        product_name = (request.form.get("product_name", "") or "").strip()
+        admin_note = str(request.form.get("order_note", "") or "").strip()[:1000]
+        try:
+            quantity = int(str(request.form.get("order_quantity", "") or "").strip())
+        except (TypeError, ValueError):
+            quantity = 0
+        if not product_name:
+            flash("Select a product before creating an order.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+        if quantity < 1:
+            flash("Enter an order quantity of at least 1.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+        if quantity > 1000:
+            flash("Too many items in one order. Create 1000 items or fewer at a time.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        product = app.db.products.find_one({"name": name_regex(product_name)})
+        if not product:
+            flash("Selected product was not found.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        # First clear any older paid pending-stock orders if stock already exists.
+        # New admin-created orders must never jump ahead of the existing queue.
+        process_pending_stock_orders(app.db, product["name"])
+
+        order, err = create_admin_created_order(user, product, quantity, admin_note=admin_note)
+        user_label = telegram_user_display(app.db, user_id, user.get("username"))
+        if not order:
+            flash(f"Could not create order for {user_label}: {err or 'unknown error'}", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        complete_order(app.db, user_id, order["order_id"])
+        updated_order = app.db.orders.find_one({"order_id": order["order_id"]}) or order
+        status = str(updated_order.get("status") or "").lower()
+        log_admin_action(
+            app.db,
+            "admin_order_created",
+            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={quantity} status={status}",
+        )
+        if status == "delivered":
+            flash(f"Created and delivered order {order['order_id']} for {user_label}.", "success")
+        elif status == "pending_stock":
+            flash(f"Created order {order['order_id']} for {user_label} and added it to Pending Stock Orders.", "warning")
+        else:
+            flash(f"Created order {order['order_id']} for {user_label}. Current status: {status_label(status)}.", "success")
+        return redirect(url_for("user_detail", user_id=user_id))
 
     @app.post("/users/<int:user_id>/send-stock")
     @login_required
@@ -6927,7 +7084,8 @@ def buyer_ranking_match() -> dict:
         "status": {"$in": ["delivered", "pending_stock"]},
         "is_replacement": {"$ne": True},
         "admin_stock_delivery": {"$ne": True},
-        "payment_method": {"$nin": ["admin_stock", "replacement"]},
+        "admin_created_order": {"$ne": True},
+        "payment_method": {"$nin": ["admin_stock", "admin_created_order", "replacement"]},
         "$or": [{"amount_inr": {"$gt": 0}}, {"amount_usdt": {"$gt": 0}}],
     }
 
@@ -6990,11 +7148,12 @@ def paid_usdt_expr() -> dict:
     method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
     return {"$cond": [
         {"$or": [
-            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"]]},
+            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock", "admin_created_order"]]},
             {"$regexMatch": {"input": method, "regex": "usdt"}},
             {"$regexMatch": {"input": method, "regex": "binance"}},
             {"$regexMatch": {"input": method, "regex": "bep20"}},
             {"$regexMatch": {"input": method, "regex": "admin_stock"}},
+            {"$regexMatch": {"input": method, "regex": "admin_created"}},
         ]},
         {"$ifNull": ["$amount_usdt", 0]},
         0,
@@ -7101,32 +7260,86 @@ def csv_response(filename: str, fields: list[str], rows) -> Response:
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
+
+def claim_order_delivery(db, order_id: str, *, lock_seconds: int = 300) -> dict | None:
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return None
+    now = utcnow()
+    try:
+        seconds = max(30, int(lock_seconds or 300))
+    except Exception:
+        seconds = 300
+    cutoff = now - timedelta(seconds=seconds)
+    token = uuid.uuid4().hex
+    return db.orders.find_one_and_update(
+        {
+            "order_id": clean_order_id,
+            "status": {"$in": ["pending", "pending_stock"]},
+            "$or": [
+                {"delivery_lock_token": {"$exists": False}},
+                {"delivery_lock_token": None},
+                {"delivery_lock_at": {"$exists": False}},
+                {"delivery_lock_at": None},
+                {"delivery_lock_at": {"$lte": cutoff}},
+            ],
+        },
+        {"$set": {"delivery_lock_token": token, "delivery_lock_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def clear_order_delivery_lock(db, order_id: str, delivery_token: str | None = None) -> bool:
+    query: dict[str, Any] = {"order_id": str(order_id or "").strip().upper()}
+    if delivery_token:
+        query["delivery_lock_token"] = delivery_token
+    res = db.orders.update_one(query, {"$unset": {"delivery_lock_token": "", "delivery_lock_at": ""}})
+    return bool(res.modified_count)
+
+
 # ───────────────────── Telegram mirrored actions ─────────────────────
 
 
 def complete_order(db, user_id: int, ref_id: str) -> None:
-    order = db.orders.find_one({"order_id": ref_id})
-    if not order or order.get("status") == "delivered":
+    order = claim_order_delivery(db, ref_id)
+    if not order:
+        latest = db.orders.find_one({"order_id": str(ref_id or "").strip().upper()}, {"status": 1})
+        if not latest or latest.get("status") in {"delivered", "expired", "cancelled", "rejected"}:
+            return
+        try:
+            current_app.logger.info("Order delivery already in progress or not deliverable ref=%s status=%s", ref_id, latest.get("status"))
+        except Exception:
+            pass
         return
+
+    delivery_token = order.get("delivery_lock_token")
     product_name = order.get("product_name", "")
     quantity = int(order.get("quantity", 1) or 1)
     if order.get("status") != "pending_stock" and has_pending_stock_ahead(db, product_name, order.get("created_at"), order.get("order_id")):
-        mark_order_pending_stock(db, ref_id)
+        mark_order_pending_stock(db, ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
         send_pending_stock_notice(user_id, order, queued=True)
         send_admin_message(f"⏳ Paid order queued behind older pending stock orders.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}")
         return
     items = pop_stock(db, product_name, quantity)
     if not items:
-        mark_order_pending_stock(db, ref_id)
+        mark_order_pending_stock(db, ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
         send_pending_stock_notice(user_id, order)
         send_admin_message(
             f"⚠️ Paid order is waiting for stock.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\n\nAdd stock from the web panel or with /addstock {product_name}."
         )
         return
-    update_order_status(db, ref_id, "delivered", items)
-    send_order_items(user_id, order, items, from_pending=(order.get("status") == "pending_stock"))
+    was_pending_stock = order.get("status") == "pending_stock"
+    updated = update_order_status(db, ref_id, "delivered", items, delivery_token=delivery_token)
+    if not updated:
+        send_admin_message(
+            f"🚨 Stock delivery finalization failed after stock was removed.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\nPlease inspect this order before taking action."
+        )
+        return
+    if is_admin_created_order(order) and not was_pending_stock:
+        send_admin_created_order_created_notice(user_id, order)
+    send_order_items(user_id, order, items, from_pending=was_pending_stock)
     delete_payment_message(db, ref_id)
     notify_low_stock_if_needed(db, product_name)
 
@@ -7139,10 +7352,20 @@ def process_pending_stock_orders(db, product_name: str) -> dict[str, int]:
         qty = int(order.get("quantity", 1) or 1)
         if get_stock_count(db, product_name) < qty:
             break
+        claimed = claim_order_delivery(db, order.get("order_id"))
+        if not claimed:
+            continue
+        delivery_token = claimed.get("delivery_lock_token")
         items = pop_stock(db, product_name, qty)
         if not items:
+            mark_order_pending_stock(db, order.get("order_id"), delivery_token=delivery_token)
             break
-        update_order_status(db, order["order_id"], "delivered", items)
+        updated = update_order_status(db, order["order_id"], "delivered", items, delivery_token=delivery_token)
+        if not updated:
+            send_admin_message(
+                f"🚨 Pending-stock finalization failed after stock was removed.\nProduct: {product_name}\nQuantity: {qty}\nRef: {order.get('order_id')}"
+            )
+            continue
         delivered_orders += 1
         delivered_items += len(items)
         send_order_items(int(order.get("user_id", 0) or 0), order, items, from_pending=True)
@@ -7175,19 +7398,41 @@ def complete_wallet_load(db, user_id: int, pending: dict) -> None:
     send_wallet_load_status(db, user_id, credited, already=False)
 
 
-def update_order_status(db, order_id: str, status: str, items: list[str] | None = None) -> None:
-    update = {"$set": {"status": status}}
+def update_order_status(
+    db,
+    order_id: str,
+    status: str,
+    items: list[str] | None = None,
+    *,
+    delivery_token: str | None = None,
+) -> bool:
+    query: dict[str, Any] = {"order_id": str(order_id or "").strip().upper()}
+    if delivery_token:
+        query["delivery_lock_token"] = delivery_token
+    if status == "pending_stock":
+        query["status"] = {"$nin": ["delivered", "expired", "cancelled", "rejected"]}
+        if not delivery_token:
+            query["$or"] = [
+                {"delivery_lock_token": {"$exists": False}},
+                {"delivery_lock_token": None},
+            ]
+
+    update: dict[str, Any] = {"$set": {"status": status}}
     if items is not None:
         update["$set"]["items"] = items
     if status == "delivered":
         update["$set"]["delivered_at"] = utcnow()
     if status == "pending_stock":
         update["$set"]["pending_stock_at"] = utcnow()
-    db.orders.update_one({"order_id": order_id}, update)
+    if status in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
+        update["$unset"] = {"delivery_lock_token": "", "delivery_lock_at": ""}
+
+    res = db.orders.update_one(query, update)
+    return bool(res.matched_count)
 
 
-def mark_order_pending_stock(db, order_id: str) -> None:
-    update_order_status(db, order_id, "pending_stock")
+def mark_order_pending_stock(db, order_id: str, *, delivery_token: str | None = None) -> bool:
+    return update_order_status(db, order_id, "pending_stock", delivery_token=delivery_token)
 
 
 def notify_low_stock_if_needed(db, product_name: str) -> None:
@@ -7588,14 +7833,55 @@ def notify_order_expired(order: dict, admin_expired: bool = False) -> bool:
         reply_markup=support_markup(lang),
     )
 
+def is_admin_created_order(order: dict | None) -> bool:
+    """Return True for admin-created orders, including older rows saved before the flag existed."""
+    if not order:
+        return False
+    if bool(order.get("admin_created_order")):
+        return True
+    method = str(order.get("payment_method") or "").strip().lower()
+    return method in {"admin_created_order", "admin_created"} or "admin_created" in method
+
+
 def send_pending_stock_notice(user_id: int, order: dict, queued: bool = False) -> None:
     lang = get_user_language_sync(current_app.db, user_id)
     product_name = order.get("product_name", "Product")
     order_id = order.get("order_id", "N/A")
-    queue_note = tr(lang, "pending_stock_queued") if queued else tr(lang, "pending_stock_waiting")
+    if is_admin_created_order(order):
+        queue_note = tr(lang, "admin_created_order_stock_queued") if queued else tr(lang, "admin_created_order_stock_waiting")
+        message = tr(
+            lang,
+            "admin_created_order_pending_stock_notice",
+            product=product_name,
+            order_id=order_id,
+            quantity=int(order.get("quantity", 0) or 0),
+            queue_note=queue_note,
+        )
+    else:
+        queue_note = tr(lang, "pending_stock_queued") if queued else tr(lang, "pending_stock_waiting")
+        message = tr(lang, "pending_stock_notice", product=product_name, order_id=order_id, queue_note=queue_note)
     send_telegram_message(
         user_id,
-        tr(lang, "pending_stock_notice", product=product_name, order_id=order_id, queue_note=queue_note),
+        message,
+        parse_mode="Markdown",
+        reply_markup=support_markup(lang),
+    )
+
+
+
+def send_admin_created_order_created_notice(user_id: int, order: dict) -> None:
+    if not is_admin_created_order(order):
+        return
+    lang = get_user_language_sync(current_app.db, user_id)
+    send_telegram_message(
+        user_id,
+        tr(
+            lang,
+            "admin_created_order_created_notice",
+            product=order.get("product_name", "Product"),
+            order_id=order.get("order_id", "N/A"),
+            quantity=int(order.get("quantity", 0) or 0),
+        ),
         parse_mode="Markdown",
         reply_markup=support_markup(lang),
     )
@@ -7646,6 +7932,8 @@ def delivery_caption(order: dict, from_pending: bool = False, resent_by_admin: b
         title = tr(lang, "order_resent_admin")
     elif order.get("admin_stock_delivery"):
         title = tr(lang, "admin_stock_sent")
+    elif is_admin_created_order(order):
+        title = tr(lang, "admin_created_order_delivery_title")
     elif from_pending:
         title = tr(lang, "pending_order_delivered")
     else:
@@ -7690,6 +7978,8 @@ def send_order_items(user_id: int, order: dict, items: list[str], from_pending: 
     if not items:
         if resent_by_admin:
             title = tr(lang, "order_resent_admin")
+        elif is_admin_created_order(order):
+            title = tr(lang, "admin_created_order_delivery_title")
         elif from_pending:
             title = tr(lang, "pending_order_delivered")
         else:
@@ -7847,7 +8137,7 @@ def order_paid_amounts(order: dict) -> tuple[float, float]:
     usdt = float(order.get("amount_usdt") or 0)
     if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
         return inr, 0.0
-    if method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock"} or "usdt" in method or "polygon" in method or "binance" in method or "bep20" in method or "admin_stock" in method:
+    if method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock", "admin_created_order"} or "usdt" in method or "polygon" in method or "binance" in method or "bep20" in method or "admin_stock" in method or "admin_created" in method:
         return 0.0, usdt
     if usdt and not inr:
         return 0.0, usdt
@@ -7935,6 +8225,7 @@ def method_label(method: str | None) -> str:
         "admin_add": "Admin wallet add",
         "admin_remove": "Admin wallet remove",
         "admin_stock": "Admin stock send",
+        "admin_created_order": "Admin-created order",
     }.get(method, method.upper() if method else "N/A")
 
 

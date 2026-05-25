@@ -3668,3 +3668,33 @@ button.small-button,
   justify-content: flex-start;
   margin: 0;
 }
+
+/* User detail admin-created order placement */
+.user-create-order-panel {
+  grid-column: 1 / -1;
+}
+.user-order-inline-form {
+  display: grid;
+  grid-template-columns: minmax(240px, 2fr) minmax(120px, .65fr) minmax(240px, 2fr) auto;
+  gap: 14px;
+  align-items: end;
+}
+.user-order-inline-form button[type="submit"] {
+  width: max-content;
+  min-height: 44px;
+  white-space: nowrap;
+}
+@media (max-width: 1100px) {
+  .user-order-inline-form {
+    grid-template-columns: 1fr 140px;
+  }
+  .user-order-inline-form label:nth-of-type(3),
+  .user-order-inline-form button[type="submit"] {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 720px) {
+  .user-order-inline-form {
+    grid-template-columns: 1fr;
+  }
+}
