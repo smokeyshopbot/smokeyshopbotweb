@@ -865,6 +865,10 @@ def ensure_admin_indexes(db) -> None:
     db.replacement_reports.create_index([("items.item_hash", 1), ("status", 1)])
     db.stock_manager_payment_requests.create_index([("status", 1), ("requested_at", -1)])
     db.stock_manager_stock_events.create_index([("username_key", 1), ("created_at", -1)])
+    db.stock_item_ledger.create_index([("product_key", 1), ("item_hash", 1)], unique=True)
+    db.stock_item_ledger.create_index([("item_search_text", 1)])
+    db.stock_item_ledger.create_index([("current_status", 1), ("last_movement_at", -1)])
+    db.stock_item_ledger.create_index([("first_added_by_username", 1), ("first_added_at", -1)])
     db.stock_upload_rejections.create_index([("product_name", 1), ("created_at", -1)])
     db.stock_upload_rejections.create_index([("username_key", 1), ("created_at", -1)])
     db.stock_manager_replacement_obligations.create_index([("username_key", 1), ("status", 1)])
@@ -2669,6 +2673,17 @@ def register_routes(app: Flask) -> None:
             {"_id": product["_id"]},
             {"$push": {"stock": {"$each": fresh_blocks}, "stock_added_by": {"$each": stock_meta_records}}},
         )
+        record_stock_ledger_add(
+            app.db,
+            product["name"],
+            fresh_blocks,
+            username=current_admin_username() or "owner",
+            role=current_admin_role(),
+            source="webadmin",
+            stock_upload_kind="replacement" if is_replacement_upload else "normal",
+            manager_earning_rate_usdt=earning_rate_for_upload,
+            owner_due_rate_usdt=0.0,
+        )
         record_stock_manager_stock_event(
             app.db,
             "add",
@@ -2738,6 +2753,16 @@ def register_routes(app: Flask) -> None:
             allowed_added_by=current_admin_username() if is_stock_manager_role() else None,
         )
         if result.get("removed"):
+            record_stock_ledger_status(
+                app.db,
+                name,
+                result.get("removed", []),
+                "removed",
+                username=current_admin_username() or "owner",
+                role=current_admin_role(),
+                source="webadmin",
+                note="Removed from current stock",
+            )
             record_stock_manager_stock_event(
                 app.db,
                 "remove",
@@ -2760,7 +2785,20 @@ def register_routes(app: Flask) -> None:
     @login_required
     @csrf_required
     def clear_stock(name: str):
+        product_before = app.db.products.find_one({"name": name_regex(name)}, {"stock": 1, "name": 1})
+        current_items = list((product_before or {}).get("stock", []) or [])
         res = app.db.products.update_one({"name": name_regex(name)}, {"$set": {"stock": []}})
+        if res.matched_count and current_items:
+            record_stock_ledger_status(
+                app.db,
+                (product_before or {}).get("name") or name,
+                current_items,
+                "removed",
+                username=current_admin_username() or "owner",
+                role=current_admin_role(),
+                source="webadmin",
+                note="Product stock cleared",
+            )
         notify_low_stock_if_needed(app.db, name)
         if res.matched_count:
             log_admin_action(app.db, "stock_cleared", name)
@@ -3424,6 +3462,16 @@ def register_routes(app: Flask) -> None:
                     {"_id": product["_id"]},
                     {"$push": {"stock": {"$each": items, "$position": pending}, "stock_added_by": {"$each": restore_records}}},
                 )
+                record_stock_ledger_add(
+                    app.db,
+                    product["name"],
+                    items,
+                    username=current_admin_username() or "owner",
+                    role=current_admin_role(),
+                    source="webadmin",
+                    stock_upload_kind="admin_send_duplicate_rollback",
+                    note="Restored after duplicate check rollback",
+                )
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source)
                 flash("Duplicate stock detected after stock changed. Nothing was sent. Please try again after cleaning the stock.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
@@ -3448,6 +3496,18 @@ def register_routes(app: Flask) -> None:
             flash(f"Could not create order history for {user_label}: {err or 'unknown error'}", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
+        if source == "manual":
+            record_stock_ledger_add(
+                app.db,
+                product["name"],
+                items,
+                username=current_admin_username() or "owner",
+                role=current_admin_role(),
+                source="webadmin",
+                stock_upload_kind="manual_admin_send",
+                note=f"Sent directly to user as {order['order_id']}",
+            )
+        record_order_items_delivered_in_ledger(app.db, order, items, source="webadmin_admin_stock")
         lang = get_user_language_sync(app.db, user_id)
         filename = delivery_txt_filename(order)
         sent = send_telegram_document(
@@ -3553,6 +3613,16 @@ def register_routes(app: Flask) -> None:
                     {"_id": product["_id"]},
                     {"$push": {"stock": {"$each": items, "$position": pending}, "stock_added_by": {"$each": restore_records}}},
                 )
+                record_stock_ledger_add(
+                    app.db,
+                    product["name"],
+                    items,
+                    username=current_admin_username() or "owner",
+                    role=current_admin_role(),
+                    source="webadmin",
+                    stock_upload_kind="manual_replacement_duplicate_rollback",
+                    note="Restored after duplicate check rollback",
+                )
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source, flow="replacement")
                 flash("Duplicate stock detected after stock changed. Nothing was sent. Please try again after cleaning the stock.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
@@ -3577,6 +3647,18 @@ def register_routes(app: Flask) -> None:
             flash(f"Could not create replacement history for {user_label}: {err or 'unknown error'}", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
+        if source == "manual":
+            record_stock_ledger_add(
+                app.db,
+                product["name"],
+                items,
+                username=current_admin_username() or "owner",
+                role=current_admin_role(),
+                source="webadmin",
+                stock_upload_kind="manual_replacement_send",
+                note=f"Sent directly as replacement {order['order_id']}",
+            )
+        record_order_items_delivered_in_ledger(app.db, order, items, source="webadmin_manual_replacement")
         lang = get_user_language_sync(app.db, user_id)
         filename = delivery_txt_filename(order)
         sent = send_telegram_document(
@@ -3839,6 +3921,17 @@ def register_routes(app: Flask) -> None:
                 "delivery_telegram_delete_results": results,
             }},
         )
+        record_stock_ledger_status(
+            app.db,
+            str(order.get("product_name") or ""),
+            [str(item).strip() for item in (order.get("items") or []) if str(item).strip()],
+            "revoked",
+            order=order,
+            username=revoked_by,
+            role=current_admin_role(),
+            source="webadmin",
+            note="Delivery revoked/deleted from Telegram",
+        )
         action_name = "replacement_revoked" if order.get("is_replacement") else "order_revoked"
         log_admin_action(app.db, action_name, f"{ref_id} user={order.get('user_id')} deleted={deleted_count}/{len(refs)} by={revoked_by}")
 
@@ -3942,6 +4035,28 @@ def register_routes(app: Flask) -> None:
                 "delivery_transfer_note": transfer_note,
             }},
         )
+        record_stock_ledger_status(
+            app.db,
+            str(order.get("product_name") or ""),
+            items,
+            "transferred",
+            order=order,
+            username=transferred_by,
+            role=current_admin_role(),
+            source="webadmin",
+            note=f"Transferred to {target_user_id} as {new_order['order_id']}",
+        )
+        record_stock_ledger_status(
+            app.db,
+            str(new_order.get("product_name") or ""),
+            items,
+            "transferred_delivered",
+            order=new_order,
+            username=transferred_by,
+            role=current_admin_role(),
+            source="webadmin",
+            note=f"Transferred from {ref_id}",
+        )
 
         label = "Replacement" if order.get("is_replacement") else "Order"
         target_label = telegram_user_display(app.db, target_user_id, target_user.get("username"))
@@ -4015,6 +4130,16 @@ def register_routes(app: Flask) -> None:
         app.db.products.update_one(
             {"_id": product["_id"]},
             {"$push": {"stock": {"$each": returned_items}, "stock_added_by": {"$each": stock_meta_records}}},
+        )
+        record_stock_ledger_add(
+            app.db,
+            product_name,
+            returned_items,
+            username=returned_by,
+            role=current_admin_role(),
+            source="webadmin",
+            stock_upload_kind="returned_revoked_delivery",
+            note=f"Added back from revoked delivery {ref_id}",
         )
         pending_summary = process_pending_stock_orders(app.db, product_name)
         now = utcnow()
@@ -4773,6 +4898,227 @@ def stock_item_hash(item: str) -> str:
     return hashlib.sha256(str(item or "").strip().encode("utf-8")).hexdigest()
 
 
+def stock_ledger_product_key(product_name: Any) -> str:
+    return str(product_name or "").strip().lower()
+
+
+def stock_ledger_item_hash(item: Any) -> str:
+    clean = normalize_approved_stock_item(item)
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest() if clean else ""
+
+
+def stock_ledger_search_text(item: Any) -> str:
+    return re.sub(r"\s+", " ", normalize_approved_stock_item(item).lower()).strip()
+
+
+def stock_ledger_movement(
+    movement_type: str,
+    *,
+    username: str = "",
+    role: str = "",
+    user_id: int | None = None,
+    source: str = "webadmin",
+    order_id: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    movement: dict[str, Any] = {
+        "type": str(movement_type or "").strip().lower(),
+        "at": utcnow(),
+        "username": str(username or "").strip().lstrip("@"),
+        "role": str(role or "").strip(),
+        "source": str(source or "webadmin").strip(),
+        "order_id": str(order_id or "").strip().upper(),
+        "note": str(note or "").strip()[:1000],
+    }
+    if user_id is not None:
+        try:
+            movement["user_id"] = int(user_id)
+        except Exception:
+            pass
+    return movement
+
+
+def record_stock_ledger_add(
+    db,
+    product_name: str,
+    items: list[str],
+    *,
+    username: str = "",
+    role: str = "",
+    user_id: int | None = None,
+    source: str = "webadmin",
+    stock_upload_kind: str = "normal",
+    note: str = "",
+    manager_earning_rate_usdt: float | None = None,
+    owner_due_rate_usdt: float | None = None,
+) -> None:
+    clean_product = str(product_name or "").strip()
+    product_key = stock_ledger_product_key(clean_product)
+    if not product_key:
+        return
+    now = utcnow()
+    clean_username = str(username or "").strip().lstrip("@")
+    clean_role = normalize_admin_role(role) if role else str(role or "").strip()
+    upload_kind = str(stock_upload_kind or "normal").strip().lower() or "normal"
+    set_fields_common: dict[str, Any] = {}
+    if manager_earning_rate_usdt is not None:
+        set_fields_common["stock_manager_earning_rate_usdt"] = round(max(0.0, safe_float(manager_earning_rate_usdt, 0.0)), 3)
+    if owner_due_rate_usdt is not None:
+        set_fields_common["stock_manager_owner_rate_usdt"] = round(max(0.0, safe_float(owner_due_rate_usdt, 0.0)), 3)
+    movement = stock_ledger_movement(
+        "added", username=clean_username, role=clean_role, user_id=user_id, source=source, note=note
+    )
+    for item in items or []:
+        clean_item = normalize_approved_stock_item(item)
+        item_hash = stock_ledger_item_hash(clean_item)
+        if not clean_item or not item_hash:
+            continue
+        try:
+            db.stock_item_ledger.update_one(
+                {"product_key": product_key, "item_hash": item_hash},
+                {
+                    "$setOnInsert": {
+                        "product_key": product_key,
+                        "item_hash": item_hash,
+                        "first_added_at": now,
+                        "first_added_by_username": clean_username,
+                        "first_added_by_role": clean_role,
+                        "first_added_by_user_id": int(user_id) if user_id is not None else None,
+                        "first_added_source": str(source or "webadmin").strip(),
+                    },
+                    "$set": {
+                        "product_name": clean_product,
+                        "item_text": clean_item,
+                        "item_search_text": stock_ledger_search_text(clean_item),
+                        "current_status": "available",
+                        "current_status_at": now,
+                        "last_movement_at": now,
+                        "last_added_at": now,
+                        "last_added_by_username": clean_username,
+                        "last_added_by_role": clean_role,
+                        "last_added_by_user_id": int(user_id) if user_id is not None else None,
+                        "last_added_source": str(source or "webadmin").strip(),
+                        "stock_upload_kind": upload_kind,
+                        "current_order_id": "",
+                        "current_user_id": None,
+                        "current_username": "",
+                        "updated_at": now,
+                        **set_fields_common,
+                    },
+                    "$push": {"movements": {"$each": [movement], "$slice": -80}},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+
+def record_stock_ledger_status(
+    db,
+    product_name: str,
+    items: list[str],
+    status: str,
+    *,
+    order: dict | None = None,
+    username: str = "",
+    role: str = "",
+    user_id: int | None = None,
+    source: str = "webadmin",
+    note: str = "",
+) -> None:
+    clean_product = str(product_name or "").strip()
+    product_key = stock_ledger_product_key(clean_product)
+    clean_status = str(status or "").strip().lower() or "unknown"
+    if not product_key or not items:
+        return
+    now = utcnow()
+    order = order or {}
+    order_id = str(order.get("order_id") or "").strip().upper()
+    current_user_id = user_id
+    if current_user_id is None and order.get("user_id") is not None:
+        try:
+            current_user_id = int(order.get("user_id"))
+        except Exception:
+            current_user_id = None
+    current_username = str(order.get("username") or "").strip().lstrip("@")
+    movement = stock_ledger_movement(
+        clean_status, username=username, role=role, user_id=current_user_id, source=source, order_id=order_id, note=note
+    )
+    set_fields: dict[str, Any] = {
+        "product_name": clean_product,
+        "current_status": clean_status,
+        "current_status_at": now,
+        "last_movement_at": now,
+        "updated_at": now,
+    }
+    if order_id:
+        set_fields["current_order_id"] = order_id
+    if current_user_id is not None:
+        set_fields["current_user_id"] = current_user_id
+    if current_username:
+        set_fields["current_username"] = current_username
+    for item in items or []:
+        clean_item = normalize_approved_stock_item(item)
+        item_hash = stock_ledger_item_hash(clean_item)
+        if not clean_item or not item_hash:
+            continue
+        try:
+            db.stock_item_ledger.update_one(
+                {"product_key": product_key, "item_hash": item_hash},
+                {
+                    "$setOnInsert": {
+                        "product_key": product_key,
+                        "item_hash": item_hash,
+                        "first_added_at": now,
+                        "first_added_by_username": str(username or "").strip().lstrip("@"),
+                        "first_added_by_role": str(role or "").strip(),
+                        "first_added_source": str(source or "webadmin").strip(),
+                    },
+                    "$set": {**set_fields, "item_text": clean_item, "item_search_text": stock_ledger_search_text(clean_item)},
+                    "$push": {"movements": {"$each": [movement], "$slice": -80}},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+
+def record_order_items_delivered_in_ledger(db, order: dict, items: list[str], *, source: str = "webadmin") -> None:
+    if not order or not items:
+        return
+    if order.get("is_replacement"):
+        status = "replacement_delivered"
+    elif order.get("admin_stock_delivery") or order.get("payment_method") == "admin_stock":
+        status = "admin_sent"
+    else:
+        status = "delivered"
+    record_stock_ledger_status(
+        db,
+        str(order.get("product_name") or ""),
+        items,
+        status,
+        order=order,
+        source=source,
+        note="Attached to delivered order history",
+    )
+
+
+def stock_ledger_status_label(status: Any) -> tuple[str, str]:
+    clean = str(status or "").strip().lower()
+    labels = {
+        "available": ("Available in inventory", "available"),
+        "delivered": ("Sold / delivered order", "delivered"),
+        "replacement_delivered": ("Replacement delivered", "delivered"),
+        "admin_sent": ("Admin-sent order", "delivered"),
+        "removed": ("Removed from stock", "removed"),
+        "popped": ("Removed from live stock", "other"),
+        "revoked": ("Revoked delivery", "other"),
+        "transferred": ("Transferred delivery", "delivered"),
+        "transferred_delivered": ("Transferred delivery", "delivered"),
+    }
+    return labels.get(clean, (clean.replace("_", " ").title() or "Ledger record", "other"))
+
+
 REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 
 
@@ -5214,6 +5560,19 @@ def stock_upload_info_for_item(db, product_name: str, item: Any, current_product
                 "added_at": event.get("created_at"),
                 "stock_upload_kind": event.get("stock_upload_kind"),
             }
+    if not record:
+        ledger_query = {"item_hash": stock_ledger_item_hash(clean_item)}
+        product_key = stock_ledger_product_key(product_name)
+        if product_key:
+            ledger_query = {"product_key": product_key, "item_hash": stock_ledger_item_hash(clean_item)}
+        ledger = db.stock_item_ledger.find_one(ledger_query, sort=[("first_added_at", 1)]) or {}
+        if ledger:
+            record = {
+                "added_by_username": ledger.get("first_added_by_username") or ledger.get("last_added_by_username"),
+                "added_by_role": ledger.get("first_added_by_role") or ledger.get("last_added_by_role"),
+                "added_at": ledger.get("first_added_at") or ledger.get("last_added_at"),
+                "stock_upload_kind": ledger.get("stock_upload_kind"),
+            }
     return {
         "uploaded_by": str(record.get("added_by_username") or "Unknown").strip() or "Unknown",
         "uploaded_role": str(record.get("added_by_role") or "").strip(),
@@ -5227,6 +5586,14 @@ def build_stock_lookup_results(db, query: str, *, limit: int = 200) -> dict[str,
     result: dict[str, Any] = {"query": lookup, "matches": [], "total_matches": 0, "limited": False}
     if len(normalize_stock_lookup_text(lookup)) < 2:
         return result
+
+    seen_ledger_keys: set[tuple[str, str]] = set()
+
+    def remember_ledger_item(product_name: Any, item: Any) -> None:
+        product_key = stock_ledger_product_key(product_name)
+        item_hash = stock_ledger_item_hash(item)
+        if product_key and item_hash:
+            seen_ledger_keys.add((product_key, item_hash))
 
     def add_match(row: dict[str, Any]) -> None:
         result["total_matches"] = int(result.get("total_matches") or 0) + 1
@@ -5242,6 +5609,7 @@ def build_stock_lookup_results(db, query: str, *, limit: int = 200) -> dict[str,
             if not stock_item_matches_query(item, lookup):
                 continue
             info = stock_upload_info_for_item(db, product_name, item, current_product=product)
+            remember_ledger_item(product_name, item)
             add_match({
                 "status": "Available in inventory",
                 "status_class": "available",
@@ -5280,6 +5648,7 @@ def build_stock_lookup_results(db, query: str, *, limit: int = 200) -> dict[str,
             if not stock_item_matches_query(item, lookup):
                 continue
             info = stock_upload_info_for_item(db, product_name, item)
+            remember_ledger_item(product_name, item)
             is_replacement = bool(order.get("is_replacement"))
             is_admin_stock = bool(order.get("admin_stock_delivery"))
             if is_replacement:
@@ -5314,6 +5683,59 @@ def build_stock_lookup_results(db, query: str, *, limit: int = 200) -> dict[str,
                 "source": source,
                 "replacement_report_id": str(order.get("replacement_report_id") or ""),
             })
+
+    # Permanent item ledger lookup. This keeps stock searchable even after it was
+    # removed from live stock, revoked, transferred, or hit an unusual failed delivery path.
+    terms = stock_lookup_terms(lookup)
+    ledger_query: dict[str, Any] = {}
+    if terms:
+        # Use the longest useful term to reduce the scan, then apply the same
+        # Python matcher used for current/order stock so multi-line stock still works.
+        strongest = max(terms, key=len)
+        ledger_query = {"item_search_text": {"$regex": re.escape(strongest), "$options": "i"}}
+    try:
+        ledger_cursor = db.stock_item_ledger.find(ledger_query).sort("last_movement_at", -1).limit(1000)
+    except Exception:
+        ledger_cursor = []
+    for ledger in ledger_cursor:
+        item_text = str(ledger.get("item_text") or "").strip()
+        product_name = str(ledger.get("product_name") or "Unknown product").strip() or "Unknown product"
+        if not stock_item_matches_query(item_text, lookup):
+            continue
+        ledger_key = (stock_ledger_product_key(product_name), stock_ledger_item_hash(item_text))
+        if ledger_key in seen_ledger_keys:
+            continue
+        seen_ledger_keys.add(ledger_key)
+        status_label_text, status_class = stock_ledger_status_label(ledger.get("current_status"))
+        order_id = str(ledger.get("current_order_id") or "").strip().upper()
+        order_url = ""
+        if order_id:
+            try:
+                order_row = db.orders.find_one({"order_id": order_id}, {"is_replacement": 1}) or {}
+                endpoint = "replacement_order_detail" if order_row.get("is_replacement") else "order_detail"
+                order_url = url_for(endpoint, order_id=order_id)
+            except Exception:
+                order_url = ""
+        user_id = ledger.get("current_user_id")
+        user_label = "Not delivered"
+        if user_id:
+            user_label = telegram_user_display(db, user_id, ledger.get("current_username"))
+        add_match({
+            "status": status_label_text,
+            "status_class": status_class,
+            "product_name": product_name,
+            "item": item_text,
+            "stock_position": None,
+            "uploaded_by": str(ledger.get("first_added_by_username") or ledger.get("last_added_by_username") or "Unknown").strip() or "Unknown",
+            "uploaded_role": str(ledger.get("first_added_by_role") or ledger.get("last_added_by_role") or "").strip(),
+            "uploaded_at": ledger.get("first_added_at") or ledger.get("last_added_at"),
+            "delivered_at": ledger.get("current_status_at"),
+            "order_id": order_id,
+            "order_url": order_url,
+            "user_label": user_label,
+            "source": "Stock item ledger",
+            "replacement_report_id": "",
+        })
 
     return result
 
@@ -5962,6 +6384,16 @@ def _restore_replacement_stock(db, popped_by_product: dict[str, list[str]]) -> N
                 {"name": name_regex(product_name)},
                 {"$push": {"stock": {"$each": clean_items, "$position": 0}}},
             )
+            record_stock_ledger_add(
+                db,
+                product_name,
+                clean_items,
+                username="system",
+                role="system",
+                source="webadmin",
+                stock_upload_kind="replacement_send_rollback",
+                note="Restored because replacement Telegram send failed",
+            )
 
 
 def _new_replacement_order_id(db) -> str:
@@ -6069,6 +6501,18 @@ def send_replacement_from_stock(db, report: dict, sent_by: str = "owner", admin_
         })
 
     db.orders.insert_one(order)
+    for product_name, popped_items in popped_by_product.items():
+        record_stock_ledger_status(
+            db,
+            product_name,
+            popped_items,
+            "replacement_delivered",
+            order=order,
+            username=sent_by or "owner",
+            role="system" if sent_by == "auto-stock" else "owner",
+            source="webadmin",
+            note=f"Replacement report {report.get('report_id', '')}",
+        )
     db.replacement_reports.update_one(
         {"_id": report["_id"]},
         {"$set": {
@@ -6965,6 +7409,8 @@ def pop_stock(db, product_name: str, quantity: int) -> list[str]:
         return []
     items = updated.get("_last_popped", []) or []
     db.products.update_one({"_id": updated["_id"]}, {"$unset": {"_last_popped": ""}})
+    if items:
+        record_stock_ledger_status(db, product_name, items, "popped", source="webadmin", note="Removed from live stock before delivery finalization")
     return items
 
 
@@ -7016,6 +7462,7 @@ def pop_available_stock_for_admin_send(db, product_name: str, quantity: int) -> 
             return []
 
         if result.modified_count:
+            record_stock_ledger_status(db, product_name, items, "popped", source="webadmin", note="Removed from live stock for admin send")
             return items
 
         # Stock changed between read and write. Retry with a fresh view.
@@ -7428,6 +7875,12 @@ def update_order_status(
         update["$unset"] = {"delivery_lock_token": "", "delivery_lock_at": ""}
 
     res = db.orders.update_one(query, update)
+    if res.matched_count and status == "delivered" and items:
+        try:
+            order = db.orders.find_one({"order_id": str(order_id or "").strip().upper()}) or {}
+            record_order_items_delivered_in_ledger(db, order, items, source="webadmin")
+        except Exception:
+            pass
     return bool(res.matched_count)
 
 

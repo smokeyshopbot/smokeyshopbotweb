@@ -113,6 +113,209 @@ async def record_admin_activity(
     except Exception:
         pass
 
+def _stock_ledger_product_key(product_name: Any) -> str:
+    return str(product_name or "").strip().lower()
+
+
+def _stock_ledger_item_hash(item: Any) -> str:
+    clean = normalize_approved_stock_item(item)
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest() if clean else ""
+
+
+def _stock_ledger_search_text(item: Any) -> str:
+    return re.sub(r"\s+", " ", normalize_approved_stock_item(item).lower()).strip()
+
+
+def _stock_ledger_movement(
+    movement_type: str,
+    *,
+    username: str = "",
+    role: str = "",
+    user_id: int | None = None,
+    source: str = "system",
+    order_id: str = "",
+    note: str = "",
+) -> dict:
+    movement = {
+        "type": str(movement_type or "").strip().lower(),
+        "at": datetime.now(timezone.utc),
+        "username": str(username or "").strip().lstrip("@"),
+        "role": str(role or "").strip(),
+        "source": str(source or "system").strip(),
+        "order_id": str(order_id or "").strip().upper(),
+        "note": str(note or "").strip()[:1000],
+    }
+    if user_id is not None:
+        try:
+            movement["user_id"] = int(user_id)
+        except Exception:
+            pass
+    return movement
+
+
+async def record_stock_ledger_add(
+    product_name: str,
+    items: list[str],
+    *,
+    username: str = "",
+    role: str = "telegram_admin",
+    user_id: int | None = None,
+    source: str = "telegram_bot",
+    stock_upload_kind: str = "normal",
+    note: str = "",
+) -> None:
+    """Keep every stock item searchable even after it is sold/removed later."""
+    clean_product = str(product_name or "").strip()
+    product_key = _stock_ledger_product_key(clean_product)
+    if not product_key:
+        return
+    now = datetime.now(timezone.utc)
+    clean_username = str(username or "").strip().lstrip("@")
+    clean_role = str(role or "telegram_admin").strip()
+    upload_kind = str(stock_upload_kind or "normal").strip().lower() or "normal"
+    movement = _stock_ledger_movement(
+        "added", username=clean_username, role=clean_role, user_id=user_id, source=source, note=note
+    )
+    database = get_db()
+    for item in items or []:
+        clean_item = normalize_approved_stock_item(item)
+        item_hash = _stock_ledger_item_hash(clean_item)
+        if not clean_item or not item_hash:
+            continue
+        try:
+            await database.stock_item_ledger.update_one(
+                {"product_key": product_key, "item_hash": item_hash},
+                {
+                    "$setOnInsert": {
+                        "product_key": product_key,
+                        "item_hash": item_hash,
+                        "first_added_at": now,
+                        "first_added_by_username": clean_username,
+                        "first_added_by_role": clean_role,
+                        "first_added_by_user_id": int(user_id) if user_id is not None else None,
+                        "first_added_source": str(source or "telegram_bot").strip(),
+                    },
+                    "$set": {
+                        "product_name": clean_product,
+                        "item_text": clean_item,
+                        "item_search_text": _stock_ledger_search_text(clean_item),
+                        "current_status": "available",
+                        "current_status_at": now,
+                        "last_movement_at": now,
+                        "last_added_at": now,
+                        "last_added_by_username": clean_username,
+                        "last_added_by_role": clean_role,
+                        "last_added_by_user_id": int(user_id) if user_id is not None else None,
+                        "last_added_source": str(source or "telegram_bot").strip(),
+                        "stock_upload_kind": upload_kind,
+                        "current_order_id": "",
+                        "current_user_id": None,
+                        "current_username": "",
+                        "updated_at": now,
+                    },
+                    "$push": {"movements": {"$each": [movement], "$slice": -80}},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+
+async def record_stock_ledger_status(
+    product_name: str,
+    items: list[str],
+    status: str,
+    *,
+    order: dict | None = None,
+    username: str = "",
+    role: str = "",
+    user_id: int | None = None,
+    source: str = "system",
+    note: str = "",
+) -> None:
+    clean_product = str(product_name or "").strip()
+    product_key = _stock_ledger_product_key(clean_product)
+    clean_status = str(status or "").strip().lower() or "unknown"
+    if not product_key or not items:
+        return
+    now = datetime.now(timezone.utc)
+    order = order or {}
+    order_id = str(order.get("order_id") or "").strip().upper()
+    current_user_id = user_id
+    if current_user_id is None and order.get("user_id") is not None:
+        try:
+            current_user_id = int(order.get("user_id"))
+        except Exception:
+            current_user_id = None
+    current_username = str(order.get("username") or "").strip().lstrip("@")
+    movement = _stock_ledger_movement(
+        clean_status,
+        username=username,
+        role=role,
+        user_id=current_user_id,
+        source=source,
+        order_id=order_id,
+        note=note,
+    )
+    set_fields: dict[str, Any] = {
+        "product_name": clean_product,
+        "current_status": clean_status,
+        "current_status_at": now,
+        "last_movement_at": now,
+        "updated_at": now,
+    }
+    if order_id:
+        set_fields["current_order_id"] = order_id
+    if current_user_id is not None:
+        set_fields["current_user_id"] = current_user_id
+    if current_username:
+        set_fields["current_username"] = current_username
+    database = get_db()
+    for item in items or []:
+        clean_item = normalize_approved_stock_item(item)
+        item_hash = _stock_ledger_item_hash(clean_item)
+        if not clean_item or not item_hash:
+            continue
+        try:
+            await database.stock_item_ledger.update_one(
+                {"product_key": product_key, "item_hash": item_hash},
+                {
+                    "$setOnInsert": {
+                        "product_key": product_key,
+                        "item_hash": item_hash,
+                        "first_added_at": now,
+                        "first_added_by_username": str(username or "").strip().lstrip("@"),
+                        "first_added_by_role": str(role or "").strip(),
+                        "first_added_source": str(source or "system").strip(),
+                    },
+                    "$set": {**set_fields, "item_text": clean_item, "item_search_text": _stock_ledger_search_text(clean_item)},
+                    "$push": {"movements": {"$each": [movement], "$slice": -80}},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+
+async def record_order_items_delivered_in_ledger(order: dict, items: list[str], *, source: str = "telegram_bot") -> None:
+    if not order or not items:
+        return
+    if order.get("is_replacement"):
+        status = "replacement_delivered"
+    elif order.get("admin_stock_delivery") or order.get("payment_method") == "admin_stock":
+        status = "admin_sent"
+    else:
+        status = "delivered"
+    await record_stock_ledger_status(
+        str(order.get("product_name") or ""),
+        items,
+        status,
+        order=order,
+        source=source,
+        note="Attached to delivered order history",
+    )
+
+
 
 # ─────────────────────────── USERS ───────────────────────────
 
@@ -476,7 +679,16 @@ async def record_stock_upload_rejection(
     return doc
 
 
-async def add_stock(product_name: str, items: list[str]) -> int:
+async def add_stock(
+    product_name: str,
+    items: list[str],
+    *,
+    username: str = "",
+    role: str = "telegram_admin",
+    user_id: int | None = None,
+    source: str = "telegram_bot",
+    stock_upload_kind: str = "normal",
+) -> int:
     """Add only fresh stock items to the end of this product's queue.
 
     Exact duplicate stock is rejected within the same product, including
@@ -521,6 +733,16 @@ async def add_stock(product_name: str, items: list[str]) -> int:
         {"_id": product["_id"]},
         {"$push": {"stock": {"$each": fresh_items}}},
     )
+    if res.matched_count:
+        await record_stock_ledger_add(
+            product.get("name") or product_name,
+            fresh_items,
+            username=username,
+            role=role,
+            user_id=user_id,
+            source=source,
+            stock_upload_kind=stock_upload_kind,
+        )
     return len(fresh_items) if res.matched_count else 0
 
 
@@ -553,6 +775,7 @@ async def remove_stock_items(product_name: str, items: list[str]) -> dict:
             {"_id": product["_id"]},
             {"$set": {"stock": stock}},
         )
+        await record_stock_ledger_status(product.get("name") or product_name, removed, "removed", source="telegram_bot", note="Removed from current stock")
 
     return {"removed": removed, "not_found": not_found, "remaining": len(stock)}
 
@@ -602,6 +825,8 @@ async def pop_stock(product_name: str, quantity: int) -> list[str]:
         {"_id": updated["_id"]},
         {"$unset": {"_last_popped": ""}},
     )
+    if items:
+        await record_stock_ledger_status(product_name, items, "popped", source="telegram_bot", note="Removed from live stock before delivery finalization")
     return items
 
 
@@ -757,10 +982,14 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
 
 
 async def clear_stock(product_name: str) -> bool:
+    product = await get_product(product_name)
+    current_items = list((product or {}).get("stock", []) or [])
     res = await get_db().products.update_one(
         {"name": _name_regex(product_name)},
         {"$set": {"stock": []}},
     )
+    if res.matched_count and current_items:
+        await record_stock_ledger_status(product_name, current_items, "removed", source="telegram_bot", note="Product stock cleared")
     return res.matched_count > 0
 
 
@@ -900,6 +1129,12 @@ async def update_order_status(
     if status in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
         update["$unset"] = {"delivery_lock_token": "", "delivery_lock_at": ""}
     res = await get_db().orders.update_one(query, update)
+    if res.matched_count and status == "delivered" and items:
+        try:
+            order = await get_db().orders.find_one({"order_id": clean_order_id}) or {}
+            await record_order_items_delivered_in_ledger(order, items, source="telegram_bot")
+        except Exception:
+            pass
     return bool(res.matched_count)
 
 

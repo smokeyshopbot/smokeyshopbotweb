@@ -1659,7 +1659,15 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return True
 
     previous_available = await db.get_available_stock_count(product_name)
-    count = await db.add_stock(product_name, blocks)
+    count = await db.add_stock(
+        product_name,
+        blocks,
+        username=(update.effective_user.username or "") if update.effective_user else "",
+        role="telegram_admin",
+        user_id=user_id,
+        source="telegram_bot",
+        stock_upload_kind="normal",
+    )
     skipped_count = max(0, len(blocks) - count)
     rejected_by_pool_count = len(approved_pool_rejected_blocks)
 

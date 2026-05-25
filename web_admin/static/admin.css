@@ -2761,6 +2761,11 @@ button, .primary, .success, .danger, .secondary-button, .small-button, .link-but
   border-color: rgba(34, 197, 94, .35);
   color: #86efac;
 }
+.lookup-status-removed {
+  background: rgba(239, 68, 68, .14);
+  border-color: rgba(239, 68, 68, .35);
+  color: #fca5a5;
+}
 .lookup-status-other {
   background: rgba(245, 158, 11, .14);
   border-color: rgba(245, 158, 11, .35);
