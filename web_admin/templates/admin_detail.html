@@ -35,7 +35,9 @@
   <div class="card"><span>Total stock submitted</span><strong>{{ summary.total_added }}</strong><small>Normal stock uploads only. Replacement uploads are excluded.</small></div>
   <div class="card replacement-due-card"><span>Pending replacements</span><strong>{{ summary.pending_replacement_count }}</strong><small>Replacement stock this manager still needs to submit.</small></div>
   <div class="card"><span>Current stock</span><strong>{{ summary.current_stock }}</strong><small>Unsold stock still available from this manager.</small></div>
-  <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered items added by this manager.</small></div>
+  <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered, non-revoked order items added by this manager.</small></div>
+  <div class="card"><span>Removed / cleared</span><strong>{{ summary.removed_stock }}</strong><small>Stock removed from live inventory before sale.</small></div>
+  <div class="card"><span>Other / legacy</span><strong>{{ summary.other_legacy_stock }}</strong><small>Old or untracked stock gap, including legacy records before full item tracking.</small></div>
   <div class="card"><span>Lifetime earnings</span><strong>{{ money_usdt(summary.manager_earning_usdt) }}</strong><small>Stock added × earning rate.</small></div>
   <div class="card payout-due-card"><span>Payout due</span><strong>{{ money_usdt(summary.payable_due_usdt) }}</strong><small>{% if summary.pending_payment_request %}Request pending{% else %}No pending request{% endif %}</small></div>
 </section>
@@ -177,11 +179,16 @@
 </section>
 
 <section class="panel">
-  <h2>Product stock summary</h2>
+  <div class="toolbar">
+    <div>
+      <h2>Product stock summary</h2>
+      <p class="muted">Breakdown: submitted = current + sold + removed/cleared + other/legacy.</p>
+    </div>
+  </div>
   {% if stats.products %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Product</th><th>Added</th><th>Current</th><th>Sold</th><th>Earning rate</th><th>Earnings</th><th>Last activity</th></tr></thead>
+      <thead><tr><th>Product</th><th>Added</th><th>Current</th><th>Sold</th><th>Removed</th><th>Other / legacy</th><th>Earning rate</th><th>Earnings</th><th>Last activity</th></tr></thead>
       <tbody>
       {% for row in stats.products %}
         <tr>
@@ -189,6 +196,8 @@
           <td>{{ row.added }}</td>
           <td>{{ row.current }}</td>
           <td>{{ row.sold }}</td>
+          <td>{{ row.removed }}</td>
+          <td>{{ row.other_legacy }}</td>
           <td>{{ money_usdt(row.configured_manager_rate_usdt) }}</td>
           <td>{{ money_usdt(row.manager_earning_usdt) }}</td>
           <td>{{ fmt_dt(row.last_activity_at) }}</td>

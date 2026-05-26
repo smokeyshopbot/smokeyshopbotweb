@@ -14,6 +14,10 @@
 <section class="grid cards stock-manager-summary-cards stock-manager-summary-cards-compact">
   <div class="card"><span>Total stock submitted</span><strong>{{ summary.total_added }}</strong><small>Normal stock uploads only. Replacement uploads are excluded.</small></div>
   <div class="card replacement-due-card"><span>Pending replacements</span><strong>{{ summary.pending_replacement_count }}</strong><small>Replacement stock you still need to submit.</small></div>
+  <div class="card"><span>Current stock</span><strong>{{ summary.current_stock }}</strong><small>Unsold stock still available from your uploads.</small></div>
+  <div class="card"><span>Sold stock</span><strong>{{ summary.sold_stock }}</strong><small>Delivered, non-revoked items from your uploads.</small></div>
+  <div class="card"><span>Removed / cleared</span><strong>{{ summary.removed_stock }}</strong><small>Stock removed from live inventory before sale.</small></div>
+  <div class="card"><span>Other / legacy</span><strong>{{ summary.other_legacy_stock }}</strong><small>Old or untracked stock gap before full item tracking.</small></div>
   <div class="card"><span>Your earnings till date</span><strong>{{ money_usdt(summary.manager_earning_usdt) }}</strong><small>Normal stock submitted × owner-set earning rate.</small></div>
   <div class="card payout-due-card"><span>Payout due to you</span><strong>{{ money_usdt(summary.payable_due_usdt) }}</strong><small>Minimum request: {{ money_usdt(stock_manager_min_payout_usdt) }}.</small></div>
 </section>
@@ -51,6 +55,39 @@
   </div>
 </section>
 {% endif %}
+
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>My stock breakdown</h2>
+      <p class="muted">Submitted = current + sold + removed/cleared + other/legacy.</p>
+    </div>
+  </div>
+  {% if stats.products %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Product</th><th>Submitted</th><th>Current</th><th>Sold</th><th>Removed</th><th>Other / legacy</th><th>Last activity</th></tr>
+      </thead>
+      <tbody>
+      {% for row in stats.products %}
+        <tr>
+          <td><strong>{{ row.product_name }}</strong></td>
+          <td>{{ row.added }}</td>
+          <td>{{ row.current }}</td>
+          <td>{{ row.sold }}</td>
+          <td>{{ row.removed }}</td>
+          <td>{{ row.other_legacy }}</td>
+          <td>{{ fmt_dt(row.last_activity_at) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No stock activity for your assigned products yet.</p>
+  {% endif %}
+</section>
 
 <section class="panel payout-request-panel">
   <div class="toolbar">

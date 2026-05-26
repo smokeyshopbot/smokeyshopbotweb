@@ -5971,6 +5971,7 @@ def make_stock_manager_product_stats(product_name: str) -> dict[str, Any]:
         "current": 0,
         "sold": 0,
         "removed": 0,
+        "other_legacy": 0,
         "manager_earning_usdt": 0.0,
         "owner_due_usdt": 0.0,
         "configured_manager_rate_usdt": 0.0,
@@ -6184,6 +6185,7 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
         "items.0": {"$exists": True},
         "is_replacement": {"$ne": True},
         "payment_method": {"$ne": "replacement"},
+        "delivery_revoked": {"$ne": True},
     }, {
         "product_name": 1,
         "items": 1,
@@ -6224,8 +6226,15 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
         # Stock-manager totals are based on normal stock submitted by the manager.
         # Replacement uploads are excluded earlier from add events and metadata.
         row["added"] = lifetime_uploaded_total
-        inferred_removed = max(0, lifetime_uploaded_total - normal_visible_total)
-        row["removed"] = max(int(row.get("removed", 0)), inferred_removed)
+        explicit_removed = max(0, int(row.get("removed", 0)))
+        # Keep removed/cleared stock separate from older untracked differences.
+        # This makes the stock-manager totals explainable instead of forcing every
+        # mismatch into the removed bucket. Old records may not have item-level
+        # movement history, so their gap is shown as other/legacy.
+        row["removed"] = explicit_removed
+        tracked_total = normal_current + normal_sold + explicit_removed
+        row["other_legacy"] = max(0, lifetime_uploaded_total - tracked_total)
+        row["accounted_total"] = normal_current + normal_sold + explicit_removed + int(row.get("other_legacy", 0))
         row["manager_earning_usdt"] = round(float(row.get("manager_earning_usdt", 0.0)), 2)
         row["owner_due_usdt"] = round(float(row.get("owner_due_usdt", 0.0)), 2)
         products.append(row)
@@ -6248,6 +6257,9 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
         "total_added": sum(int(row.get("added", 0)) for row in products),
         "current_stock": sum(int(row.get("current", 0)) for row in products),
         "sold_stock": sum(int(row.get("sold", 0)) for row in products),
+        "removed_stock": sum(int(row.get("removed", 0)) for row in products),
+        "other_legacy_stock": sum(int(row.get("other_legacy", 0)) for row in products),
+        "accounted_stock": sum(int(row.get("accounted_total", 0)) for row in products),
         "manager_earning_usdt": manager_earning_usdt,
         "paid_usdt": paid_usdt,
         "payable_due_usdt": payable_due,
