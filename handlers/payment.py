@@ -40,7 +40,12 @@ logger = logging.getLogger(__name__)
 
 USDT_PAYMENT_QUANT = Decimal("0.001")
 USDT_LEGACY_PAYMENT_QUANT = Decimal("0.000001")
-MANUAL_USDT_HASH_TOLERANCE = Decimal("0.01")
+MANUAL_USDT_BEP20_HASH_TOLERANCE = Decimal("0.01")
+MANUAL_USDT_POLYGON_HASH_TOLERANCE = Decimal("0.07")
+
+
+def _manual_usdt_hash_tolerance_for_network(network: str | None) -> Decimal:
+    return MANUAL_USDT_POLYGON_HASH_TOLERANCE if normalize_usdt_network(network) == "polygon" else MANUAL_USDT_BEP20_HASH_TOLERANCE
 
 
 def _decimal_usdt(value) -> Decimal | None:
@@ -645,6 +650,7 @@ async def _try_auto_confirm_submitted_usdt_hash(
     ref_id = str(pending.get("ref_id") or "")
     user_id = int(pending.get("user_id") or update.effective_user.id)
     network = _usdt_network_for_pending(pending)
+    tolerance = _manual_usdt_hash_tolerance_for_network(network)
     try:
         wallet = await _get_usdt_wallet_for_pending(pending)
         min_ts = db.created_at_to_timestamp(pending.get("created_at"))
@@ -654,7 +660,7 @@ async def _try_auto_confirm_submitted_usdt_hash(
             wallet_address=wallet,
             network=network,
             min_timestamp=min_ts,
-            amount_tolerance=MANUAL_USDT_HASH_TOLERANCE,
+            amount_tolerance=tolerance,
         )
     except Exception as exc:
         logger.exception("Manual USDT tx-hash auto-check crashed ref=%s hash=%s: %s", ref_id, txn_hash, exc)
@@ -669,7 +675,7 @@ async def _try_auto_confirm_submitted_usdt_hash(
 
     if not result.found:
         reason = public_usdt_error_text(result.errors)
-        extra = {"expected_usdt": pending.get("unique_usdt") or pending.get("expected_usdt"), "tolerance_usdt": MANUAL_USDT_HASH_TOLERANCE}
+        extra = {"expected_usdt": pending.get("unique_usdt") or pending.get("expected_usdt"), "tolerance_usdt": tolerance}
         received_usdt = extract_usdt_received_amount_from_error(result.errors)
         if received_usdt:
             extra["received_usdt"] = received_usdt

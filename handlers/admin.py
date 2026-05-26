@@ -33,6 +33,7 @@ Admin Commands:
 from datetime import datetime, timezone
 import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import ContextTypes
 from utils.messages import admin_commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text, aggregate_amount_text
 from utils.admin_notify import send_admin_message, send_admin_photo
@@ -147,6 +148,25 @@ def _is_primary_owner_admin(user_id: int | None) -> bool:
         return False
 
 
+def _is_user_delivery_block_error(exc: Exception) -> bool:
+    """True for Telegram errors that mean the user chat is no longer reachable."""
+    if isinstance(exc, Forbidden):
+        return True
+    if isinstance(exc, BadRequest):
+        text = str(exc or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "chat not found",
+                "user is deactivated",
+                "bot was blocked",
+                "bot can't initiate conversation",
+                "bot was kicked",
+            )
+        )
+    return False
+
+
 async def _notify_owner_stock_upload_rejection(bot, *, product_name: str, admin_user, accepted_count: int, rejected_items: list[str]) -> int:
     """Keep rejected stock-manager uploads inside WebAdmin.
 
@@ -195,6 +215,7 @@ async def _notify_active_users(
         try:
             message = await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=markup)
             sent += 1
+            await db.mark_user_delivery_success(user_id, source="stock_notification")
             if cleanup_previous_stock_notification:
                 new_message_id = getattr(message, "message_id", None)
                 if previous_message_id and previous_message_id != new_message_id:
@@ -204,7 +225,9 @@ async def _notify_active_users(
                         pass
                 if new_message_id:
                     await db.save_user_product_notification_message(user_id, clean_product_name or product_name, int(new_message_id), "new_stock")
-        except Exception:
+        except Exception as exc:
+            if _is_user_delivery_block_error(exc):
+                await db.mark_user_delivery_failure(user_id, source="stock_notification", error=str(exc))
             continue
     return sent
 
@@ -1460,8 +1483,11 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             sent += 1
-        except Exception:
+            await db.mark_user_delivery_success(user_id, source="broadcast")
+        except Exception as exc:
             failed += 1
+            if _is_user_delivery_block_error(exc):
+                await db.mark_user_delivery_failure(user_id, source="broadcast", error=str(exc))
 
     if maintenance_on:
         # Admin/tester IDs should receive test broadcasts during maintenance even
@@ -1474,8 +1500,11 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
                 sent += 1
-            except Exception:
+                await db.mark_user_delivery_success(user_id, source="broadcast")
+            except Exception as exc:
                 failed += 1
+                if _is_user_delivery_block_error(exc):
+                    await db.mark_user_delivery_failure(user_id, source="broadcast", error=str(exc))
         await update.message.reply_text(
             f"🛠 Maintenance mode is ON. Broadcast sent only to admin/tester IDs and not queued for normal users.\n✅ Sent: {sent}\n❌ Failed: {failed}"
         )

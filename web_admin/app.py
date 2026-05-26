@@ -3558,8 +3558,8 @@ def register_routes(app: Flask) -> None:
         if not user:
             flash("User not found. Ask them to press /start first.", "error")
             return redirect(url_for("users"))
-        if user.get("blocked"):
-            flash("This user is blocked. Unblock them before sending stock.", "error")
+        if user.get("blocked") and user.get("blocked_manually"):
+            flash("This user is manually blocked. Unblock them before sending stock.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
         product_name = (request.form.get("product_name", "") or "").strip()
@@ -3678,6 +3678,7 @@ def register_routes(app: Flask) -> None:
             caption=delivery_caption(order, lang=lang),
         )
         if sent:
+            mark_user_delivery_success(app.db, user_id, source="admin_stock_document")
             record_order_delivery_message(
                 app.db,
                 order["order_id"],
@@ -3710,8 +3711,8 @@ def register_routes(app: Flask) -> None:
         if not user:
             flash("User not found. Ask them to press /start first.", "error")
             return redirect(url_for("users"))
-        if user.get("blocked"):
-            flash("This user is blocked. Unblock them before sending a replacement.", "error")
+        if user.get("blocked") and user.get("blocked_manually"):
+            flash("This user is manually blocked. Unblock them before sending a replacement.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
         product_name = (request.form.get("product_name", "") or "").strip()
@@ -3829,6 +3830,7 @@ def register_routes(app: Flask) -> None:
             caption=delivery_caption(order, lang=lang),
         )
         if sent:
+            mark_user_delivery_success(app.db, user_id, source="manual_replacement_document")
             record_order_delivery_message(
                 app.db,
                 order["order_id"],
@@ -3861,8 +3863,8 @@ def register_routes(app: Flask) -> None:
         if not user:
             flash("User not found. Ask them to press /start first.", "error")
             return redirect(url_for("users"))
-        if user.get("blocked"):
-            flash("This user is blocked. Unblock them before sending a message.", "error")
+        if user.get("blocked") and user.get("blocked_manually"):
+            flash("This user is manually blocked. Unblock them before sending a message.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
         lang = lang_from_user(user)
         normalized_lang = normalize_lang(lang)
@@ -3882,7 +3884,12 @@ def register_routes(app: Flask) -> None:
             flash("Maintenance mode is ON. Direct user message skipped for this normal user and not queued.", "info")
             return redirect(url_for("user_detail", user_id=user_id))
         prefix = admin_panel_message_prefix("direct", lang)
-        ok = send_telegram_message(user_id, f"{prefix}\n\n{message}")
+        status = send_telegram_message_status(user_id, f"{prefix}\n\n{message}")
+        ok = bool(status.get("ok"))
+        if ok:
+            mark_user_delivery_success(app.db, user_id, source="direct_message")
+        elif status.get("blocked"):
+            mark_user_delivery_failure(app.db, user_id, source="direct_message", error=str(status.get("error") or ""))
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
         flash(f"Message sent to {user_label}." if ok else f"Message could not be sent to {user_label}. Check Secret Settings → Bot token and whether the user has started the bot.", "success" if ok else "error")
         return redirect(url_for("user_detail", user_id=user_id))
@@ -3895,7 +3902,7 @@ def register_routes(app: Flask) -> None:
         blocked = request.form.get("blocked") == "1"
         user = app.db.users.find_one({"user_id": user_id}) or {}
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
-        app.db.users.update_one({"user_id": user_id}, {"$set": {"blocked": blocked}}, upsert=False)
+        set_user_manual_block(app.db, user_id, blocked)
         send_telegram_message(user_id, "🚫 You have been blocked from this bot." if blocked else "✅ You have been unblocked. You can use the bot again.")
         flash(f"{user_label} blocked." if blocked else f"{user_label} unblocked.", "success")
         return redirect(request.referrer or url_for("users"))
@@ -8178,6 +8185,115 @@ def flush_maintenance_notifications(db) -> dict[str, int]:
     return {"processed": processed, "sent": sent}
 
 
+def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") -> None:
+    """Mark a user reachable after a successful Telegram send.
+
+    Only auto delivery blocks are cleared; explicit admin blocks remain blocked.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return
+    now = utcnow()
+    db.users.update_one(
+        {
+            "user_id": uid,
+            "$or": [
+                {"blocked_manually": {"$ne": True}},
+                {"blocked_by_delivery": True},
+                {"blocked_reason": "delivery_failed"},
+            ],
+        },
+        {
+            "$set": {
+                "blocked": False,
+                "blocked_by_delivery": False,
+                "telegram_delivery_status": "active",
+                "last_message_delivered_at": now,
+                "last_delivery_source": str(source or "telegram"),
+            },
+            "$unset": {"blocked_reason": "", "last_delivery_error": ""},
+        },
+    )
+
+
+def mark_user_delivery_failure(db, user_id: int, *, source: str = "telegram", error: str = "") -> None:
+    """Auto-mark a user blocked when Telegram says the chat cannot receive DMs."""
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return
+    now = utcnow()
+    db.users.update_one(
+        {"user_id": uid, "blocked_manually": {"$ne": True}},
+        {
+            "$set": {
+                "blocked": True,
+                "blocked_by_delivery": True,
+                "blocked_reason": "delivery_failed",
+                "telegram_delivery_status": "blocked",
+                "last_message_failed_at": now,
+                "last_delivery_source": str(source or "telegram"),
+                "last_delivery_error": str(error or "Telegram delivery failed")[:500],
+            }
+        },
+    )
+
+
+def set_user_manual_block(db, user_id: int, blocked: bool) -> None:
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return
+    now = utcnow()
+    if blocked:
+        update = {
+            "$set": {
+                "blocked": True,
+                "blocked_manually": True,
+                "blocked_by_delivery": False,
+                "blocked_reason": "admin",
+                "blocked_at": now,
+                "telegram_delivery_status": "blocked_by_admin",
+            }
+        }
+    else:
+        update = {
+            "$set": {
+                "blocked": False,
+                "blocked_manually": False,
+                "blocked_by_delivery": False,
+                "telegram_delivery_status": "active_by_admin",
+                "unblocked_at": now,
+            },
+            "$unset": {"blocked_reason": "", "last_delivery_error": ""},
+        }
+    db.users.update_one({"user_id": uid}, update, upsert=False)
+
+
+def _is_telegram_delivery_block_response(status_code: int | None, description: str) -> bool:
+    desc = str(description or "").lower()
+    if int(status_code or 0) not in {400, 403}:
+        return False
+    return any(
+        marker in desc
+        for marker in (
+            "bot was blocked",
+            "blocked by the user",
+            "user is deactivated",
+            "chat not found",
+            "bot can't initiate conversation",
+            "bot was kicked",
+        )
+    )
+
+
 def product_notify_markup(product_name: str, lang: str = "en", product_id: Any | None = None) -> dict:
     callback_data = f"product_id:{product_id}" if product_id else f"product:{product_name}"
     return {"inline_keyboard": [[{"text": tr(lang, "btn_buy_now"), "callback_data": callback_data}]]}
@@ -8271,15 +8387,19 @@ def notify_active_users(
                 previous_message_id = int((previous or {}).get("message_id") or 0) or None
             except Exception:
                 previous_message_id = None
-        result = send_telegram_message_result(user_id, body, parse_mode=parse_mode, reply_markup=markup)
+        status = send_telegram_message_status(user_id, body, parse_mode=parse_mode, reply_markup=markup)
+        result = status.get("result") if status.get("ok") else False
         new_message_id = _telegram_result_message_id(result)
         if result:
             sent += 1
+            mark_user_delivery_success(db, user_id, source="stock_notification")
             if cleanup_previous_stock_notification:
                 if previous_message_id and previous_message_id != new_message_id:
                     delete_telegram_message(user_id, previous_message_id)
                 if new_message_id:
                     _save_product_notification(db, user_id, clean_product_name or product_name, new_message_id, "new_stock")
+        elif status.get("blocked"):
+            mark_user_delivery_failure(db, user_id, source="stock_notification", error=str(status.get("error") or ""))
     return sent
 
 
@@ -8369,10 +8489,10 @@ def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, ol
         return notify_active_users(db, text_for, product_name=product_name, admin_only=True)
     return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins)
 
-def send_telegram_message_result(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict | bool:
+def send_telegram_message_status(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
     bot_token = get_bot_token()
     if not bot_token or not chat_id:
-        return False
+        return {"ok": False, "blocked": False, "error": "Missing bot token or chat ID"}
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -8382,10 +8502,21 @@ def send_telegram_message_result(chat_id: int, text: str, parse_mode: str | None
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=15)
         payload_resp = resp.json() if resp.content else {}
         if resp.ok and payload_resp.get("ok"):
-            return payload_resp.get("result") or {"ok": True}
-        return False
-    except Exception:
-        return False
+            return {"ok": True, "result": payload_resp.get("result") or {"ok": True}, "blocked": False}
+        description = str(payload_resp.get("description") or resp.text or "Telegram delivery failed")
+        return {
+            "ok": False,
+            "blocked": _is_telegram_delivery_block_response(resp.status_code, description),
+            "error": description,
+            "status_code": resp.status_code,
+        }
+    except Exception as exc:
+        return {"ok": False, "blocked": False, "error": str(exc)}
+
+
+def send_telegram_message_result(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict | bool:
+    status = send_telegram_message_status(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    return status.get("result") if status.get("ok") else False
 
 
 def send_telegram_message(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool:

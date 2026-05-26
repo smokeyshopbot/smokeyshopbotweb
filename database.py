@@ -327,21 +327,48 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
     db = get_db()
     username = (username or "").strip().lstrip("@")
     existing = await db.users.find_one({"user_id": user_id})
+    now = datetime.now(timezone.utc)
     if existing:
+        set_updates: dict[str, Any] = {"last_user_interaction_at": now}
+        unset_updates: dict[str, str] = {}
         if username and existing.get("username") != username:
-            await db.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"username": username, "username_updated_at": datetime.now(timezone.utc)}},
-            )
+            set_updates["username"] = username
+            set_updates["username_updated_at"] = now
             existing["username"] = username
+
+        # If the user was auto-marked blocked only because Telegram delivery
+        # failed earlier, any new inbound message means the chat is reachable
+        # again. Do not clear an explicit admin/manual block.
+        if existing.get("blocked") and existing.get("blocked_by_delivery") and not existing.get("blocked_manually"):
+            set_updates.update({
+                "blocked": False,
+                "blocked_by_delivery": False,
+                "telegram_delivery_status": "active_by_interaction",
+                "last_message_delivered_at": now,
+            })
+            unset_updates["blocked_reason"] = ""
+            unset_updates["last_delivery_error"] = ""
+            existing["blocked"] = False
+            existing["blocked_by_delivery"] = False
+            existing.pop("blocked_reason", None)
+            existing.pop("last_delivery_error", None)
+
+        update_doc: dict[str, Any] = {"$set": set_updates}
+        if unset_updates:
+            update_doc["$unset"] = unset_updates
+        await db.users.update_one({"user_id": user_id}, update_doc)
+        existing.update(set_updates)
         return existing
     doc = {
         "user_id": user_id,
         "username": username,
         "blocked": False,
+        "blocked_manually": False,
+        "blocked_by_delivery": False,
         "wallet_inr": 0.0,
         "wallet_usdt": 0.0,
-        "joined_at": datetime.now(timezone.utc),
+        "joined_at": now,
+        "last_user_interaction_at": now,
         "language": None,
         "language_selected": False,
     }
@@ -407,8 +434,92 @@ async def get_language_settings() -> dict:
 
 
 async def set_blocked(user_id: int, blocked: bool):
+    now = datetime.now(timezone.utc)
+    if blocked:
+        update = {
+            "$set": {
+                "blocked": True,
+                "blocked_manually": True,
+                "blocked_by_delivery": False,
+                "blocked_reason": "admin",
+                "blocked_at": now,
+                "telegram_delivery_status": "blocked_by_admin",
+            }
+        }
+    else:
+        update = {
+            "$set": {
+                "blocked": False,
+                "blocked_manually": False,
+                "blocked_by_delivery": False,
+                "telegram_delivery_status": "active_by_admin",
+                "unblocked_at": now,
+            },
+            "$unset": {"blocked_reason": "", "last_delivery_error": ""},
+        }
+    await get_db().users.update_one({"user_id": user_id}, update)
+
+
+async def mark_user_delivery_success(user_id: int, *, source: str = "telegram") -> None:
+    """Mark a user reachable after a successful Telegram send.
+
+    This clears only auto delivery blocks. Explicit admin blocks are preserved.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return
+    now = datetime.now(timezone.utc)
     await get_db().users.update_one(
-        {"user_id": user_id}, {"$set": {"blocked": blocked}}
+        {
+            "user_id": uid,
+            "$or": [
+                {"blocked_manually": {"$ne": True}},
+                {"blocked_by_delivery": True},
+                {"blocked_reason": "delivery_failed"},
+            ],
+        },
+        {
+            "$set": {
+                "blocked": False,
+                "blocked_by_delivery": False,
+                "telegram_delivery_status": "active",
+                "last_message_delivered_at": now,
+                "last_delivery_source": str(source or "telegram"),
+            },
+            "$unset": {"blocked_reason": "", "last_delivery_error": ""},
+        },
+    )
+
+
+async def mark_user_delivery_failure(user_id: int, *, source: str = "telegram", error: str = "") -> None:
+    """Auto-mark a user blocked when Telegram rejects delivery.
+
+    The WebAdmin users list already reads the ``blocked`` field for its status
+    pill, so stock/broadcast delivery failures become visible immediately.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return
+    now = datetime.now(timezone.utc)
+    await get_db().users.update_one(
+        {"user_id": uid, "blocked_manually": {"$ne": True}},
+        {
+            "$set": {
+                "blocked": True,
+                "blocked_by_delivery": True,
+                "blocked_reason": "delivery_failed",
+                "telegram_delivery_status": "blocked",
+                "last_message_failed_at": now,
+                "last_delivery_source": str(source or "telegram"),
+                "last_delivery_error": str(error or "Telegram delivery failed")[:500],
+            }
+        },
     )
 
 
