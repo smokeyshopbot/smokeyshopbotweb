@@ -8182,6 +8182,52 @@ def product_notify_markup(product_name: str, lang: str = "en", product_id: Any |
     callback_data = f"product_id:{product_id}" if product_id else f"product:{product_name}"
     return {"inline_keyboard": [[{"text": tr(lang, "btn_buy_now"), "callback_data": callback_data}]]}
 
+def _product_notification_key(product_name: Any) -> str:
+    return str(product_name or "").strip().lower()
+
+
+def _last_product_notification(db, user_id: int, product_name: str, kind: str = "new_stock") -> dict | None:
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    key = _product_notification_key(product_name)
+    if not uid or not key:
+        return None
+    return db.user_product_notifications.find_one(
+        {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
+        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1},
+    )
+
+
+def _save_product_notification(db, user_id: int, product_name: str, message_id: int, kind: str = "new_stock") -> None:
+    try:
+        uid = int(user_id or 0)
+        mid = int(message_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+        mid = 0
+    key = _product_notification_key(product_name)
+    if not uid or not mid or not key:
+        return
+    now = datetime.now(timezone.utc)
+    db.user_product_notifications.update_one(
+        {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
+        {
+            "$set": {
+                "user_id": uid,
+                "product_name": str(product_name or "").strip(),
+                "product_key": key,
+                "kind": str(kind or "new_stock"),
+                "message_id": mid,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
 def notify_active_users(
     db,
     text,
@@ -8190,11 +8236,13 @@ def notify_active_users(
     parse_mode: str = "HTML",
     admin_only: bool = False,
     include_admins: bool = True,
+    cleanup_previous_stock_notification: bool = False,
 ) -> int:
     sent = 0
     admin_ids = set(get_admin_ids(db))
-    product = db.products.find_one({"name": name_regex(product_name)}, {"_id": 1})
+    product = db.products.find_one({"name": name_regex(product_name)}, {"_id": 1, "name": 1})
     product_id = product.get("_id") if product else None
+    clean_product_name = str((product or {}).get("name") or product_name or "").strip()
     if admin_only:
         users = get_admin_recipient_users(db)
     else:
@@ -8215,9 +8263,23 @@ def notify_active_users(
             continue
         lang = lang_from_user(user)
         body = text(lang) if callable(text) else str(text)
-        markup = product_notify_markup(product_name, lang, product_id)
-        if send_telegram_message(user_id, body, parse_mode=parse_mode, reply_markup=markup):
+        markup = product_notify_markup(clean_product_name or product_name, lang, product_id)
+        previous_message_id = None
+        if cleanup_previous_stock_notification:
+            try:
+                previous = _last_product_notification(db, user_id, clean_product_name or product_name, "new_stock")
+                previous_message_id = int((previous or {}).get("message_id") or 0) or None
+            except Exception:
+                previous_message_id = None
+        result = send_telegram_message_result(user_id, body, parse_mode=parse_mode, reply_markup=markup)
+        new_message_id = _telegram_result_message_id(result)
+        if result:
             sent += 1
+            if cleanup_previous_stock_notification:
+                if previous_message_id and previous_message_id != new_message_id:
+                    delete_telegram_message(user_id, previous_message_id)
+                if new_message_id:
+                    _save_product_notification(db, user_id, clean_product_name or product_name, new_message_id, "new_stock")
     return sent
 
 
@@ -8270,8 +8332,8 @@ def notify_users_new_stock(db, product_name: str, available_stock: int | None = 
 
     if get_setting(db, "maintenance_mode", False):
         queue_maintenance_notification(db, "new_stock", clean_name, {"available_stock": available_stock})
-        return notify_active_users(db, text_for, product_name=clean_name, admin_only=True)
-    return notify_active_users(db, text_for, product_name=clean_name, include_admins=include_admins)
+        return notify_active_users(db, text_for, product_name=clean_name, admin_only=True, cleanup_previous_stock_notification=True)
+    return notify_active_users(db, text_for, product_name=clean_name, include_admins=include_admins, cleanup_previous_stock_notification=True)
 
 
 def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None, include_admins: bool = True) -> int:
@@ -8307,7 +8369,7 @@ def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, ol
         return notify_active_users(db, text_for, product_name=product_name, admin_only=True)
     return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins)
 
-def send_telegram_message(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool:
+def send_telegram_message_result(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict | bool:
     bot_token = get_bot_token()
     if not bot_token or not chat_id:
         return False
@@ -8318,7 +8380,29 @@ def send_telegram_message(chat_id: int, text: str, parse_mode: str | None = None
         payload["reply_markup"] = reply_markup
     try:
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=15)
-        return bool(resp.ok and resp.json().get("ok"))
+        payload_resp = resp.json() if resp.content else {}
+        if resp.ok and payload_resp.get("ok"):
+            return payload_resp.get("result") or {"ok": True}
+        return False
+    except Exception:
+        return False
+
+
+def send_telegram_message(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> bool:
+    return bool(send_telegram_message_result(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup))
+
+
+def delete_telegram_message(chat_id: int, message_id: int) -> bool:
+    bot_token = get_bot_token()
+    if not bot_token or not chat_id or not message_id:
+        return False
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/deleteMessage",
+            json={"chat_id": int(chat_id), "message_id": int(message_id)},
+            timeout=10,
+        )
+        return bool(resp.ok and (resp.json() if resp.content else {}).get("ok"))
     except Exception:
         return False
 

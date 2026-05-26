@@ -165,12 +165,14 @@ async def _notify_active_users(
     parse_mode: str = "HTML",
     admin_only: bool = False,
     include_admins: bool = True,
+    cleanup_previous_stock_notification: bool = False,
 ) -> int:
     users = await db.get_all_users()
     admin_ids = await _get_admin_id_set()
     sent = 0
     product = await db.get_product(product_name)
-    markup = _product_notify_markup(product, product_name)
+    clean_product_name = str((product or {}).get("name") or product_name or "").strip()
+    markup = _product_notify_markup(product, clean_product_name or product_name)
     for user in users:
         try:
             user_id = int(user.get("user_id", 0) or 0)
@@ -183,9 +185,25 @@ async def _notify_active_users(
             continue
         if not include_admins and is_admin_target:
             continue
+        previous_message_id = None
+        if cleanup_previous_stock_notification:
+            try:
+                previous = await db.get_user_product_notification_message(user_id, clean_product_name or product_name, "new_stock")
+                previous_message_id = int((previous or {}).get("message_id") or 0) or None
+            except Exception:
+                previous_message_id = None
         try:
-            await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=markup)
+            message = await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=markup)
             sent += 1
+            if cleanup_previous_stock_notification:
+                new_message_id = getattr(message, "message_id", None)
+                if previous_message_id and previous_message_id != new_message_id:
+                    try:
+                        await bot.delete_message(chat_id=user_id, message_id=previous_message_id)
+                    except Exception:
+                        pass
+                if new_message_id:
+                    await db.save_user_product_notification_message(user_id, clean_product_name or product_name, int(new_message_id), "new_stock")
         except Exception:
             continue
     return sent
@@ -288,8 +306,8 @@ async def notify_users_new_stock(bot, product_name: str, available_stock: int | 
     )
     if await db.is_maintenance_mode():
         await db.queue_maintenance_notification("new_stock", clean_name, {"available_stock": available_stock})
-        return await _notify_active_users(bot, text, product_name=clean_name, admin_only=True)
-    return await _notify_active_users(bot, text, product_name=clean_name, include_admins=include_admins)
+        return await _notify_active_users(bot, text, product_name=clean_name, admin_only=True, cleanup_previous_stock_notification=True)
+    return await _notify_active_users(bot, text, product_name=clean_name, include_admins=include_admins, cleanup_previous_stock_notification=True)
 
 
 async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None, include_admins: bool = True) -> int:

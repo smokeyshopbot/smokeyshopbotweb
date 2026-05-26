@@ -1682,6 +1682,63 @@ async def set_maintenance_mode(enabled: bool):
 async def is_maintenance_mode() -> bool:
     return bool(await get_setting("maintenance_mode", False))
 
+
+def _stock_notification_key(product_name: Any) -> str:
+    return str(product_name or "").strip().lower()
+
+
+async def get_user_product_notification_message(user_id: int, product_name: str, kind: str = "new_stock") -> dict | None:
+    """Return the last product-notification message sent to a user.
+
+    This is used only for cleanup of product stock notifications. Order,
+    payment, wallet, and delivery messages are never touched.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    key = _stock_notification_key(product_name)
+    if not uid or not key:
+        return None
+    return await get_db().user_product_notifications.find_one(
+        {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
+        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1},
+    )
+
+
+async def save_user_product_notification_message(
+    user_id: int,
+    product_name: str,
+    message_id: int,
+    kind: str = "new_stock",
+) -> None:
+    """Remember the latest product stock notification message for cleanup."""
+    try:
+        uid = int(user_id or 0)
+        mid = int(message_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+        mid = 0
+    key = _stock_notification_key(product_name)
+    if not uid or not mid or not key:
+        return
+    now = datetime.now(timezone.utc)
+    await get_db().user_product_notifications.update_one(
+        {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
+        {
+            "$set": {
+                "user_id": uid,
+                "product_name": str(product_name or "").strip(),
+                "product_key": key,
+                "kind": str(kind or "new_stock"),
+                "message_id": mid,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
 # ─────────────────────── MAINTENANCE NOTIFICATION QUEUE ────────────────────
 
 async def queue_maintenance_notification(kind: str, product_name: str, payload: dict | None = None):
