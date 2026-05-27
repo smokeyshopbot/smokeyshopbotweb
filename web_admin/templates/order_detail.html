@@ -86,6 +86,78 @@
   <div><span>Created</span><strong>{{ fmt_dt(order.created_at) }}</strong></div>
   <div><span>Delivered</span><strong>{{ fmt_dt(order.delivered_at) }}</strong></div>
 </section>
+{% if order.status == 'pending_stock' and current_admin_role in ['owner','orders_manager'] %}
+<section class="panel" id="cancel-pending-stock">
+  <h2>Cancel pending-stock order</h2>
+  <p class="muted">Use this when stock will not be available, customer requested cancellation, or the order was created by mistake. Choose exactly which refund options the user should receive.</p>
+  <form method="post" action="{{ url_for('cancel_pending_stock_order', order_id=order.order_id) }}" class="stack-form" data-confirm-order-action data-order-action="cancel_pending_stock" data-order-ref="{{ order.order_id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Cancel reason
+      <select name="cancel_mode" required>
+        <option value="no_stock">No stock available / will not restock</option>
+        <option value="customer_request">Customer requested cancellation</option>
+        <option value="created_by_mistake">Created by mistake</option>
+        <option value="other">Other</option>
+      </select>
+    </label>
+    <div class="form-check-grid refund-option-grid">
+      <label class="check-card refund-option-card">
+        <input type="checkbox" name="offer_wallet_credit" value="1" {% if not order.admin_created_order and order.payment_method not in ['admin_created_order','admin_stock','replacement','admin','manual'] %}checked{% endif %}>
+        <span>
+          <strong>Show “Add to wallet” button</strong>
+          <small>User can add the refundable amount to their bot wallet automatically.</small>
+        </span>
+      </label>
+      <label class="check-card refund-option-card">
+        <input type="checkbox" name="offer_refund_request" value="1" {% if not order.admin_created_order and order.payment_method not in ['admin_created_order','admin_stock','replacement','admin','manual'] %}checked{% endif %}>
+        <span>
+          <strong>Show “Request refund” button</strong>
+          <small>User sends refund address/details and it appears here for admin to pay manually.</small>
+        </span>
+      </label>
+    </div>
+    <p class="muted small-text">Leave both unchecked for admin-created mistakes or orders where no refund/wallet choice should be shown.</p>
+    <label>Admin note / refund note
+      <textarea name="cancel_note" rows="3" required placeholder="Example: No stock will be available. You may add the amount to wallet or request a manual refund."></textarea>
+    </label>
+    <button type="submit" class="danger">Cancel pending order</button>
+  </form>
+</section>
+{% endif %}
+{% if order.get('pending_stock_cancelled') or order.get('refund_status') %}
+<section class="panel">
+  <h2>Cancellation / refund status</h2>
+  <div class="detail-grid compact-detail-grid">
+    <div><span>Cancelled at</span><strong>{{ fmt_dt(order.cancelled_at) }}</strong></div>
+    <div><span>Cancelled by</span><strong>{{ order.cancelled_by or '—' }}</strong></div>
+    <div><span>Reason</span><strong>{{ (order.cancel_mode or '—').replace('_', ' ').title() }}</strong></div>
+    <div><span>Refund status</span><strong><span class="{{ status_badge_class(order.refund_status) }}">{{ status_label(order.refund_status) }}</span></strong></div>
+    <div><span>Refund amount</span><strong class="money-text">{{ order_refund_amount_text(order) }}</strong></div>
+    <div><span>User options</span><strong>{% if order.refund_status == 'waiting_user_choice' %}{% if order.refund_wallet_enabled %}Wallet{% endif %}{% if order.refund_wallet_enabled and order.refund_external_enabled %} + {% endif %}{% if order.refund_external_enabled %}Refund{% endif %}{% else %}—{% endif %}</strong></div>
+  </div>
+  {% if order.cancel_note %}<p><strong>Admin note:</strong> {{ order.cancel_note }}</p>{% endif %}
+  {% if order.refund_request_details %}
+    <h3>User refund details</h3>
+    <pre class="stock-item delivered-stock-item">{{ order.refund_request_details }}</pre>
+  {% endif %}
+  {% if order.refund_status == 'refund_requested' and current_admin_role in ['owner','payment_manager','orders_manager'] %}
+    <form method="post" action="{{ url_for('mark_order_refund_paid', order_id=order.order_id) }}" class="stack-form" data-confirm-order-action data-order-action="mark_refund_paid" data-order-ref="{{ order.order_id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Refund paid note
+        <textarea name="refund_paid_note" rows="2" placeholder="Tx hash / refund note / paid from wallet"></textarea>
+      </label>
+      <button type="submit" class="primary">Mark refund paid</button>
+    </form>
+  {% elif order.refund_status == 'wallet_credited' %}
+    <p class="success-text">This amount was automatically credited to the user's wallet at {{ fmt_dt(order.refund_wallet_credited_at) }}.</p>
+  {% elif order.refund_status == 'waiting_user_choice' %}
+    <p class="muted">Waiting for the user to choose wallet credit or external refund in the bot.</p>
+  {% elif order.refund_status == 'refund_paid' %}
+    <p class="success-text">Refund marked paid by {{ order.refund_paid_by or 'admin' }} at {{ fmt_dt(order.refund_paid_at) }}.</p>
+    {% if order.refund_paid_note %}<p><strong>Refund paid note:</strong> {{ order.refund_paid_note }}</p>{% endif %}
+  {% endif %}
+</section>
+{% endif %}
 {% if order.admin_stock_delivery and order.admin_stock_note %}
 <section class="panel">
   <h2>Admin note sent with order</h2>

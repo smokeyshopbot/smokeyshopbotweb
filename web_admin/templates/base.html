@@ -29,7 +29,12 @@
       </a>
       {% endif %}
       {% if can_access('users') %}<a href="{{ url_for('users') }}">Users</a>{% endif %}
-      {% if can_access('orders') %}<a href="{{ url_for('orders') }}">Recent Orders</a>{% endif %}
+      {% if can_access('orders') %}
+      <a href="{{ url_for('orders', filter='status:refund_requested') if pending_refund_request_count else url_for('orders') }}" class="nav-with-badge">
+        <span>Recent Orders</span>
+        {% if pending_refund_request_count %}<span class="nav-badge refund-request-badge refund-request-alert" title="{{ pending_refund_request_count }} refund request{{ '' if pending_refund_request_count == 1 else 's' }} pending">R{{ pending_refund_request_count }}</span>{% endif %}
+      </a>
+      {% endif %}
       {% if can_access('replacement_orders') %}<a href="{{ url_for('replacement_orders') }}">Recent Replacements</a>{% endif %}
       {% if can_access('pending_orders') %}
       <a href="{{ url_for('pending_orders') }}" class="nav-with-badge">
@@ -238,28 +243,32 @@
       const stockAlerts = OWNER_LIVE_NOTIFICATIONS ? Number(state.counts.product_stock_alerts || 0) : 0;
       const stockUploadRejections = OWNER_LIVE_NOTIFICATIONS ? Number(state.counts.stock_upload_rejections || 0) : 0;
       const payoutRequests = Number(state.counts.stock_manager_payout_requests || 0);
+      const refundRequests = Number(state.counts.refund_requests_pending || 0);
       const replacementReports = Number(state.counts.replacement_reports_pending || 0);
       const stockInfo = state.stock_alert || {};
       const stockSeverity = stockInfo.severity || (Number(state.counts.products_out_of_stock || 0) > 0 ? 'danger' : (stockAlerts > 0 ? 'warning' : ''));
       const stockTitle = Number(stockInfo.out_of_stock || 0) + ' out of stock, ' + Number(stockInfo.low_stock || 0) + ' low stock';
       const productsLink = document.querySelector('a[href="{{ url_for("products") }}"]');
+      const ordersLink = document.querySelector('a[href="{{ url_for("orders") }}"], a[href="{{ url_for("orders", filter="status:refund_requested") }}"]');
       const pendingLink = document.querySelector('a[href="{{ url_for("pending_orders") }}"]');
       const paymentsLink = document.querySelector('a[href="{{ url_for("payments") }}"]');
       const adminsLink = document.querySelector('a[href="{{ url_for("admins_panel") }}"]');
       const replacementsLink = document.querySelector('a[href="{{ url_for("replacements") }}"]');
       setNavBadge(productsLink, stockAlerts, stockSeverity ? 'stock-alert-' + stockSeverity : '', stockTitle, 'stock-alert-badge');
       setNavBadge(productsLink, stockUploadRejections, 'stock-rejection-alert', stockUploadRejections + ' rejected stock-manager upload log(s)', 'stock-rejection-badge', 'R');
+      if (ordersLink) ordersLink.setAttribute('href', refundRequests > 0 ? '{{ url_for("orders", filter="status:refund_requested") }}' : '{{ url_for("orders") }}');
+      setNavBadge(ordersLink, refundRequests, 'refund-request-alert', refundRequests + ' refund request(s) pending', 'refund-request-badge', 'R');
       setNavBadge(pendingLink, pendingStock);
       setNavBadge(paymentsLink, reviews);
       setNavBadge(adminsLink, payoutRequests);
       setNavBadge(replacementsLink, replacementReports);
-      const visibleImportant = OWNER_LIVE_NOTIFICATIONS ? ((productsLink ? (stockAlerts + stockUploadRejections) : 0) + (pendingLink ? pendingStock : 0) + (paymentsLink ? reviews : 0) + (adminsLink ? payoutRequests : 0) + (replacementsLink ? replacementReports : 0)) : 0;
+      const visibleImportant = OWNER_LIVE_NOTIFICATIONS ? ((productsLink ? (stockAlerts + stockUploadRejections) : 0) + (ordersLink ? refundRequests : 0) + (pendingLink ? pendingStock : 0) + (paymentsLink ? reviews : 0) + (adminsLink ? payoutRequests : 0) + (replacementsLink ? replacementReports : 0)) : 0;
       updateTitle(visibleImportant);
     }
 
     function setNavBadge(link, count, variantClass, title, badgeClass, prefix) {
       if (!link) return;
-      const selector = badgeClass ? '.nav-badge.' + badgeClass : '.nav-badge:not(.stock-rejection-badge):not(.stock-alert-badge)';
+      const selector = badgeClass ? '.nav-badge.' + badgeClass : '.nav-badge:not(.stock-rejection-badge):not(.stock-alert-badge):not(.refund-request-badge)';
       let badge = link.querySelector(selector);
       if (count > 0) {
         if (!badge) {
@@ -345,6 +354,11 @@
       const nextPayouts = Number(nextCounts.stock_manager_payout_requests || 0);
       if (nextPayouts > prevPayouts) {
         return 'New stock manager payout request (' + nextPayouts + ' pending).';
+      }
+      const prevRefunds = Number(prevCounts.refund_requests_pending || 0);
+      const nextRefunds = Number(nextCounts.refund_requests_pending || 0);
+      if (nextRefunds > prevRefunds) {
+        return 'New refund request submitted (' + nextRefunds + ' pending).';
       }
       const prevStock = Number(prevCounts.orders_pending_stock || 0);
       const nextStock = Number(nextCounts.orders_pending_stock || 0);
@@ -532,11 +546,13 @@
       const isRevoke = action === 'revoke';
       const isTransfer = action === 'transfer';
       const isReturnStock = action === 'return_stock';
-      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : (isReturnStock ? 'Add back to stock' : 'Confirm'))));
+      const isCancelPendingStock = action === 'cancel_pending_stock';
+      const isMarkRefundPaid = action === 'mark_refund_paid';
+      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : (isReturnStock ? 'Add back to stock' : (isCancelPendingStock ? 'Cancel pending order' : (isMarkRefundPaid ? 'Mark refund paid' : 'Confirm'))))));
 
       title.textContent = isRevoke
         ? 'Delete Telegram file and revoke?'
-        : (isTransfer ? 'Transfer revoked delivery?' : (isReturnStock ? 'Add revoked delivery back to stock?' : (label + ' order?')));
+        : (isTransfer ? 'Transfer revoked delivery?' : (isReturnStock ? 'Add revoked delivery back to stock?' : (isCancelPendingStock ? 'Cancel pending-stock order?' : (isMarkRefundPaid ? 'Mark refund paid?' : (label + ' order?')))));
       message.textContent = isExpire
         ? 'This will expire pending order ' + orderRef + '.'
         : (isRevoke
@@ -545,10 +561,14 @@
             ? 'This will send the exact revoked stock/items from ' + orderRef + ' to the corrected user and create a new delivery history record.'
             : (isReturnStock
               ? 'This will add the exact revoked stock/items from ' + orderRef + ' back to current stock. After this, the delivery cannot be transferred to another user.'
-              : 'This will resend the delivered product for order ' + orderRef + ' to the user.')));
+              : (isCancelPendingStock
+                ? 'This will stop automatic pending-stock delivery for order ' + orderRef + '. The user will receive only the refund/wallet buttons selected on the form.'
+                : (isMarkRefundPaid
+                  ? 'This will close the refund request for order ' + orderRef + ' as paid.'
+                  : 'This will resend the delivered product for order ' + orderRef + ' to the user.'))));
       submitButton.textContent = label;
-      submitButton.classList.toggle('danger', isExpire || isRevoke);
-      submitButton.classList.toggle('primary', !(isExpire || isRevoke));
+      submitButton.classList.toggle('danger', isExpire || isRevoke || isCancelPendingStock);
+      submitButton.classList.toggle('primary', !(isExpire || isRevoke || isCancelPendingStock));
       if (ref) ref.textContent = orderRef;
       if (kind) kind.textContent = label;
 

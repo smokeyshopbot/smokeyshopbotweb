@@ -12,13 +12,19 @@
   </div>
 </div>
 <section class="panel">
+  {% if pending_refund_request_count and filter_value != 'status:refund_requested' %}
+    <div class="inline-alert warning-alert">
+      <strong>{{ pending_refund_request_count }} refund request{{ '' if pending_refund_request_count == 1 else 's' }} pending.</strong>
+      <a href="{{ url_for('orders', filter='status:refund_requested') }}">Open refund requests</a>
+    </div>
+  {% endif %}
   <div class="toolbar">
     <form method="get" class="search-form">
       <input name="q" placeholder="{{ 'Order, user, username or product' if show_order_user_identity else 'Order or product' }}" value="{{ q }}">
       <select name="filter">
         <option value="" {% if not filter_value %}selected{% endif %}>All orders</option>
         <optgroup label="By status">
-          {% for s in ['pending','delivered','pending_stock','expired','failed'] %}<option value="status:{{ s }}" {% if filter_value == 'status:' ~ s %}selected{% endif %}>{{ status_label(s) }}</option>{% endfor %}
+          {% for s in ['pending','delivered','pending_stock','cancelled','refund_requested','awaiting_refund_choice','wallet_credited','refund_paid','expired','failed'] %}<option value="status:{{ s }}" {% if filter_value == 'status:' ~ s %}selected{% endif %}>{{ status_label(s) }}</option>{% endfor %}
         </optgroup>
         {% if methods %}
         <optgroup label="By payment method">
@@ -53,7 +59,9 @@
         <td class="center-cell status-cell"><span class="{{ status_badge_class(order.display_status or order.status) }}">{{ status_label(order.display_status or order.status) }}</span></td>
         <td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td>
         <td class="center-cell order-action-cell">
-          {% if order.status == 'pending' and (order.display_status or order.status) == 'pending' %}
+          {% if order.status == 'pending_stock' and current_admin_role in ['owner','orders_manager'] %}
+            <a class="small-button" href="{{ url_for('order_detail', order_id=order.order_id) }}#cancel-pending-stock">Cancel</a>
+          {% elif order.status == 'pending' and (order.display_status or order.status) == 'pending' %}
             <form method="post" action="{{ url_for('expire_order_now', order_id=order.order_id, status=status, q=q) }}" data-confirm-order-action data-order-action="expire" data-order-ref="{{ order.order_id }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="danger small-button">Expire</button>

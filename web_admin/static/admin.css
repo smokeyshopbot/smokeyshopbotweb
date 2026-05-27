@@ -222,6 +222,10 @@ code { background: #030712; border: 1px solid var(--line); border-radius: 6px; p
 .nav-badge.stock-alert-warning { background: var(--warning); color: #111827; }
 .nav-badge.stock-alert-danger { background: var(--danger); color: #fff; }
 .nav-badge.stock-rejection-alert { background: #8b5cf6; color: #fff; }
+.nav-badge.refund-request-alert { background: #f97316; color: #fff; }
+.inline-alert { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.inline-alert strong { color: var(--text); }
+.inline-alert.warning-alert { border-color: rgba(249, 115, 22, .45); background: rgba(249, 115, 22, .10); }
 .secondary-money { font-size: 1.25rem !important; margin-top: 2px !important; }
 .dynamic-price-form { grid-template-columns: minmax(220px, 2fr) repeat(auto-fit, minmax(190px, 1fr)) auto; }
 .price-mini-form { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)) auto; min-width: 240px; }
@@ -3764,4 +3768,40 @@ button.small-button,
 .preorder-enable-button input:not(:checked) + .preorder-enable-button-body .preorder-enabled-label,
 .preorder-enable-button input:checked + .preorder-enable-button-body .preorder-disabled-label {
   display: none;
+}
+
+/* Refund choice toggles on cancelled pending-stock orders */
+.form-check-grid.refund-option-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.refund-option-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, .28);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, .46);
+  cursor: pointer;
+}
+.refund-option-card input {
+  width: auto;
+  margin-top: 4px;
+  min-height: 0;
+}
+.refund-option-card small {
+  display: block;
+  color: var(--muted);
+  margin-top: 4px;
+  line-height: 1.35;
+}
+.small-text {
+  font-size: .92rem;
+}
+@media (max-width: 760px) {
+  .form-check-grid.refund-option-grid {
+    grid-template-columns: 1fr;
+  }
 }

@@ -189,10 +189,11 @@ ROLE_ENDPOINTS: dict[str, set[str]] = {
         "products", "product_manage", "add_stock", "remove_stock", "export_stock_csv",
     },
     ADMIN_ROLE_PAYMENT_MANAGER: {
-        "payments", "decide_payment", "tx_hash_logs", "legacy_payment_audit_redirect", "telegram_file",
+        "payments", "decide_payment", "tx_hash_logs", "legacy_payment_audit_redirect", "telegram_file", "order_detail", "mark_order_refund_paid",
     },
     ADMIN_ROLE_ORDERS_MANAGER: {
         "orders", "order_detail", "pending_orders", "expire_stale_orders_now", "expire_order_now", "resend_order", "revoke_order_delivery", "return_revoked_order_to_stock",
+        "cancel_pending_stock_order", "mark_order_refund_paid",
         "replacement_orders", "replacement_order_detail",
     },
 }
@@ -815,6 +816,7 @@ def create_app() -> Flask:
             "pending_review_count": 0,
             "pending_stock_order_count": 0,
             "pending_payout_request_count": 0,
+            "pending_refund_request_count": 0,
             "pending_replacement_report_count": 0,
             "product_stock_alert": {"count": 0, "low_stock": 0, "out_of_stock": 0, "severity": ""},
             "stock_upload_rejection_count": 0,
@@ -828,6 +830,7 @@ def create_app() -> Flask:
                 "pending_review_count": count_pending_payment_reviews(app.db),
                 "pending_stock_order_count": app.db.orders.count_documents({"status": "pending_stock"}),
                 "pending_payout_request_count": count_pending_stock_manager_payout_requests(app.db),
+                "pending_refund_request_count": count_pending_refund_requests(app.db),
                 "pending_replacement_report_count": count_pending_replacement_reports(app.db),
                 "product_stock_alert": get_product_stock_alert_summary(app.db),
                 "stock_upload_rejection_count": count_stock_upload_rejections(app.db),
@@ -873,6 +876,7 @@ def create_app() -> Flask:
             "user_status_badge_class": user_status_badge_class,
             "method_label": method_label,
             "order_amount_text": order_amount_text,
+            "order_refund_amount_text": order_refund_amount_text,
             "admin_ids": sidebar_state.get("admin_ids", []),
             "bot_token_configured": bool(sidebar_state.get("bot_token_configured")),
             "current_admin_role": current_admin_role(),
@@ -900,6 +904,7 @@ def create_app() -> Flask:
             "pending_payment_review_count": int(sidebar_state.get("pending_review_count") or 0),
             "pending_stock_order_count": int(sidebar_state.get("pending_stock_order_count") or 0),
             "pending_payout_request_count": int(sidebar_state.get("pending_payout_request_count") or 0),
+            "pending_refund_request_count": int(sidebar_state.get("pending_refund_request_count") or 0),
             "pending_replacement_report_count": int(sidebar_state.get("pending_replacement_report_count") or 0),
             "product_stock_alert": sidebar_state.get("product_stock_alert") or {"count": 0, "low_stock": 0, "out_of_stock": 0, "severity": ""},
             "stock_upload_rejection_count": int(sidebar_state.get("stock_upload_rejection_count") or 0),
@@ -1412,15 +1417,32 @@ def register_routes(app: Flask) -> None:
         refs = [str(row.get("order_id") or "") for row in rows if row.get("status") == "pending" and row.get("order_id")]
         if not refs:
             for row in rows:
-                row["display_status"] = "revoked" if row.get("delivery_revoked") else row.get("status")
+                refund_status = str(row.get("refund_status") or "").strip().lower()
+                if row.get("delivery_revoked"):
+                    row["display_status"] = "revoked"
+                elif refund_status == "refund_requested":
+                    row["display_status"] = "refund_requested"
+                elif refund_status == "waiting_user_choice":
+                    row["display_status"] = "awaiting_refund_choice"
+                elif refund_status in {"wallet_credited", "refund_paid"}:
+                    row["display_status"] = refund_status
+                else:
+                    row["display_status"] = row.get("status")
             return rows
         review_statuses = {"upi_submitted", "binance_submitted", "usdt_manual_submitted"}
         payment_rows = app.db.pending_payments.find({"ref_id": {"$in": refs}}, {"ref_id": 1, "status": 1})
         payment_status_by_ref = {str(row.get("ref_id") or ""): row.get("status") for row in payment_rows}
         for row in rows:
             status = row.get("status")
+            refund_status = str(row.get("refund_status") or "").strip().lower()
             if row.get("delivery_revoked"):
                 row["display_status"] = "revoked"
+            elif refund_status == "refund_requested":
+                row["display_status"] = "refund_requested"
+            elif refund_status == "waiting_user_choice":
+                row["display_status"] = "awaiting_refund_choice"
+            elif refund_status in {"wallet_credited", "refund_paid"}:
+                row["display_status"] = refund_status
             elif status == "pending" and payment_status_by_ref.get(str(row.get("order_id") or "")) in review_statuses:
                 row["display_status"] = "needs_review"
             else:
@@ -1447,6 +1469,7 @@ def register_routes(app: Flask) -> None:
                 "pending_payments": count_pending_payment_reviews(app.db),
                 "active_payment_currencies": get_active_payment_currencies(app.db),
                 "pending_stock": app.db.orders.count_documents({"status": "pending_stock"}),
+                "pending_refunds": count_pending_refund_requests(app.db),
                 "low_stock": low_stock_rows,
                 "recent_orders": recent_orders,
             }
@@ -1459,6 +1482,7 @@ def register_routes(app: Flask) -> None:
             pending_payments=int(state.get("pending_payments") or 0),
             active_payment_currencies=state.get("active_payment_currencies") or set(),
             pending_stock=int(state.get("pending_stock") or 0),
+            pending_refunds=int(state.get("pending_refunds") or 0),
             low_stock=state.get("low_stock") or [],
             recent_orders=state.get("recent_orders") or [],
         )
@@ -4022,11 +4046,18 @@ def register_routes(app: Flask) -> None:
                 if q.isdigit():
                     ors.append({"user_id": int(q)})
             query["$or"] = ors
-        valid_statuses = {"pending", "delivered", "pending_stock", "expired", "failed"}
+        valid_statuses = {"pending", "delivered", "pending_stock", "expired", "failed", "cancelled", "refund_requested", "awaiting_refund_choice", "wallet_credited", "refund_paid"}
         if status not in valid_statuses:
             status = ""
         if status:
-            query["status"] = status
+            if status == "refund_requested":
+                query["refund_status"] = "refund_requested"
+            elif status == "awaiting_refund_choice":
+                query["refund_status"] = "waiting_user_choice"
+            elif status in {"wallet_credited", "refund_paid"}:
+                query["refund_status"] = status
+            else:
+                query["status"] = status
         payment_settings = get_payment_settings(app.db)
         methods = sorted([
             m for m in app.db.orders.distinct("payment_method", {"is_replacement": {"$ne": True}})
@@ -4077,6 +4108,132 @@ def register_routes(app: Flask) -> None:
             log_admin_action(app.db, "order_expired", f"{ref_id} for {order_before.get('user_id')}")
         flash(message, "success" if ok else "error")
         return redirect(url_for("orders", filter=request.args.get("filter", ""), q=request.args.get("q", "")))
+
+    @app.post("/orders/<order_id>/cancel-pending-stock")
+    @login_required
+    @csrf_required
+    def cancel_pending_stock_order(order_id: str):
+        if current_admin_role() not in {ADMIN_ROLE_OWNER, ADMIN_ROLE_ORDERS_MANAGER}:
+            flash("Only owner/orders admin can cancel paid pending-stock orders.", "error")
+            return redirect(url_for("orders"))
+
+        ref_id = str(order_id or "").strip().upper()
+        order = app.db.orders.find_one({"order_id": ref_id}) if ref_id else None
+        if not order:
+            flash("Order not found.", "error")
+            return redirect(url_for("orders"))
+        if order.get("is_replacement"):
+            flash("Replacement orders cannot be cancelled here.", "error")
+            return redirect(url_for("replacement_order_detail", order_id=ref_id))
+        if order.get("status") != "pending_stock":
+            flash("Only Paid — Waiting for Stock orders can be cancelled here.", "error")
+            return redirect(url_for("order_detail", order_id=ref_id))
+
+        mode = str(request.form.get("cancel_mode") or "no_stock").strip().lower()
+        if mode not in {"no_stock", "customer_request", "created_by_mistake", "other"}:
+            mode = "other"
+        note = str(request.form.get("cancel_note") or "").strip()[:1000]
+        if not note:
+            flash("Add a cancellation note/reason.", "error")
+            return redirect(url_for("order_detail", order_id=ref_id))
+
+        offer_wallet_credit = bool(request.form.get("offer_wallet_credit"))
+        offer_refund_request = bool(request.form.get("offer_refund_request"))
+        refund_currency, refund_amount = order_refund_currency_amount(order)
+        has_refundable_amount = refund_currency in {"inr", "usdt"} and refund_amount > 0
+        if not has_refundable_amount:
+            offer_wallet_credit = False
+            offer_refund_request = False
+        refund_choice_enabled = bool(offer_wallet_credit or offer_refund_request)
+        now = utcnow()
+        cancelled_by = current_admin_username() or current_admin_role() or "owner"
+        update_set = {
+            "status": "cancelled",
+            "cancelled_at": now,
+            "cancelled_by": cancelled_by,
+            "cancelled_by_role": current_admin_role(),
+            "cancel_mode": mode,
+            "cancel_note": note,
+            "pending_stock_cancelled": True,
+            "refund_currency": refund_currency,
+            "refund_amount": round(refund_amount, 2),
+            "refund_wallet_enabled": bool(offer_wallet_credit),
+            "refund_external_enabled": bool(offer_refund_request),
+            "refund_updated_at": now,
+        }
+        if refund_choice_enabled:
+            update_set.update({
+                "refund_status": "waiting_user_choice",
+                "refund_choice_sent_at": now,
+            })
+        else:
+            update_set.update({
+                "refund_status": "not_eligible",
+                "refund_not_eligible_reason": "no_refund_options_selected" if has_refundable_amount else "no_refundable_amount",
+            })
+
+        updated = app.db.orders.find_one_and_update(
+            {"order_id": ref_id, "status": "pending_stock"},
+            {
+                "$set": update_set,
+                "$unset": {"delivery_lock_token": "", "delivery_lock_at": ""},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not updated:
+            flash("Order could not be cancelled. It may already have been delivered/cancelled by another process.", "error")
+            return redirect(url_for("order_detail", order_id=ref_id))
+
+        delete_payment_message(app.db, ref_id)
+        sent = False
+        user_id_value = int(updated.get("user_id", 0) or 0)
+        if refund_choice_enabled:
+            sent = send_cancelled_order_refund_choice(user_id_value, updated, note)
+        else:
+            sent = send_cancelled_order_notice(user_id_value, updated, note)
+        log_admin_action(app.db, "pending_stock_order_cancelled", f"{ref_id} mode={mode} refund_status={updated.get('refund_status')} wallet={bool(updated.get('refund_wallet_enabled'))} refund={bool(updated.get('refund_external_enabled'))} sent={bool(sent)} by={cancelled_by}")
+        if refund_choice_enabled:
+            enabled_labels = []
+            if updated.get("refund_wallet_enabled"):
+                enabled_labels.append("wallet credit")
+            if updated.get("refund_external_enabled"):
+                enabled_labels.append("refund request")
+            label_text = " and ".join(enabled_labels) or "refund"
+            flash(f"Order {ref_id} cancelled. User was sent {label_text} option(s)." if sent else f"Order {ref_id} cancelled, but Telegram notice could not be sent.", "success" if sent else "warning")
+        else:
+            flash(f"Order {ref_id} cancelled without user refund/wallet buttons." if sent else f"Order {ref_id} cancelled, but Telegram notice could not be sent.", "success" if sent else "warning")
+        return redirect(url_for("order_detail", order_id=ref_id))
+
+    @app.post("/orders/<order_id>/mark-refund-paid")
+    @login_required
+    @csrf_required
+    def mark_order_refund_paid(order_id: str):
+        if current_admin_role() not in {ADMIN_ROLE_OWNER, ADMIN_ROLE_PAYMENT_MANAGER, ADMIN_ROLE_ORDERS_MANAGER}:
+            flash("You do not have permission to close refund requests.", "error")
+            return redirect(url_for("orders"))
+        ref_id = str(order_id or "").strip().upper()
+        note = str(request.form.get("refund_paid_note") or "").strip()[:1000]
+        now = utcnow()
+        paid_by = current_admin_username() or current_admin_role() or "owner"
+        updated = app.db.orders.find_one_and_update(
+            {"order_id": ref_id, "refund_status": "refund_requested"},
+            {"$set": {
+                "refund_status": "refund_paid",
+                "refund_paid_at": now,
+                "refund_completed_at": now,
+                "refund_paid_by": paid_by,
+                "refund_paid_by_role": current_admin_role(),
+                "refund_paid_note": note,
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not updated:
+            flash("Refund request not found or already closed.", "error")
+            return redirect(url_for("order_detail", order_id=ref_id))
+        send_refund_paid_notice(int(updated.get("user_id", 0) or 0), updated, note)
+        log_admin_action(app.db, "refund_marked_paid", f"{ref_id} by={paid_by} note={note[:80]}")
+        flash(f"Refund for order {ref_id} marked as paid.", "success")
+        return redirect(url_for("order_detail", order_id=ref_id))
 
     @app.get("/orders/<order_id>")
     @login_required
@@ -4904,6 +5061,7 @@ def get_live_admin_state(db) -> dict:
     latest_payment_review = _max_mongo_value(db, "pending_payments", "reviewed_at", {"reviewed_at": {"$exists": True}})
     latest_payment_confirmed = _max_mongo_value(db, "pending_payments", "confirmed_at", {"confirmed_at": {"$exists": True}})
     latest_payout_request = _max_mongo_value(db, "stock_manager_payment_requests", "requested_at", {"status": "pending"})
+    latest_refund_request = _max_mongo_value(db, "orders", "refund_requested_at", {"refund_status": "refund_requested", "is_replacement": {"$ne": True}})
     latest_replacement_report = _max_mongo_value(db, "replacement_reports", "created_at", {"status": {"$in": ["pending", "reviewing", "approved", "replacement_ready"]}})
     latest_stock_upload_rejection = _max_mongo_value(db, "stock_upload_rejections", "created_at")
 
@@ -4916,6 +5074,7 @@ def get_live_admin_state(db) -> dict:
         "active_orders": _count_safe(db, "orders", {"status": {"$in": ["pending", "pending_stock"]}, "is_replacement": {"$ne": True}}),
         "payment_reviews": _count_safe(db, "pending_payments", review_query),
         "stock_manager_payout_requests": _count_safe(db, "stock_manager_payment_requests", {"status": "pending"}),
+        "refund_requests_pending": count_pending_refund_requests(db),
         "replacement_reports_pending": _count_safe(db, "replacement_reports", {"status": {"$in": ["pending", "reviewing", "approved", "replacement_ready"]}}),
         "replacement_reports_open": _count_safe(db, "replacement_reports", {"status": {"$in": ["pending", "reviewing", "approved", "replacement_ready"]}}),
         "waiting_payments": _count_safe(db, "pending_payments", {"status": "waiting"}),
@@ -4931,6 +5090,7 @@ def get_live_admin_state(db) -> dict:
         "payment_reviewed": _dt_or_number_signature(latest_payment_review),
         "payment_confirmed": _dt_or_number_signature(latest_payment_confirmed),
         "stock_manager_payout_request": _dt_or_number_signature(latest_payout_request),
+        "refund_request": _dt_or_number_signature(latest_refund_request),
         "replacement_report": _dt_or_number_signature(latest_replacement_report),
         "stock_upload_rejection": _dt_or_number_signature(latest_stock_upload_rejection),
     }
@@ -7419,6 +7579,13 @@ def count_pending_stock_manager_payout_requests(db) -> int:
     return db.stock_manager_payment_requests.count_documents({"status": "pending"})
 
 
+def count_pending_refund_requests(db) -> int:
+    return db.orders.count_documents({
+        "refund_status": "refund_requested",
+        "is_replacement": {"$ne": True},
+    })
+
+
 def manual_review_query() -> list[dict]:
     """Return conditions that identify payments handled by manual review.
 
@@ -9135,6 +9302,111 @@ def is_admin_created_order(order: dict | None) -> bool:
     return method in {"admin_created_order", "admin_created"} or "admin_created" in method
 
 
+def order_refund_currency_amount(order: dict | None) -> tuple[str, float]:
+    """Return the currency/amount that should be offered for a cancelled paid order."""
+    order = order or {}
+    currency = str(order.get("refund_currency") or "").strip().lower()
+    try:
+        amount = float(order.get("refund_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if currency in {"inr", "usdt"} and amount > 0:
+        return currency, round(amount, 2)
+
+    method = str(order.get("payment_method") or "").strip().lower()
+    try:
+        amount_inr = float(order.get("amount_inr") or 0)
+    except (TypeError, ValueError):
+        amount_inr = 0.0
+    try:
+        amount_usdt = float(order.get("amount_usdt") or 0)
+    except (TypeError, ValueError):
+        amount_usdt = 0.0
+    if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
+        return "inr", round(max(0.0, amount_inr), 2)
+    if amount_usdt > 0:
+        return "usdt", round(max(0.0, amount_usdt), 2)
+    return "inr", round(max(0.0, amount_inr), 2)
+
+
+def order_refund_amount_text(order: dict | None) -> str:
+    currency, amount = order_refund_currency_amount(order)
+    if currency == "inr":
+        return money_inr(amount)
+    return money_usdt(amount)
+
+
+def paid_user_order_refund_eligible(order: dict | None) -> bool:
+    """Only real paid user orders can get the user refund/wallet choice.
+
+    Admin-created/manual/replacement orders are deliberately excluded to avoid
+    fake credits/refund requests for orders made by mistake from WebAdmin.
+    """
+    if not order or order.get("is_replacement"):
+        return False
+    if is_admin_created_order(order) or order.get("admin_stock_delivery"):
+        return False
+    method = str(order.get("payment_method") or "").strip().lower()
+    if method in {"admin_created_order", "admin_stock", "replacement", "admin", "manual"}:
+        return False
+    currency, amount = order_refund_currency_amount(order)
+    return amount > 0 and currency in {"inr", "usdt"}
+
+
+def send_cancelled_order_refund_choice(user_id: int, order: dict, note: str = "") -> bool:
+    order_id = str(order.get("order_id") or "").strip().upper()
+    amount_text = order_refund_amount_text(order)
+    product = str(order.get("product_name") or "Product")
+    quantity = int(order.get("quantity", 0) or 0)
+    buttons = []
+    if order.get("refund_wallet_enabled"):
+        buttons.append([{"text": "💰 Add to wallet", "callback_data": f"refund_wallet:{order_id}"}])
+    if order.get("refund_external_enabled"):
+        buttons.append([{"text": "🔁 Request refund", "callback_data": f"refund_request:{order_id}"}])
+    if not buttons:
+        return send_cancelled_order_notice(user_id, order, note)
+    text = (
+        "❌ Your paid order was cancelled by admin.\n\n"
+        f"🧾 Order ID: {order_id}\n"
+        f"📦 Product: {product} x{quantity}\n"
+        f"💰 Amount: {amount_text}\n\n"
+    )
+    clean_note = str(note or "").strip()
+    if clean_note:
+        text += f"📝 Admin note: {clean_note[:500]}\n\n"
+    text += "Choose one of the available options below:"
+    reply_markup = {"inline_keyboard": buttons}
+    return send_telegram_message(int(user_id), text, reply_markup=reply_markup)
+
+def send_cancelled_order_notice(user_id: int, order: dict, note: str = "") -> bool:
+    order_id = str(order.get("order_id") or "").strip().upper()
+    product = str(order.get("product_name") or "Product")
+    quantity = int(order.get("quantity", 0) or 0)
+    text = (
+        "❌ Your pending-stock order was cancelled by admin.\n\n"
+        f"🧾 Order ID: {order_id}\n"
+        f"📦 Product: {product} x{quantity}"
+    )
+    clean_note = str(note or "").strip()
+    if clean_note:
+        text += f"\n\n📝 Admin note: {clean_note[:500]}"
+    text += "\n\nContact support if you need help."
+    return send_telegram_message(int(user_id), text)
+
+
+def send_refund_paid_notice(user_id: int, order: dict, note: str = "") -> bool:
+    order_id = str(order.get("order_id") or "").strip().upper()
+    text = (
+        "✅ Your refund was marked as paid by admin.\n\n"
+        f"🧾 Order ID: {order_id}\n"
+        f"💰 Amount: {order_refund_amount_text(order)}"
+    )
+    clean_note = str(note or "").strip()
+    if clean_note:
+        text += f"\n\n📝 Note: {clean_note[:500]}"
+    return send_telegram_message(int(user_id), text)
+
+
 def send_pending_stock_notice(user_id: int, order: dict, queued: bool = False) -> None:
     order_id = str(order.get("order_id", "N/A") or "N/A")
     try:
@@ -9475,16 +9747,22 @@ def status_label(status: str | None) -> str:
         "expired": "Expired",
         "confirmed": "Confirmed",
         "revoked": "Revoked",
+        "cancelled": "Cancelled",
+        "awaiting_refund_choice": "Awaiting Refund Choice",
+        "waiting_user_choice": "Awaiting Refund Choice",
+        "refund_requested": "Refund Requested",
+        "wallet_credited": "Wallet Credited",
+        "refund_paid": "Refund Paid",
     }.get((status or "unknown").lower(), str(status or "unknown").replace("_", " ").title())
 
 
 def status_badge_class(status: str | None) -> str:
     status_key = (status or "unknown").lower()
-    if status_key in {"delivered", "confirmed", "completed", "approved"}:
+    if status_key in {"delivered", "confirmed", "completed", "approved", "wallet_credited", "refund_paid"}:
         return "status-badge status-green"
-    if status_key in {"pending", "pending_stock", "needs_review", "waiting", "upi_submitted", "binance_submitted", "usdt_manual_submitted"}:
+    if status_key in {"pending", "pending_stock", "needs_review", "waiting", "upi_submitted", "binance_submitted", "usdt_manual_submitted", "awaiting_refund_choice", "waiting_user_choice", "refund_requested"}:
         return "status-badge status-yellow"
-    if status_key in {"failed", "expired", "rejected", "blocked", "revoked"}:
+    if status_key in {"failed", "expired", "rejected", "blocked", "revoked", "cancelled"}:
         return "status-badge status-red"
     return "status-badge status-neutral"
 

@@ -23,6 +23,7 @@
   <a class="card" href="{{ url_for('products') }}"><span>Products</span><strong>{{ stats.products_enabled }}/{{ stats.products_total }}</strong><small>{{ stats.total_stock }} stock units</small></a>
   <a class="card" href="{{ url_for('orders') }}"><span>Orders</span><strong>{{ stats.orders_total }}</strong><small>{{ stats.orders_delivered }} delivered</small></a>
   <a class="card" href="{{ url_for('pending_orders') }}"><span>Pending stock orders</span><strong>{{ pending_stock }}</strong><small>paid orders waiting</small></a>
+  <a class="card" href="{{ url_for('orders', filter='status:refund_requested') }}"><span>Refund requests</span><strong>{{ pending_refunds }}</strong><small>manual refunds pending</small></a>
   <a class="card" href="{{ url_for('payments') }}"><span>Payment review</span><strong>{{ pending_payments }}</strong><small>manual submissions</small></a>
   <div class="card">
     <span>Revenue / paid value</span>

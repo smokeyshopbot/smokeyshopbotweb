@@ -1606,6 +1606,136 @@ async def mark_order_pending_stock(order_id: str, *, delivery_token: str | None 
     return await update_order_status(order_id, "pending_stock", delivery_token=delivery_token)
 
 
+def _refund_currency_amount_from_order(order: dict | None) -> tuple[str, float]:
+    """Return the refundable wallet currency/amount for a paid user order."""
+    order = order or {}
+    currency = str(order.get("refund_currency") or "").strip().lower()
+    try:
+        amount = float(order.get("refund_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if currency in {"inr", "usdt"} and amount > 0:
+        return currency, round(amount, 2)
+
+    method = str(order.get("payment_method") or "").strip().lower()
+    try:
+        amount_inr = float(order.get("amount_inr") or 0)
+    except (TypeError, ValueError):
+        amount_inr = 0.0
+    try:
+        amount_usdt = float(order.get("amount_usdt") or 0)
+    except (TypeError, ValueError):
+        amount_usdt = 0.0
+
+    if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
+        return "inr", round(max(0.0, amount_inr), 2)
+    if amount_usdt > 0:
+        return "usdt", round(max(0.0, amount_usdt), 2)
+    return "inr", round(max(0.0, amount_inr), 2)
+
+
+async def get_refund_waiting_order_for_user(order_id: str, user_id: int) -> Optional[dict]:
+    """Fetch a cancelled order that is waiting for this user's refund/wallet choice."""
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return None
+    return await get_db().orders.find_one({
+        "order_id": clean_order_id,
+        "user_id": int(user_id),
+        "refund_status": "waiting_user_choice",
+    })
+
+
+async def credit_cancelled_order_refund_to_wallet(order_id: str, user_id: int) -> Optional[dict]:
+    """One-time credit of a cancelled paid order into the user's wallet.
+
+    The atomic order update is the idempotency lock; repeated button clicks do
+    not add money twice. Admin-created/manual orders never enter
+    refund_status='waiting_user_choice', so they cannot be credited here.
+    """
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return None
+    now = datetime.now(timezone.utc)
+    order = await get_db().orders.find_one_and_update(
+        {
+            "order_id": clean_order_id,
+            "user_id": int(user_id),
+            "refund_status": "waiting_user_choice",
+            "refund_wallet_enabled": {"$ne": False},
+            "$or": [
+                {"refund_wallet_credited_at": {"$exists": False}},
+                {"refund_wallet_credited_at": None},
+            ],
+        },
+        {
+            "$set": {
+                "refund_status": "wallet_credited",
+                "refund_choice": "wallet",
+                "refund_wallet_credited_at": now,
+                "refund_completed_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not order:
+        return None
+
+    currency, amount = _refund_currency_amount_from_order(order)
+    if amount <= 0:
+        await get_db().orders.update_one(
+            {"order_id": clean_order_id, "refund_status": "wallet_credited"},
+            {"$set": {"refund_status": "not_eligible", "refund_error": "No refundable amount was found."}},
+        )
+        return None
+
+    field = "wallet_inr" if currency == "inr" else "wallet_usdt"
+    await get_db().users.update_one({"user_id": int(user_id)}, {"$inc": {field: round(amount, 2)}}, upsert=True)
+    await get_db().orders.update_one(
+        {"order_id": clean_order_id},
+        {"$set": {"refund_currency": currency, "refund_amount": round(amount, 2)}},
+    )
+    order["refund_currency"] = currency
+    order["refund_amount"] = round(amount, 2)
+    return order
+
+
+async def submit_cancelled_order_refund_request(order_id: str, user_id: int, refund_details: str) -> Optional[dict]:
+    """Save a user's external refund details once and expose them in WebAdmin."""
+    clean_order_id = str(order_id or "").strip().upper()
+    details = str(refund_details or "").strip()[:1200]
+    if not clean_order_id or not details:
+        return None
+    now = datetime.now(timezone.utc)
+    updated = await get_db().orders.find_one_and_update(
+        {
+            "order_id": clean_order_id,
+            "user_id": int(user_id),
+            "refund_status": "waiting_user_choice",
+            "refund_external_enabled": {"$ne": False},
+            "$or": [
+                {"refund_requested_at": {"$exists": False}},
+                {"refund_requested_at": None},
+            ],
+        },
+        {
+            "$set": {
+                "refund_status": "refund_requested",
+                "refund_choice": "external_refund",
+                "refund_request_details": details,
+                "refund_requested_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated:
+        try:
+            await record_admin_activity("refund_requested", f"order={clean_order_id} user={int(user_id)}")
+        except Exception:
+            pass
+    return updated
+
+
 async def claim_pending_stock_notice(order_id: str) -> bool:
     """Claim the one-time pending-stock user notice for this order.
 
