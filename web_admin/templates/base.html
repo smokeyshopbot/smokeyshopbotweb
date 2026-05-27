@@ -548,24 +548,42 @@
       const isReturnStock = action === 'return_stock';
       const isCancelPendingStock = action === 'cancel_pending_stock';
       const isMarkRefundPaid = action === 'mark_refund_paid';
-      const label = isExpire ? 'Expire' : (isResend ? 'Resend' : (isRevoke ? 'Revoke' : (isTransfer ? 'Transfer' : (isReturnStock ? 'Add back to stock' : (isCancelPendingStock ? 'Cancel pending order' : (isMarkRefundPaid ? 'Mark refund paid' : 'Confirm'))))));
+      let label = 'Confirm';
+      let titleText = 'Confirm order action?';
+      let messageText = 'This will confirm the selected action for order ' + orderRef + '.';
 
-      title.textContent = isRevoke
-        ? 'Delete Telegram file and revoke?'
-        : (isTransfer ? 'Transfer revoked delivery?' : (isReturnStock ? 'Add revoked delivery back to stock?' : (isCancelPendingStock ? 'Cancel pending-stock order?' : (isMarkRefundPaid ? 'Mark refund paid?' : (label + ' order?')))));
-      message.textContent = isExpire
-        ? 'This will expire pending order ' + orderRef + '.'
-        : (isRevoke
-          ? 'This will try to delete the sent Telegram file/message for order ' + orderRef + ' and disable /getorder refetch. Telegram may refuse deletion after about 48 hours.'
-          : (isTransfer
-            ? 'This will send the exact revoked stock/items from ' + orderRef + ' to the corrected user and create a new delivery history record.'
-            : (isReturnStock
-              ? 'This will add the exact revoked stock/items from ' + orderRef + ' back to current stock. After this, the delivery cannot be transferred to another user.'
-              : (isCancelPendingStock
-                ? 'This will stop automatic pending-stock delivery for order ' + orderRef + '. The user will receive only the refund/wallet buttons selected on the form.'
-                : (isMarkRefundPaid
-                  ? 'This will close the refund request for order ' + orderRef + ' as paid.'
-                  : 'This will resend the delivered product for order ' + orderRef + ' to the user.'))));
+      if (isExpire) {
+        label = 'Expire';
+        titleText = 'Expire order?';
+        messageText = 'This will expire pending order ' + orderRef + '.';
+      } else if (isRevoke) {
+        label = 'Revoke';
+        titleText = 'Delete Telegram file and revoke?';
+        messageText = 'This will try to delete the sent Telegram file/message for order ' + orderRef + ' and disable /getorder refetch. Telegram may refuse deletion after about 48 hours.';
+      } else if (isTransfer) {
+        label = 'Transfer';
+        titleText = 'Transfer revoked delivery?';
+        messageText = 'This will send the exact revoked stock/items from ' + orderRef + ' to the corrected user and create a new delivery history record.';
+      } else if (isReturnStock) {
+        label = 'Add back to stock';
+        titleText = 'Add revoked delivery back to stock?';
+        messageText = 'This will add the exact revoked stock/items from ' + orderRef + ' back to current stock. After this, the delivery cannot be transferred to another user.';
+      } else if (isCancelPendingStock) {
+        label = 'Cancel pending order';
+        titleText = 'Cancel pending-stock order?';
+        messageText = 'This will stop automatic pending-stock delivery for order ' + orderRef + '. The user will receive only the refund/wallet buttons selected on the form.';
+      } else if (isMarkRefundPaid) {
+        label = 'Mark refund paid';
+        titleText = 'Mark refund paid?';
+        messageText = 'This will close the refund request for order ' + orderRef + ' as paid.';
+      } else if (isResend) {
+        label = 'Resend';
+        titleText = 'Resend order?';
+        messageText = 'This will resend the delivered product for order ' + orderRef + ' to the user.';
+      }
+
+      title.textContent = titleText;
+      message.textContent = messageText;
       submitButton.textContent = label;
       submitButton.classList.toggle('danger', isExpire || isRevoke || isCancelPendingStock);
       submitButton.classList.toggle('primary', !(isExpire || isRevoke || isCancelPendingStock));

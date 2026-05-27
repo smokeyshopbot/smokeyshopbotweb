@@ -37,6 +37,98 @@ def clear_shop_flow(user_id: int | str | None) -> None:
         return
     _shop_flow.pop(uid, None)
 
+
+# Track users who chose external refund and are entering address/details.
+_refund_detail_flow: dict[int, dict] = {}
+
+
+def clear_refund_flow(user_id: int | str | None) -> None:
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return
+    _refund_detail_flow.pop(uid, None)
+
+
+def is_refund_flow_active(user_id: int | str | None) -> bool:
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return False
+    return uid in _refund_detail_flow
+
+
+def _refund_currency_amount(order: dict | None) -> tuple[str, float]:
+    order = order or {}
+    currency = str(order.get("refund_currency") or "").strip().lower()
+    try:
+        amount = float(order.get("refund_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if currency in {"inr", "usdt"} and amount > 0:
+        return currency, round(amount, 2)
+    method = str(order.get("payment_method") or "").strip().lower()
+    try:
+        amount_inr = float(order.get("amount_inr") or 0)
+    except (TypeError, ValueError):
+        amount_inr = 0.0
+    try:
+        amount_usdt = float(order.get("amount_usdt") or 0)
+    except (TypeError, ValueError):
+        amount_usdt = 0.0
+    if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
+        return "inr", round(max(0.0, amount_inr), 2)
+    if amount_usdt > 0:
+        return "usdt", round(max(0.0, amount_usdt), 2)
+    return "inr", round(max(0.0, amount_inr), 2)
+
+
+def _refund_amount_text(order: dict | None) -> str:
+    currency, amount = _refund_currency_amount(order)
+    if currency == "inr":
+        return f"₹{amount:.2f}"
+    return f"${amount:.2f} USDT"
+
+
+def _refund_choice_keyboard(order: dict | None, lang: str = "en") -> InlineKeyboardMarkup | None:
+    """Return only the refund buttons that admin allowed for this cancelled order."""
+    order = order or {}
+    if str(order.get("refund_status") or "").strip().lower() != "waiting_user_choice":
+        return None
+    clean_order_id = str(order.get("order_id") or "").strip().upper()
+    if not clean_order_id:
+        return None
+    buttons: list[list[InlineKeyboardButton]] = []
+    if order.get("refund_wallet_enabled"):
+        buttons.append([InlineKeyboardButton(tr(lang, "refund_add_to_wallet"), callback_data=f"refund_wallet:{clean_order_id}")])
+    if order.get("refund_external_enabled"):
+        buttons.append([InlineKeyboardButton(tr(lang, "refund_request_external"), callback_data=f"refund_request:{clean_order_id}")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def _refund_status_message(order: dict | None, lang: str = "en") -> str:
+    refund_status = str((order or {}).get("refund_status") or "").strip().lower()
+    if refund_status == "waiting_user_choice":
+        return tr(lang, "cancelled_order_refund_available") if _refund_choice_keyboard(order, lang) else tr(lang, "cancelled_order_no_options")
+    if refund_status == "wallet_credited":
+        return tr(lang, "cancelled_order_wallet_credited")
+    if refund_status == "refund_requested":
+        return tr(lang, "cancelled_order_refund_requested")
+    if refund_status == "refund_paid":
+        return tr(lang, "cancelled_order_refund_paid")
+    return tr(lang, "cancelled_order_no_options")
+
+
+def _is_cancelled_pending_stock_order(order: dict | None) -> bool:
+    order = order or {}
+    return bool(order.get("pending_stock_cancelled")) or (
+        str(order.get("status") or "").strip().lower() == "cancelled"
+        and str(order.get("refund_status") or "").strip().lower() in {
+            "waiting_user_choice", "wallet_credited", "refund_requested", "refund_paid", "not_eligible"
+        }
+    )
+
+
 ORDERS_PAGE_SIZE = 10
 REPLACEMENTS_PAGE_SIZE = 10
 
@@ -461,6 +553,11 @@ def _status_emoji(status: str) -> str:
         "failed": "❌",
         "expired": "❌",
         "confirmed": "✅",
+        "cancelled": "❌",
+        "waiting_user_choice": "🔁",
+        "refund_requested": "🔁",
+        "wallet_credited": "✅",
+        "refund_paid": "✅",
         "revoked": "🚫",
     }.get((status or "").lower(), "❓")
 
@@ -475,6 +572,11 @@ def _status_label(status: str, lang: str = "en") -> str:
         "failed": "status_failed",
         "expired": "status_expired",
         "confirmed": "status_confirmed",
+        "cancelled": "status_cancelled",
+        "waiting_user_choice": "status_waiting_user_choice",
+        "refund_requested": "status_refund_requested",
+        "wallet_credited": "status_wallet_credited",
+        "refund_paid": "status_refund_paid",
         "revoked": "delivery_revoked",
     }.get((status or "unknown").lower())
     return tr(lang, key) if key else str(status or "unknown").replace("_", " ").title()
@@ -499,7 +601,19 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
     ]
     for order in orders:
         order_id = order.get("order_id", "N/A")
-        display_status = "revoked" if order.get("delivery_revoked") else order.get("status")
+        refund_status = str(order.get("refund_status") or "").strip().lower()
+        if order.get("delivery_revoked"):
+            display_status = "revoked"
+        elif refund_status == "waiting_user_choice":
+            display_status = "waiting_user_choice"
+        elif refund_status == "refund_requested":
+            display_status = "refund_requested"
+        elif refund_status == "wallet_credited":
+            display_status = "wallet_credited"
+        elif refund_status == "refund_paid":
+            display_status = "refund_paid"
+        else:
+            display_status = order.get("status")
         lines.extend([
             f"{tr(lang, 'order_id')}: `{order_id}`",
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}",
@@ -607,20 +721,40 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
     order_id = order.get("order_id", "N/A")
     product_name = order.get("product_name", "N/A")
     quantity = order.get("quantity", 0)
-    status = "revoked" if order.get("delivery_revoked") else order.get("status", "unknown")
+    refund_status = str(order.get("refund_status") or "").strip().lower()
+    if order.get("delivery_revoked"):
+        status = "revoked"
+    elif refund_status == "waiting_user_choice":
+        status = "waiting_user_choice"
+    elif refund_status == "refund_requested":
+        status = "refund_requested"
+    elif refund_status == "wallet_credited":
+        status = "wallet_credited"
+    elif refund_status == "refund_paid":
+        status = "refund_paid"
+    else:
+        status = order.get("status", "unknown")
     items = order.get("items", []) or []
     is_replacement = bool(order.get("is_replacement"))
     id_label = tr(lang, "replacement_id") if is_replacement else tr(lang, "order_id")
 
     if status != "delivered" or not items:
-        return (
+        details = (
             f"📦 *{id_label} `{order_id}`*\n\n"
             f"{tr(lang, 'product')}: *{product_name}* x{quantity}\n"
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
             f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
-            f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}\n\n"
-            f"{tr(lang, 'no_delivered_items')}"
+            f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}"
         )
+        if _is_cancelled_pending_stock_order(order):
+            note = str(order.get("cancel_note") or "").strip()
+            if refund_status in {"waiting_user_choice", "wallet_credited", "refund_requested", "refund_paid"}:
+                details += f"\n{tr(lang, 'refund_amount_label')}: *{_refund_amount_text(order)}*"
+            if note:
+                details += f"\n{tr(lang, 'admin_note')}: {md_code(note[:700])}"
+            details += f"\n\n{_refund_status_message(order, lang)}"
+            return details
+        return details + f"\n\n{tr(lang, 'no_delivered_items')}"
 
     if is_replacement:
         title = f"🎁 *{tr(lang, 'previous_replacement_items').replace('📄 ', '')}*" if is_refetch else f"✅ *{tr(lang, 'replacement_items_title')}*"
@@ -677,7 +811,19 @@ def _format_user_replacements_text(replacements: list[dict], page: int = 0, tota
     ]
     for order in replacements:
         order_id = order.get("order_id", "N/A")
-        display_status = "revoked" if order.get("delivery_revoked") else order.get("status")
+        refund_status = str(order.get("refund_status") or "").strip().lower()
+        if order.get("delivery_revoked"):
+            display_status = "revoked"
+        elif refund_status == "waiting_user_choice":
+            display_status = "waiting_user_choice"
+        elif refund_status == "refund_requested":
+            display_status = "refund_requested"
+        elif refund_status == "wallet_credited":
+            display_status = "wallet_credited"
+        elif refund_status == "refund_paid":
+            display_status = "refund_paid"
+        else:
+            display_status = order.get("status")
         report_id = order.get("replacement_report_id", "N/A")
         original_orders = ", ".join(str(x) for x in (order.get("original_order_ids") or []) if str(x).strip()) or str(order.get("original_order_id") or "N/A")
         lines.extend([
@@ -924,7 +1070,8 @@ async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_
     else:
         await update.message.reply_text(
             _format_order_delivery_text(order, is_refetch=True, lang=lang),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=_refund_choice_keyboard(order, lang),
         )
     return True
 
@@ -1656,6 +1803,87 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
             None, context, user_id, order_id,
             amount_usdt=unique_usdt, description=description
         )
+
+
+async def handle_refund_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle wallet-credit / external-refund choices after admin cancels a paid waiting-stock order."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    lang = await _user_lang(user_id)
+    data = str(query.data or "")
+    action, _, raw_order_id = data.partition(":")
+    order_id = raw_order_id.strip().upper()
+    if not order_id:
+        await query.edit_message_text(tr(lang, "refund_order_not_available"))
+        return
+
+    order = await db.get_refund_waiting_order_for_user(order_id, user_id)
+    if not order:
+        clear_refund_flow(user_id)
+        await query.edit_message_text(tr(lang, "refund_already_handled"))
+        return
+
+    if action == "refund_wallet":
+        if order.get("refund_wallet_enabled") is False:
+            await query.edit_message_text(tr(lang, "refund_order_not_available"))
+            return
+        credited = await db.credit_cancelled_order_refund_to_wallet(order_id, user_id)
+        clear_refund_flow(user_id)
+        if not credited:
+            await query.edit_message_text(tr(lang, "refund_already_handled"))
+            return
+        await query.edit_message_text(
+            tr(
+                lang,
+                "refund_wallet_credited",
+                order_id=order_id,
+                amount=_refund_amount_text(credited),
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "refund_request":
+        if order.get("refund_external_enabled") is False:
+            await query.edit_message_text(tr(lang, "refund_order_not_available"))
+            return
+        _refund_detail_flow[user_id] = {"order_id": order_id}
+        await query.edit_message_text(
+            tr(lang, "refund_details_prompt", order_id=order_id, amount=_refund_amount_text(order)),
+            parse_mode="Markdown",
+        )
+        return
+
+    await query.edit_message_text(tr(lang, "refund_order_not_available"))
+
+
+async def handle_refund_detail_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consumes one text message with external refund details."""
+    user_id = update.effective_user.id
+    state = _refund_detail_flow.get(user_id)
+    if not state:
+        return False
+    lang = await _user_lang(user_id)
+    details = str(update.message.text or "").strip()
+    if not details:
+        await update.message.reply_text(tr(lang, "refund_details_empty"))
+        return True
+    if details.startswith("/"):
+        clear_refund_flow(user_id)
+        await update.message.reply_text(tr(lang, "refund_details_cancelled"))
+        return True
+    order_id = str(state.get("order_id") or "").strip().upper()
+    updated = await db.submit_cancelled_order_refund_request(order_id, user_id, details)
+    clear_refund_flow(user_id)
+    if not updated:
+        await update.message.reply_text(tr(lang, "refund_already_handled"))
+        return True
+    await update.message.reply_text(
+        tr(lang, "refund_request_saved", order_id=order_id, amount=_refund_amount_text(updated)),
+        parse_mode="Markdown",
+    )
+    return True
 
 
 async def handle_favorite_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
