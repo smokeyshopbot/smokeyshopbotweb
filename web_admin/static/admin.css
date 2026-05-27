@@ -3704,6 +3704,25 @@ button.small-button,
   }
 }
 
+
+/* Keep product preorder limit row aligned when longer labels wrap. */
+.order-limits-panel .preorder-limits-row {
+  align-items: stretch;
+}
+.order-limits-panel .preorder-limits-row > label:not(.preorder-enable-button) {
+  display: grid;
+  grid-template-rows: minmax(2.65em, auto) 47px;
+  gap: 6px;
+  align-content: end;
+}
+.order-limits-panel .preorder-limits-row > label:not(.preorder-enable-button) input {
+  height: 47px;
+  align-self: end;
+}
+.order-limits-panel .preorder-limits-row .preorder-enable-button-body {
+  align-self: end;
+}
+
 /* Product preorder enable button */
 .preorder-enable-button {
   display: flex;

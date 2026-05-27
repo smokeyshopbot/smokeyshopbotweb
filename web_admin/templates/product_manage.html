@@ -418,7 +418,7 @@ item 2"></textarea>
 {% endif %}
 
 {% if can_access('update_product_limits') %}
-<section class="panel">
+<section class="panel order-limits-panel">
   <h2>Order and preorder limits</h2>
   <p class="muted">Set per-product order limits, low-stock warning, and paid preorder limits for when stock is out.</p>
   <form method="post" action="{{ url_for('update_product_limits', name=product.name) }}" class="stacked-form">
@@ -434,7 +434,7 @@ item 2"></textarea>
         <input name="low_stock_threshold" type="number" min="1" step="1" value="{{ product.low_stock_threshold or low_stock_threshold }}">
       </label>
     </div>
-    <div class="settings-grid">
+    <div class="settings-grid preorder-limits-row">
       <label class="preorder-enable-button">
         <input class="sr-only" type="checkbox" name="preorder_enabled" value="1" {% if product.preorder_enabled %}checked{% endif %}>
         <span class="preorder-enable-button-body">
