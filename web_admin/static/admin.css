@@ -3703,3 +3703,46 @@ button.small-button,
     grid-template-columns: 1fr;
   }
 }
+
+/* Product preorder enable button */
+.preorder-enable-button {
+  display: flex;
+  align-items: end;
+  min-height: 0;
+  cursor: pointer;
+}
+.preorder-enable-button input {
+  width: auto;
+  min-height: 0;
+}
+.preorder-enable-button-body {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, .35);
+  background: rgba(148, 163, 184, .08);
+  color: var(--text);
+  min-height: 0;
+  height: 47px;
+  padding: 10px 12px;
+  font-weight: 800;
+  letter-spacing: .01em;
+  transition: border-color .16s ease, background .16s ease, box-shadow .16s ease, color .16s ease;
+  user-select: none;
+}
+.preorder-enable-button input:checked + .preorder-enable-button-body {
+  border-color: rgba(34, 197, 94, .45);
+  background: rgba(34, 197, 94, .14);
+  color: #bbf7d0;
+  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, .12);
+}
+.preorder-enable-button input:focus-visible + .preorder-enable-button-body {
+  outline: 2px solid rgba(14, 165, 233, .75);
+  outline-offset: 3px;
+}
+.preorder-enable-button input:not(:checked) + .preorder-enable-button-body .preorder-enabled-label,
+.preorder-enable-button input:checked + .preorder-enable-button-body .preorder-disabled-label {
+  display: none;
+}

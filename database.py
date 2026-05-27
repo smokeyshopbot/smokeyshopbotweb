@@ -686,6 +686,9 @@ async def add_product(name: str, price_inr: float, price_usdt: float, shop_order
         "max_order_quantity": 100,
         "low_stock_threshold": 10,
         "low_stock_alert_sent": False,
+        "preorder_enabled": False,
+        "preorder_max_quantity": 10,
+        "preorder_total_limit": 50,
         "warranty_days": max(0, int(warranty_days or 0)),
         "created_at": datetime.now(timezone.utc),
     }
@@ -941,6 +944,36 @@ async def pop_stock(product_name: str, quantity: int) -> list[str]:
     return items
 
 
+async def restore_popped_stock_items(
+    product_name: str,
+    items: list[str],
+    *,
+    source: str = "telegram_bot",
+    note: str = "Restored after delivery finalization failure",
+) -> int:
+    """Put stock items back at the front of the live stock queue.
+
+    This is a safety rollback used only when stock was atomically popped but the
+    order could not be marked delivered. Returning items to the front prevents a
+    pending paid order from getting stuck because inventory disappeared during a
+    failed finalization.
+    """
+    clean_items = [str(item).strip() for item in (items or []) if str(item).strip()]
+    if not clean_items:
+        return 0
+    res = await get_db().products.update_one(
+        {"name": _name_regex(product_name)},
+        {"$push": {"stock": {"$each": clean_items, "$position": 0}}},
+    )
+    if not res.matched_count:
+        return 0
+    try:
+        await record_stock_ledger_status(product_name, clean_items, "restored", source=source, note=note)
+    except Exception:
+        pass
+    return len(clean_items)
+
+
 async def get_stock_count(product_name: str) -> int:
     product = await get_product(product_name)
     return len(product.get("stock", [])) if product else 0
@@ -966,6 +999,128 @@ async def get_available_stock_count(product_name: str) -> int:
     actual = await get_stock_count(product_name)
     pending_qty = await get_pending_stock_quantity(product_name)
     return max(0, actual - pending_qty)
+
+
+def product_preorder_enabled(product: dict | None) -> bool:
+    return bool((product or {}).get("preorder_enabled"))
+
+
+def get_product_preorder_max_quantity(product: dict | None, default: int = 10) -> int:
+    try:
+        value = int((product or {}).get("preorder_max_quantity") or default or 10)
+    except Exception:
+        value = default or 10
+    return max(1, value)
+
+
+def get_product_preorder_total_limit(product: dict | None, default: int = 50) -> int:
+    try:
+        value = int((product or {}).get("preorder_total_limit") or default or 50)
+    except Exception:
+        value = default or 50
+    return max(1, value)
+
+
+async def get_active_preorder_quantity(product_name: str) -> int:
+    """Quantity reserved by active user preorder checkouts for this product."""
+    cursor = get_db().orders.aggregate([
+        {
+            "$match": {
+                "product_name": _name_regex(product_name),
+                "is_preorder": True,
+                "status": {"$in": ["pending", "pending_stock"]},
+                "is_replacement": {"$ne": True},
+            }
+        },
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ])
+    rows = await cursor.to_list(length=1)
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_active_preorder_backorder_quantity(product_name: str) -> int:
+    """Total active demand that consumes preorder capacity for this product.
+
+    This intentionally counts all active product orders, not only rows marked
+    is_preorder: unpaid checkout sessions, paid orders waiting for stock, and
+    admin-created waiting-stock orders all reduce the public preorder capacity.
+    Admin-created orders are still allowed to exceed this limit; the limit only
+    blocks new user preorders.
+    """
+    cursor = get_db().orders.aggregate([
+        {
+            "$match": {
+                "product_name": _name_regex(product_name),
+                "status": {"$in": ["pending", "pending_stock"]},
+                "is_replacement": {"$ne": True},
+            }
+        },
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ])
+    rows = await cursor.to_list(length=1)
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_active_user_preorder_quantity(user_id: int, product_name: str) -> int:
+    """Active preorder units this user already has for one product."""
+    cursor = get_db().orders.aggregate([
+        {
+            "$match": {
+                "user_id": int(user_id),
+                "product_name": _name_regex(product_name),
+                "is_preorder": True,
+                "status": {"$in": ["pending", "pending_stock"]},
+                "is_replacement": {"$ne": True},
+            }
+        },
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ])
+    rows = await cursor.to_list(length=1)
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_paid_preorder_quantity(product_name: str) -> int:
+    cursor = get_db().orders.aggregate([
+        {
+            "$match": {
+                "product_name": _name_regex(product_name),
+                "is_preorder": True,
+                "status": "pending_stock",
+            }
+        },
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ])
+    rows = await cursor.to_list(length=1)
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_active_user_preorder(user_id: int, product_name: str) -> Optional[dict]:
+    """Return the latest active preorder for compatibility with older callers."""
+    return await get_db().orders.find_one(
+        {
+            "user_id": int(user_id),
+            "product_name": _name_regex(product_name),
+            "is_preorder": True,
+            "status": {"$in": ["pending", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+        },
+        sort=[("created_at", -1)],
+    )
+
+
+def get_user_preorder_capacity_remaining(product: dict | None, active_user_quantity: int) -> int:
+    try:
+        product_max = parse_positive_int((product or {}).get("max_order_quantity"), 100, minimum=1)
+    except Exception:
+        product_max = 100
+    user_limit = min(get_product_preorder_max_quantity(product), product_max)
+    return max(0, user_limit - int(active_user_quantity or 0))
+
+
+def get_preorder_capacity_remaining(product: dict | None, active_quantity: int) -> int:
+    if not product_preorder_enabled(product):
+        return 0
+    return max(0, get_product_preorder_total_limit(product) - int(active_quantity or 0))
 
 def get_product_restock_threshold(product: dict | None, default: int = 10) -> int:
     try:
@@ -1087,7 +1242,13 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         product["enabled"] = product.get("enabled", True)
         product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         product["actual_stock"] = actual_stock
+        active_preorders = await get_active_preorder_backorder_quantity(product.get("name", ""))
         product["pending_stock_quantity"] = pending_qty
+        product["preorder_enabled"] = product_preorder_enabled(product)
+        product["preorder_max_quantity"] = get_product_preorder_max_quantity(product)
+        product["preorder_total_limit"] = get_product_preorder_total_limit(product)
+        product["active_preorder_quantity"] = active_preorders
+        product["preorder_capacity_remaining"] = get_preorder_capacity_remaining(product, active_preorders)
         product["available_stock"] = max(0, actual_stock - pending_qty)
     return products
 
@@ -1114,6 +1275,7 @@ async def create_order(
     amount_inr: float,
     amount_usdt: float,
     username: str = "",
+    is_preorder: bool = False,
 ) -> str:
     """Create an order with duplicate-safe order-id generation.
 
@@ -1134,6 +1296,8 @@ async def create_order(
         "amount_inr": amount_inr,
         "amount_usdt": amount_usdt,
         "status": "pending",
+        "is_preorder": bool(is_preorder),
+        "preorder_created_at": datetime.now(timezone.utc) if is_preorder else None,
         "created_at": datetime.now(timezone.utc),
         "delivered_at": None,
     }
@@ -1155,6 +1319,153 @@ async def create_order(
     # Extremely unlikely fallback. Let the caller see a real failure instead of
     # silently creating a duplicate or charging without an order.
     raise RuntimeError("Could not generate a unique order ID after multiple attempts")
+
+
+async def acquire_product_preorder_lock(product_name: str, *, lock_seconds: int = 15, wait_seconds: float = 3.0) -> str | None:
+    """Serialize preorder/admin-order capacity checks for one product.
+
+    The lock is stored on the product document itself, so both the bot and
+    WebAdmin can coordinate through MongoDB without an in-process mutex.
+    """
+    clean_name = str(product_name or "").strip()
+    if not clean_name:
+        return None
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(0.2, float(wait_seconds or 0))
+    database = get_db()
+    while True:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=max(1, int(lock_seconds or 15)))
+        try:
+            locked = await database.products.find_one_and_update(
+                {
+                    "name": _name_regex(clean_name),
+                    "$or": [
+                        {"preorder_lock_token": {"$exists": False}},
+                        {"preorder_lock_token": None},
+                        {"preorder_lock_at": {"$exists": False}},
+                        {"preorder_lock_at": None},
+                        {"preorder_lock_at": {"$lte": cutoff}},
+                    ],
+                },
+                {"$set": {"preorder_lock_token": token, "preorder_lock_at": now}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            locked = None
+        if locked:
+            return token
+        if time.monotonic() >= deadline:
+            return None
+        import asyncio
+        await asyncio.sleep(0.08)
+
+
+async def release_product_preorder_lock(product_name: str, token: str | None) -> bool:
+    if not token:
+        return False
+    res = await get_db().products.update_one(
+        {"name": _name_regex(str(product_name or "")), "preorder_lock_token": token},
+        {"$unset": {"preorder_lock_token": "", "preorder_lock_at": ""}},
+    )
+    return bool(res.modified_count)
+
+
+async def create_preorder_order_with_limits(
+    user_id: int,
+    product_name: str,
+    quantity: int,
+    payment_method: str,
+    amount_inr: float,
+    amount_usdt: float,
+    username: str = "",
+) -> dict:
+    """Create a user preorder only if global and per-user limits still allow it.
+
+    This function re-checks and inserts while holding a Mongo-backed product
+    lock, preventing simultaneous user checkouts from pushing preorder capacity
+    over the product's total limit.
+    """
+    clean_product = str(product_name or "").strip()
+    try:
+        quantity_value = max(1, int(quantity or 1))
+    except Exception:
+        quantity_value = 1
+    token = await acquire_product_preorder_lock(clean_product)
+    if not token:
+        return {"ok": False, "reason": "busy", "message_key": "preorder_busy"}
+    try:
+        product = await get_product(clean_product)
+        if not product or product.get("enabled", True) is False:
+            return {"ok": False, "reason": "unavailable", "message_key": "product_now_unavailable"}
+        if not product_preorder_enabled(product):
+            return {"ok": False, "reason": "closed", "message_key": "preorder_changed"}
+        stock_count = await get_available_stock_count(clean_product)
+        if stock_count > 0:
+            return {"ok": False, "reason": "stock_available", "message_key": "preorder_changed"}
+
+        min_qty = parse_positive_int(product.get("min_order_quantity"), 1, minimum=1)
+        product_max_qty = parse_positive_int(product.get("max_order_quantity"), 100, minimum=1)
+        if product_max_qty < min_qty:
+            product_max_qty = min_qty
+
+        active_backorder = await get_active_preorder_backorder_quantity(clean_product)
+        active_user_preorders = await get_active_user_preorder_quantity(user_id, clean_product)
+        total_remaining = get_preorder_capacity_remaining(product, active_backorder)
+        user_remaining = get_user_preorder_capacity_remaining(product, active_user_preorders)
+        max_qty = max(0, min(product_max_qty, total_remaining, user_remaining))
+
+        if total_remaining < min_qty or max_qty < min_qty:
+            if user_remaining < min_qty and total_remaining >= min_qty:
+                return {
+                    "ok": False,
+                    "reason": "user_limit",
+                    "message_key": "preorder_user_limit_reached",
+                    "user_active": active_user_preorders,
+                    "user_limit": min(get_product_preorder_max_quantity(product), product_max_qty),
+                    "remaining": total_remaining,
+                    "user_remaining": user_remaining,
+                    "max_qty": max_qty,
+                }
+            return {
+                "ok": False,
+                "reason": "full",
+                "message_key": "preorder_full",
+                "remaining": total_remaining,
+                "user_remaining": user_remaining,
+                "max_qty": max_qty,
+            }
+        if quantity_value < min_qty:
+            return {"ok": False, "reason": "min", "message_key": "min_purchase", "min_qty": min_qty}
+        if quantity_value > max_qty:
+            return {
+                "ok": False,
+                "reason": "limit",
+                "message_key": "preorder_max_purchase",
+                "remaining": total_remaining,
+                "user_remaining": user_remaining,
+                "max_qty": max_qty,
+            }
+
+        order_id = await create_order(
+            user_id,
+            clean_product,
+            quantity_value,
+            payment_method,
+            amount_inr,
+            amount_usdt,
+            username,
+            is_preorder=True,
+        )
+        return {
+            "ok": True,
+            "order_id": order_id,
+            "remaining_after": max(0, total_remaining - quantity_value),
+            "user_remaining_after": max(0, user_remaining - quantity_value),
+            "max_qty": max_qty,
+        }
+    finally:
+        await release_product_preorder_lock(clean_product, token)
 
 
 async def get_order(order_id: str) -> Optional[dict]:
@@ -1295,6 +1606,30 @@ async def mark_order_pending_stock(order_id: str, *, delivery_token: str | None 
     return await update_order_status(order_id, "pending_stock", delivery_token=delivery_token)
 
 
+async def claim_pending_stock_notice(order_id: str) -> bool:
+    """Claim the one-time pending-stock user notice for this order.
+
+    Multiple payment scanners/buttons can safely reach the same paid order at
+    almost the same time. This atomic marker prevents duplicate "payment
+    received but out of stock" messages while keeping delivery idempotent.
+    """
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return False
+    now = datetime.now(timezone.utc)
+    res = await get_db().orders.update_one(
+        {
+            "order_id": clean_order_id,
+            "$or": [
+                {"pending_stock_notice_sent_at": {"$exists": False}},
+                {"pending_stock_notice_sent_at": None},
+            ],
+        },
+        {"$set": {"pending_stock_notice_sent_at": now}},
+    )
+    return bool(res.modified_count)
+
+
 async def has_pending_stock_ahead(product_name: str, created_at, order_id: str | None = None) -> bool:
     """True when an older paid order for the same product is already waiting for stock."""
     query = {
@@ -1395,6 +1730,30 @@ async def get_all_pending_stock_orders(limit: int = 100) -> list[dict]:
     return await get_db().orders.find({"status": "pending_stock"}).sort(
         "created_at", 1
     ).limit(limit).to_list(length=limit)
+
+
+async def get_pending_stock_product_names(limit: int = 200) -> list[str]:
+    """Products that currently have paid waiting-stock orders, oldest demand first."""
+    try:
+        safe_limit = max(1, min(int(limit or 200), 1000))
+    except Exception:
+        safe_limit = 200
+    rows = await get_db().orders.aggregate([
+        {"$match": {"status": "pending_stock", "product_name": {"$type": "string", "$ne": ""}}},
+        {"$sort": {"created_at": 1}},
+        {"$group": {"_id": "$product_name", "oldest": {"$first": "$created_at"}}},
+        {"$sort": {"oldest": 1}},
+        {"$limit": safe_limit},
+    ]).to_list(length=safe_limit)
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = str(row.get("_id") or "").strip()
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
 
 
 def _order_paid_amounts(order: dict) -> tuple[float, float]:

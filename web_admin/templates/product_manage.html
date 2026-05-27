@@ -419,8 +419,8 @@ item 2"></textarea>
 
 {% if can_access('update_product_limits') %}
 <section class="panel">
-  <h2>Order limits</h2>
-  <p class="muted">Set per-product order limits and the stock count that should trigger a low-stock warning. Buyers will not see order limits unless they enter a quantity outside the allowed range.</p>
+  <h2>Order and preorder limits</h2>
+  <p class="muted">Set per-product order limits, low-stock warning, and paid preorder limits for when stock is out.</p>
   <form method="post" action="{{ url_for('update_product_limits', name=product.name) }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="settings-grid">
@@ -434,6 +434,22 @@ item 2"></textarea>
         <input name="low_stock_threshold" type="number" min="1" step="1" value="{{ product.low_stock_threshold or low_stock_threshold }}">
       </label>
     </div>
+    <div class="settings-grid">
+      <label class="preorder-enable-button">
+        <input class="sr-only" type="checkbox" name="preorder_enabled" value="1" {% if product.preorder_enabled %}checked{% endif %}>
+        <span class="preorder-enable-button-body">
+          <span class="preorder-enabled-label">Preorder enabled</span>
+          <span class="preorder-disabled-label">Preorder disabled</span>
+        </span>
+      </label>
+      <label>Max preorder quantity per user/product
+        <input name="preorder_max_quantity" type="number" min="1" step="1" value="{{ product.preorder_max_quantity or 10 }}">
+      </label>
+      <label>Max total active preorder/backorder stock
+        <input name="preorder_total_limit" type="number" min="1" step="1" value="{{ product.preorder_total_limit or 50 }}">
+      </label>
+    </div>
+    <p class="muted">This limit includes unpaid checkout sessions, paid waiting-stock orders, and admin-created waiting-stock orders. Admin/owner orders can exceed this limit, but new user preorders stop when the total active demand reaches the limit. Users may create multiple preorders as long as their active preorder units stay within the per-user/product limit.</p>
     <button class="primary" type="submit">Save order limits</button>
   </form>
 </section>

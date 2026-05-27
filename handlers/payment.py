@@ -538,6 +538,7 @@ async def handle_check_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.answer(tr(lang, "payment_already_processed_delivered"), show_alert=True)
                     return
                 if order_status == "pending_stock":
+                    await _delete_payment_msg(context, ref_id)
                     await query.answer(tr(lang, "payment_received_waiting_stock"), show_alert=True)
                     return
                 if status in {"confirmed", "approved"}:
@@ -825,7 +826,13 @@ async def _on_usdt_confirmed(context, user_id: int, ref_id: str, transaction: di
 
         status = pending.get("status")
         if pending.get("pay_type") == "order" and status in {"confirmed", "approved"}:
+            order = await db.get_order(ref_id)
+            if order and order.get("status") in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
+                await _delete_payment_msg_by_bot(context.bot, ref_id)
+                logger.info("USDT payment already confirmed; order already terminal/queued ref=%s order_status=%s", ref_id, order.get("status"))
+                return
             logger.info("USDT payment already confirmed; retrying order completion ref=%s", ref_id)
+            await _delete_payment_msg_by_bot(context.bot, ref_id)
             await complete_order(context.bot, int(pending.get("user_id", user_id)), ref_id)
             return
 
@@ -838,6 +845,7 @@ async def _on_usdt_confirmed(context, user_id: int, ref_id: str, transaction: di
         return
 
     await _send_payment_detected_notice(context.bot, pending, method_label=_usdt_payment_label(_usdt_network_for_pending(pending)))
+    await _delete_payment_msg_by_bot(context.bot, ref_id)
 
     if pending["pay_type"] == "order":
         await complete_order(context.bot, user_id, ref_id)
@@ -1077,6 +1085,7 @@ async def handle_check_binance(update: Update, context: ContextTypes.DEFAULT_TYP
                     await query.answer(tr(lang, "payment_already_processed_delivered"), show_alert=True)
                     return
                 if order_status == "pending_stock":
+                    await _delete_payment_msg(context, ref_id)
                     await query.answer(tr(lang, "payment_received_waiting_stock"), show_alert=True)
                     return
                 if status in {"confirmed", "approved"}:
@@ -1130,7 +1139,13 @@ async def _on_binance_confirmed(context, user_id: int, ref_id: str, transaction:
 
         status = pending.get("status")
         if pending.get("pay_type") == "order" and status in {"confirmed", "approved"}:
+            order = await db.get_order(ref_id)
+            if order and order.get("status") in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
+                await _delete_payment_msg_by_bot(context.bot, ref_id)
+                logger.info("Binance payment already confirmed; order already terminal/queued ref=%s order_status=%s", ref_id, order.get("status"))
+                return
             logger.info("Binance payment already confirmed; retrying order completion ref=%s", ref_id)
+            await _delete_payment_msg_by_bot(context.bot, ref_id)
             await complete_order(context.bot, int(pending.get("user_id", user_id)), ref_id)
             return
 
@@ -1143,6 +1158,7 @@ async def _on_binance_confirmed(context, user_id: int, ref_id: str, transaction:
         return
 
     await _send_payment_detected_notice(context.bot, pending, method_label="Binance Pay")
+    await _delete_payment_msg_by_bot(context.bot, ref_id)
 
     if pending["pay_type"] == "order":
         await complete_order(context.bot, int(pending.get("user_id", user_id)), ref_id)
@@ -1257,9 +1273,16 @@ def _is_admin_created_order(order: dict | None) -> bool:
 
 
 async def _send_pending_stock_notice(bot, user_id: int, order: dict, *, queued: bool = False):
+    order_id = str(order.get("order_id", "N/A") or "N/A")
+    try:
+        if not await db.claim_pending_stock_notice(order_id):
+            logger.info("Pending-stock notice already sent for order=%s", order_id)
+            return
+    except Exception:
+        logger.exception("Could not claim pending-stock notice for order=%s", order_id)
+        return
     lang = await _lang_for_user(user_id)
     product_name = order.get("product_name", "Product")
-    order_id = order.get("order_id", "N/A")
     quantity = int(order.get("quantity", 0) or 0)
     if _is_admin_created_order(order):
         queue_note = tr(lang, "admin_created_order_stock_queued") if queued else tr(lang, "admin_created_order_stock_waiting")
@@ -1451,6 +1474,21 @@ async def complete_order(bot, user_id: int, ref_id: str):
         if await db.has_pending_stock_ahead(product_name, order.get("created_at"), order.get("order_id")):
             await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
             order["status"] = "pending_stock"
+            await _delete_payment_msg_by_bot(bot, ref_id)
+
+            # A newly paid order may have been placed while older paid orders
+            # were already holding available stock. Drain the pending-stock queue
+            # immediately instead of waiting for the next stock upload, otherwise
+            # one order can look "stuck" even though enough stock exists.
+            try:
+                await process_pending_stock_orders(bot, product_name)
+            except Exception as exc:
+                logger.exception("Could not drain pending-stock queue after queuing %s: %s", ref_id, exc)
+
+            latest = await db.get_order(ref_id)
+            if latest and latest.get("status") == "delivered":
+                return
+
             await _send_pending_stock_notice(bot, user_id, order, queued=True)
             await send_admin_message(
                 bot,
@@ -1465,6 +1503,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
         logger.exception("Could not pop stock for paid order %s: %s", ref_id, exc)
         await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
+        await _delete_payment_msg_by_bot(bot, ref_id)
         await _send_pending_stock_notice(bot, user_id, order)
         await send_admin_message(
             bot,
@@ -1476,6 +1515,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
     if not items:
         await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
+        await _delete_payment_msg_by_bot(bot, ref_id)
         await _send_pending_stock_notice(bot, user_id, order)
         await send_admin_message(
             bot,
@@ -1492,11 +1532,21 @@ async def complete_order(bot, user_id: int, ref_id: str):
         # send stock to the user if we could not attach those items to the order.
         logger.error("Could not finalize delivered order after stock pop ref=%s items=%s", ref_id, len(items))
         try:
+            await db.restore_popped_stock_items(
+                product_name,
+                items,
+                source="telegram_bot",
+                note=f"Restored because paid order {ref_id} could not be finalized",
+            )
+            await db.clear_order_delivery_lock(ref_id, delivery_token=delivery_token)
+        except Exception:
+            logger.exception("Could not restore stock after delivery finalization failure ref=%s", ref_id)
+        try:
             await send_admin_message(
                 bot,
-                f"🚨 Stock delivery finalization failed after stock was removed.\n"
+                f"🚨 Stock delivery finalization failed after stock was removed, so the stock was restored.\n"
                 f"Product: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\n"
-                f"Please inspect this order before taking action."
+                f"Please retry delivery after checking this order."
             )
         except Exception:
             pass
@@ -1507,6 +1557,14 @@ async def complete_order(bot, user_id: int, ref_id: str):
     await _send_order_items(bot, user_id, order, items, from_pending=was_pending_stock)
     await _delete_payment_msg_by_bot(bot, ref_id)
     await notify_low_stock_if_needed(bot, product_name)
+
+    # If enough stock remains for other paid waiting orders, clear them now.
+    # This is a safety net for orders that became pending while stock was
+    # already available, so they do not sit until the next manual stock upload.
+    try:
+        await process_pending_stock_orders(bot, product_name)
+    except Exception as exc:
+        logger.exception("Could not drain pending-stock queue after delivering %s: %s", ref_id, exc)
 
 async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     """Finalize wallet-paid orders that accidentally stayed plain pending.
@@ -1559,48 +1617,105 @@ async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     return {"checked": len(stuck_orders), "finalized": finalized, "still_pending": still_pending}
 
 
-async def process_pending_stock_orders(bot, product_name: str) -> dict:
-    """Deliver paid pending-stock orders for a product, oldest first."""
-    pending_orders = await db.get_pending_stock_orders(product_name)
+async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict:
+    """Deliver paid pending-stock orders for a product, oldest first.
+
+    The function refetches the queue for a few passes and stops at the first
+    order that cannot be fulfilled or is actively locked by another worker. This
+    keeps FIFO priority while also fixing stuck queues when stock is already
+    available for more than one pending order.
+    """
     delivered_orders = 0
     delivered_items = 0
+    locked_orders = 0
+    blocked_by_stock = 0
+    restored_items = 0
 
-    for order in pending_orders:
-        qty = int(order.get("quantity", 1) or 1)
-        stock_now = await db.get_stock_count(product_name)
-        if stock_now < qty:
+    try:
+        safe_passes = max(1, min(int(max_passes or 3), 10))
+    except Exception:
+        safe_passes = 3
+    try:
+        safe_limit = max(1, min(int(limit or 100), 500))
+    except Exception:
+        safe_limit = 100
+
+    for _pass in range(safe_passes):
+        pending_orders = await db.get_pending_stock_orders(product_name, limit=safe_limit)
+        if not pending_orders:
             break
 
-        claimed = await db.claim_order_delivery(order.get("order_id"))
-        if not claimed:
-            continue
-        delivery_token = claimed.get("delivery_lock_token")
+        pass_delivered = 0
+        stop_pass = False
+        for order in pending_orders:
+            order_id = order.get("order_id")
+            qty = int(order.get("quantity", 1) or 1)
+            stock_now = await db.get_stock_count(product_name)
+            if stock_now < qty:
+                blocked_by_stock += 1
+                stop_pass = True
+                break
 
-        items = await db.pop_stock(product_name, qty)
-        if not items:
-            await db.mark_order_pending_stock(order.get("order_id"), delivery_token=delivery_token)
-            break
+            claimed = await db.claim_order_delivery(order_id)
+            if not claimed:
+                # Do not skip an older locked paid order and deliver younger
+                # orders first. The background watcher/startup recovery will
+                # retry after the short delivery lock expires.
+                locked_orders += 1
+                stop_pass = True
+                break
+            delivery_token = claimed.get("delivery_lock_token")
 
-        updated = await db.update_order_status(order["order_id"], "delivered", items, delivery_token=delivery_token)
-        if not updated:
-            logger.error("Could not finalize pending-stock order after stock pop order=%s", order.get("order_id"))
+            items: list[str] = []
             try:
-                await send_admin_message(
-                    bot,
-                    f"🚨 Pending-stock finalization failed after stock was removed.\n"
-                    f"Product: {product_name}\nQuantity: {qty}\nRef: {order.get('order_id')}"
-                )
-            except Exception:
-                pass
-            continue
+                items = await db.pop_stock(product_name, qty)
+            except Exception as exc:
+                logger.exception("Could not pop stock for pending-stock order %s: %s", order_id, exc)
+                await db.mark_order_pending_stock(order_id, delivery_token=delivery_token)
+                stop_pass = True
+                break
 
-        delivered_orders += 1
-        delivered_items += len(items)
-        try:
-            await _send_order_items(bot, int(order["user_id"]), order, items, from_pending=True)
-            await _delete_payment_msg_by_bot(bot, order["order_id"])
-        except Exception as exc:
-            logger.exception("Could not notify user for pending delivery order=%s: %s", order.get("order_id"), exc)
+            if not items:
+                await db.mark_order_pending_stock(order_id, delivery_token=delivery_token)
+                blocked_by_stock += 1
+                stop_pass = True
+                break
+
+            updated = await db.update_order_status(order_id, "delivered", items, delivery_token=delivery_token)
+            if not updated:
+                logger.error("Could not finalize pending-stock order after stock pop order=%s", order_id)
+                try:
+                    restored_items += await db.restore_popped_stock_items(
+                        product_name,
+                        items,
+                        source="telegram_bot",
+                        note=f"Restored because pending-stock order {order_id} could not be finalized",
+                    )
+                    await db.clear_order_delivery_lock(order_id, delivery_token=delivery_token)
+                except Exception:
+                    logger.exception("Could not restore stock after pending-stock finalization failure order=%s", order_id)
+                try:
+                    await send_admin_message(
+                        bot,
+                        f"🚨 Pending-stock finalization failed after stock was removed, so the stock was restored.\n"
+                        f"Product: {product_name}\nQuantity: {qty}\nRef: {order_id}"
+                    )
+                except Exception:
+                    pass
+                stop_pass = True
+                break
+
+            delivered_orders += 1
+            pass_delivered += 1
+            delivered_items += len(items)
+            try:
+                await _send_order_items(bot, int(order["user_id"]), order, items, from_pending=True)
+                await _delete_payment_msg_by_bot(bot, order_id)
+            except Exception as exc:
+                logger.exception("Could not notify user for pending delivery order=%s: %s", order_id, exc)
+
+        if stop_pass or pass_delivered == 0:
+            break
 
     if delivered_orders:
         try:
@@ -1616,7 +1731,13 @@ async def process_pending_stock_orders(bot, product_name: str) -> dict:
         await notify_low_stock_if_needed(bot, product_name)
     except Exception:
         pass
-    return {"orders_delivered": delivered_orders, "items_delivered": delivered_items}
+    return {
+        "orders_delivered": delivered_orders,
+        "items_delivered": delivered_items,
+        "locked_orders": locked_orders,
+        "blocked_by_stock": blocked_by_stock,
+        "restored_items": restored_items,
+    }
 
 async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already: bool = False):
     lang = pending.get("language") or await _lang_for_user(user_id)
@@ -1907,6 +2028,66 @@ async def resume_pending_payment_notices(application):
     if count:
         logger.info("Resumed payment reminder/expiry tasks: %s", count)
 
+
+
+async def recover_pending_stock_orders(bot, limit: int = 200) -> dict:
+    """Retry every product that has paid orders waiting for stock.
+
+    This catches pending orders that were left waiting because a previous worker
+    was locked/restarted or because stock already existed before the newest paid
+    order joined the queue.
+    """
+    try:
+        product_names = await db.get_pending_stock_product_names(limit=limit)
+    except Exception as exc:
+        logger.exception("Could not list pending-stock products for recovery: %s", exc)
+        return {"products_checked": 0, "orders_delivered": 0, "items_delivered": 0}
+
+    total_orders = 0
+    total_items = 0
+    checked = 0
+    for product_name in product_names:
+        checked += 1
+        try:
+            summary = await process_pending_stock_orders(bot, product_name)
+        except Exception as exc:
+            logger.exception("Pending-stock recovery failed for product=%s: %s", product_name, exc)
+            continue
+        total_orders += int(summary.get("orders_delivered", 0) or 0)
+        total_items += int(summary.get("items_delivered", 0) or 0)
+
+    if total_orders:
+        try:
+            await send_admin_message(
+                bot,
+                f"🔁 Pending-stock recovery delivered {total_orders} order(s) "
+                f"using {total_items} stock item(s)."
+            )
+        except Exception:
+            pass
+    return {"products_checked": checked, "orders_delivered": total_orders, "items_delivered": total_items}
+
+
+_pending_stock_recovery_task: asyncio.Task | None = None
+
+async def start_pending_stock_recovery_watcher(application):
+    """Start a durable pending-stock delivery safety net."""
+    global _pending_stock_recovery_task
+    if _pending_stock_recovery_task and not _pending_stock_recovery_task.done():
+        return
+    _pending_stock_recovery_task = application.create_task(_pending_stock_recovery_watcher(application))
+    logger.info("✅ Pending-stock recovery watcher started.")
+
+
+async def _pending_stock_recovery_watcher(application):
+    while True:
+        try:
+            await recover_pending_stock_orders(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Pending-stock recovery watcher crashed: %s", exc)
+        await asyncio.sleep(90)
 
 _stale_unpaid_expiry_task: asyncio.Task | None = None
 

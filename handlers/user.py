@@ -189,6 +189,50 @@ def _get_order_quantity_limits(product: dict, stock_count: int | None = None) ->
     return min_qty, max_qty
 
 
+def _preorder_limit_for_product(
+    product: dict,
+    capacity_remaining: int | None = None,
+    user_remaining: int | None = None,
+) -> int:
+    max_preorder = db.get_product_preorder_max_quantity(product)
+    product_min, product_max = _get_order_quantity_limits(product, None)
+    limit = min(max_preorder, product_max)
+    if capacity_remaining is not None:
+        limit = min(limit, max(0, int(capacity_remaining or 0)))
+    if user_remaining is not None:
+        limit = min(limit, max(0, int(user_remaining or 0)))
+    return max(0, limit)
+
+
+async def _preorder_status_for_user(product: dict, user_id: int) -> dict:
+    """Return live preorder limits for one user/product."""
+    product_name = str((product or {}).get("name") or "")
+    active_backorder = await db.get_active_preorder_backorder_quantity(product_name)
+    active_user_qty = await db.get_active_user_preorder_quantity(user_id, product_name)
+    total_remaining = db.get_preorder_capacity_remaining(product, active_backorder)
+    user_remaining = db.get_user_preorder_capacity_remaining(product, active_user_qty)
+    max_qty = _preorder_limit_for_product(product, total_remaining, user_remaining)
+    _, product_max_qty = _get_order_quantity_limits(product, None)
+    user_limit = min(db.get_product_preorder_max_quantity(product), product_max_qty)
+    return {
+        "active_backorder": active_backorder,
+        "active_user_qty": active_user_qty,
+        "total_remaining": total_remaining,
+        "user_remaining": user_remaining,
+        "user_limit": user_limit,
+        "max_qty": max_qty,
+    }
+
+
+def _preorder_is_open(product: dict, stock_count: int | None = None) -> bool:
+    if not product or product.get("enabled", True) is False:
+        return False
+    if stock_count is None:
+        stock_count = int(product.get("available_stock", len(product.get("stock", []) or [])) or 0)
+    capacity = int(product.get("preorder_capacity_remaining", 0) or 0)
+    return stock_count <= 0 and db.product_preorder_enabled(product) and capacity > 0
+
+
 def _product_button_label(product: dict, payment_settings: dict | None = None, lang: str = "en") -> str:
     """Button label showing product price and stock available to new buyers."""
     payment_settings = payment_settings or {}
@@ -198,8 +242,17 @@ def _product_button_label(product: dict, payment_settings: dict | None = None, l
         prefix = "🚫"
         stock_part = tr(lang, "stock_disabled")
     elif stock_count <= 0:
-        prefix = "❌"
-        stock_part = tr(lang, "stock_sold_out")
+        if db.product_preorder_enabled(product):
+            capacity = int(product.get("preorder_capacity_remaining", 0) or 0)
+            if capacity > 0:
+                prefix = "📝"
+                stock_part = tr(lang, "stock_preorder_open", remaining=capacity)
+            else:
+                prefix = "⛔"
+                stock_part = tr(lang, "stock_preorder_full")
+        else:
+            prefix = "❌"
+            stock_part = tr(lang, "stock_sold_out")
     else:
         prefix = "✅"
         stock_part = tr(lang, "stock_count", count=stock_count)
@@ -258,7 +311,11 @@ def _product_buy_keyboard(back_to: str = "shop", lang: str = "en") -> InlineKeyb
 def _favorite_button_label(product: dict, payment_settings: dict | None = None, is_favorite: bool = False, lang: str = "en") -> str:
     star = "⭐" if is_favorite else "☆"
     stock_count = int(product.get("available_stock", len(product.get("stock", []) or [])) or 0)
-    stock_part = tr(lang, "stock_sold_out") if stock_count <= 0 else tr(lang, "stock_count", count=stock_count)
+    if stock_count <= 0 and db.product_preorder_enabled(product):
+        capacity = int(product.get("preorder_capacity_remaining", 0) or 0)
+        stock_part = tr(lang, "stock_preorder_open", remaining=capacity) if capacity > 0 else tr(lang, "stock_preorder_full")
+    else:
+        stock_part = tr(lang, "stock_sold_out") if stock_count <= 0 else tr(lang, "stock_count", count=stock_count)
     return _fit_product_button(star, product['name'], stock_part, _price_label(product, payment_settings or {}, lang=lang))
 
 
@@ -1105,18 +1162,69 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         return
 
     stock_count = await db.get_available_stock_count(product_name)
-    if stock_count <= 0:
-        await query.edit_message_text(
-            tr(lang, "product_out_stock", product=product_name),
-            parse_mode="Markdown",
-            reply_markup=back_keyboard
-        )
-        return
+    is_preorder = False
+    preorder_capacity = 0
+    preorder_max_qty = 0
 
-    min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
-    if stock_count < min_qty:
+    if stock_count <= 0:
+        status = await _preorder_status_for_user(product, user_id)
+        preorder_capacity = int(status["total_remaining"] or 0)
+        preorder_max_qty = int(status["max_qty"] or 0)
+        user_remaining = int(status["user_remaining"] or 0)
+        user_limit = int(status["user_limit"] or 0)
+        user_active_qty = int(status["active_user_qty"] or 0)
+        min_qty_for_product, _ = _get_order_quantity_limits(product, None)
+
+        if not db.product_preorder_enabled(product):
+            await query.edit_message_text(
+                tr(lang, "product_out_stock", product=product_name),
+                parse_mode="Markdown",
+                reply_markup=back_keyboard
+            )
+            return
+
+        if user_remaining < min_qty_for_product and preorder_capacity >= min_qty_for_product:
+            await query.edit_message_text(
+                tr(lang, "preorder_user_limit_reached", product=product_name, active=user_active_qty, limit=user_limit),
+                parse_mode="Markdown",
+                reply_markup=back_keyboard
+            )
+            return
+
+        if preorder_capacity < min_qty_for_product or preorder_max_qty < min_qty_for_product:
+            await query.edit_message_text(
+                tr(lang, "preorder_full", product=product_name),
+                parse_mode="Markdown",
+                reply_markup=back_keyboard
+            )
+            return
+
+        is_preorder = True
+    else:
+        min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
+        if stock_count < min_qty:
+            await query.edit_message_text(
+                tr(lang, "product_not_enough_stock", product=product_name),
+                parse_mode="Markdown",
+                reply_markup=back_keyboard
+            )
+            return
+
+    if is_preorder:
+        _shop_flow[user_id] = {"step": "quantity", "product": product, "is_preorder": True}
         await query.edit_message_text(
-            tr(lang, "product_not_enough_stock", product=product_name),
+            compact_blank_lines(tr(
+                lang,
+                "preorder_quantity_prompt",
+                product=product['name'],
+                description=_product_details_block(product, lang),
+                price=_price_label(product, payment_settings, lang=lang),
+                remaining=preorder_capacity,
+                user_remaining=user_remaining,
+                user_limit=user_limit,
+                active=user_active_qty,
+                max_qty=preorder_max_qty,
+            )),
             parse_mode="Markdown",
             reply_markup=back_keyboard
         )
@@ -1174,33 +1282,56 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
         return True
 
     stock_count = await db.get_available_stock_count(product["name"])
-    min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
-    if qty < min_qty:
-        await update.message.reply_text(
-            tr(lang, "min_purchase", min_qty=min_qty),
-        )
-        return True
+    is_preorder = bool(state.get("is_preorder"))
+    if is_preorder:
+        min_qty, product_max_qty = _get_order_quantity_limits(product, None)
+        status = await _preorder_status_for_user(product, user_id)
+        preorder_capacity = int(status["total_remaining"] or 0)
+        user_remaining = int(status["user_remaining"] or 0)
+        user_limit = int(status["user_limit"] or 0)
+        user_active_qty = int(status["active_user_qty"] or 0)
+        max_qty = min(product_max_qty, int(status["max_qty"] or 0))
+        if not db.product_preorder_enabled(product) or preorder_capacity < min_qty or max_qty < min_qty:
+            _shop_flow.pop(user_id, None)
+            if user_remaining < min_qty and preorder_capacity >= min_qty:
+                await update.message.reply_text(tr(lang, "preorder_user_limit_reached", product=product["name"], active=user_active_qty, limit=user_limit), parse_mode="Markdown")
+            else:
+                await update.message.reply_text(tr(lang, "preorder_full", product=product["name"]), parse_mode="Markdown")
+            return True
+        if qty < min_qty:
+            await update.message.reply_text(tr(lang, "min_purchase", min_qty=min_qty))
+            return True
+        if qty > max_qty:
+            await update.message.reply_text(tr(lang, "preorder_max_purchase", max_qty=max_qty), parse_mode="Markdown")
+            return True
+    else:
+        min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
+        if qty < min_qty:
+            await update.message.reply_text(
+                tr(lang, "min_purchase", min_qty=min_qty),
+            )
+            return True
 
-    if stock_count < min_qty:
-        _shop_flow.pop(user_id, None)
-        await update.message.reply_text(
-            tr(lang, "not_enough_stock_now")
-        )
-        return True
+        if stock_count < min_qty:
+            _shop_flow.pop(user_id, None)
+            await update.message.reply_text(
+                tr(lang, "not_enough_stock_now")
+            )
+            return True
 
-    if qty > max_qty:
-        await update.message.reply_text(
-            tr(lang, "max_purchase", max_qty=max_qty),
-            parse_mode="Markdown"
-        )
-        return True
+        if qty > max_qty:
+            await update.message.reply_text(
+                tr(lang, "max_purchase", max_qty=max_qty),
+                parse_mode="Markdown"
+            )
+            return True
 
-    if qty > stock_count:
-        await update.message.reply_text(
-            tr(lang, "only_stock_available", stock=stock_count),
-            parse_mode="Markdown"
-        )
-        return True
+        if qty > stock_count:
+            await update.message.reply_text(
+                tr(lang, "only_stock_available", stock=stock_count),
+                parse_mode="Markdown"
+            )
+            return True
 
     payment_settings = await db.get_payment_settings()
     total_inr = round(float(product.get("price_inr") or 0) * qty, 2)
@@ -1219,6 +1350,7 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
         "quantity": qty,
         "total_inr": total_inr,
         "total_usdt": total_usdt,
+        "is_preorder": is_preorder,
     }
 
     buttons = []
@@ -1249,8 +1381,9 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     buttons.append([InlineKeyboardButton(tr(lang, "btn_cancel"), callback_data="pay:cancel")])
 
+    summary_key = "preorder_order_summary" if is_preorder else "order_summary"
     await update.message.reply_text(
-        tr(lang, "order_summary", product=product['name'], quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
+        tr(lang, summary_key, product=product['name'], quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -1297,6 +1430,68 @@ async def _finalize_wallet_order_after_charge(context: ContextTypes.DEFAULT_TYPE
             pass
 
 
+def _preorder_create_error_text(lang: str, result: dict, product_name: str) -> str:
+    key = str((result or {}).get("message_key") or "preorder_changed")
+    if key == "preorder_full":
+        return tr(lang, "preorder_full", product=product_name)
+    if key == "preorder_user_limit_reached":
+        return tr(
+            lang,
+            "preorder_user_limit_reached",
+            product=product_name,
+            active=int((result or {}).get("user_active") or 0),
+            limit=int((result or {}).get("user_limit") or 0),
+        )
+    if key == "preorder_max_purchase":
+        return tr(lang, "preorder_max_purchase", max_qty=int((result or {}).get("max_qty") or 0))
+    if key == "min_purchase":
+        return tr(lang, "min_purchase", min_qty=int((result or {}).get("min_qty") or 1))
+    if key == "product_now_unavailable":
+        return tr(lang, "product_now_unavailable")
+    if key == "preorder_busy":
+        return tr(lang, "preorder_busy")
+    return tr(lang, "preorder_changed")
+
+
+async def _create_checkout_order(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    username: str,
+    product: dict,
+    qty: int,
+    method: str,
+    total_inr: float,
+    total_usdt: float,
+    is_preorder: bool,
+    lang: str,
+) -> str | None:
+    product_name = str(product.get("name") or "")
+    if not is_preorder:
+        return await db.create_order(user_id, product_name, qty, method, total_inr, total_usdt, username, is_preorder=False)
+
+    result = await db.create_preorder_order_with_limits(
+        user_id,
+        product_name,
+        qty,
+        method,
+        total_inr,
+        total_usdt,
+        username,
+    )
+    if result.get("ok"):
+        return str(result.get("order_id"))
+    try:
+        await context.bot.send_message(
+            user_id,
+            _preorder_create_error_text(lang, result, product_name),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([_back_button(lang)]),
+        )
+    except Exception:
+        pass
+    return None
+
+
 async def handle_payment_method_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles payment method button selection."""
     query = update.callback_query
@@ -1324,15 +1519,36 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         return
     product = latest_product
     qty = state["quantity"]
+    is_preorder = bool(state.get("is_preorder"))
     stock_count = await db.get_available_stock_count(product["name"])
-    min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
-    if stock_count < min_qty or qty < min_qty or qty > max_qty or qty > stock_count:
-        _shop_flow.pop(user_id, None)
-        await query.edit_message_text(
-            tr(lang, "qty_or_stock_changed"),
-            reply_markup=InlineKeyboardMarkup([_back_button(lang)])
-        )
-        return
+    if is_preorder:
+        min_qty, product_max_qty = _get_order_quantity_limits(product, None)
+        status = await _preorder_status_for_user(product, user_id)
+        preorder_capacity = int(status["total_remaining"] or 0)
+        user_remaining = int(status["user_remaining"] or 0)
+        max_qty = min(product_max_qty, int(status["max_qty"] or 0))
+        if (
+            not db.product_preorder_enabled(product)
+            or preorder_capacity < min_qty
+            or user_remaining < min_qty
+            or qty < min_qty
+            or qty > max_qty
+        ):
+            _shop_flow.pop(user_id, None)
+            await query.edit_message_text(
+                tr(lang, "preorder_changed"),
+                reply_markup=InlineKeyboardMarkup([_back_button(lang)])
+            )
+            return
+    else:
+        min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
+        if stock_count < min_qty or qty < min_qty or qty > max_qty or qty > stock_count:
+            _shop_flow.pop(user_id, None)
+            await query.edit_message_text(
+                tr(lang, "qty_or_stock_changed"),
+                reply_markup=InlineKeyboardMarkup([_back_button(lang)])
+            )
+            return
     total_inr = state["total_inr"]
     total_usdt = state["total_usdt"]
 
@@ -1352,20 +1568,26 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
 
     # ── Wallet payment (instant, no verification) ──
     if method == "wallet_inr":
+        order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_inr", total_inr, 0, is_preorder, lang)
+        if not order_id:
+            return
         success = await db.deduct_wallet_inr(user_id, total_inr)
         if not success:
+            await db.update_order_status(order_id, "cancelled")
             await context.bot.send_message(user_id, tr(lang, "wallet_insufficient_inr"))
             return
-        order_id = await db.create_order(user_id, product["name"], qty, "wallet_inr", total_inr, 0, query.from_user.username or "")
         await _finalize_wallet_order_after_charge(context, user_id, order_id)
         return
 
     if method == "wallet_usdt":
+        order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_usdt", 0, total_usdt, is_preorder, lang)
+        if not order_id:
+            return
         success = await db.deduct_wallet_usdt(user_id, total_usdt)
         if not success:
+            await db.update_order_status(order_id, "cancelled")
             await context.bot.send_message(user_id, tr(lang, "wallet_insufficient_usdt"))
             return
-        order_id = await db.create_order(user_id, product["name"], qty, "wallet_usdt", 0, total_usdt, query.from_user.username or "")
         await _finalize_wallet_order_after_charge(context, user_id, order_id)
         return
 
@@ -1379,7 +1601,9 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
                 "⚠️ Too many active USDT payments are using this exact amount right now. Please try again in a few minutes."
             )
             return
-        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, method, total_inr, total_usdt, is_preorder, lang)
+        if not order_id:
+            return
         description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
@@ -1394,7 +1618,9 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         )
 
     elif method == "upi":
-        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, method, total_inr, total_usdt, is_preorder, lang)
+        if not order_id:
+            return
         description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
@@ -1416,7 +1642,9 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
                 "⚠️ Too many active Binance Pay payments are using this exact amount right now. Please try again in a few minutes."
             )
             return
-        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, method, total_inr, total_usdt, is_preorder, lang)
+        if not order_id:
+            return
         description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",

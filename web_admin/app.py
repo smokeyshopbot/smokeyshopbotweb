@@ -2357,6 +2357,13 @@ def register_routes(app: Flask) -> None:
         product["min_order_quantity"] = parse_positive_int(product.get("min_order_quantity"), 1, minimum=1)
         product["max_order_quantity"] = parse_positive_int(product.get("max_order_quantity"), 100, minimum=1)
         product["low_stock_threshold"] = parse_positive_int(product.get("low_stock_threshold"), get_runtime_int(app.db, "low_stock_alert_threshold", LOW_STOCK_ALERT_THRESHOLD), minimum=1)
+        active_preorders = get_active_preorder_backorder_quantity(app.db, product["name"])
+        product["preorder_enabled"] = product_preorder_enabled(product)
+        product["preorder_max_quantity"] = get_product_preorder_max_quantity(product)
+        product["preorder_total_limit"] = get_product_preorder_total_limit(product)
+        product["active_preorder_quantity"] = active_preorders
+        product["paid_preorder_quantity"] = get_paid_preorder_quantity(app.db, product["name"])
+        product["preorder_capacity_remaining"] = get_preorder_capacity_remaining(product, active_preorders)
         product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         position_products = sort_products_for_shop(list(app.db.products.find({}, {"name": 1, "shop_order": 1, "created_at": 1})))
         product["total_product_positions"] = len(position_products)
@@ -2537,6 +2544,9 @@ def register_routes(app: Flask) -> None:
             "max_order_quantity": 100,
             "low_stock_threshold": get_runtime_int(app.db, "low_stock_alert_threshold", LOW_STOCK_ALERT_THRESHOLD),
             "low_stock_alert_sent": False,
+            "preorder_enabled": False,
+            "preorder_max_quantity": 10,
+            "preorder_total_limit": 50,
             "warranty_days": warranty_days,
             "stock_manager_earning_rate_usdt": 0.0,
             "stock_manager_owner_rate_usdt": 0.0,
@@ -2617,9 +2627,12 @@ def register_routes(app: Flask) -> None:
             min_qty = int(str(request.form.get("min_order_quantity", "1")).strip())
             max_qty = int(str(request.form.get("max_order_quantity", "100")).strip())
             low_stock_threshold = int(str(request.form.get("low_stock_threshold", "10")).strip())
+            preorder_max_quantity = int(str(request.form.get("preorder_max_quantity", "10")).strip())
+            preorder_total_limit = int(str(request.form.get("preorder_total_limit", "50")).strip())
         except ValueError:
-            flash("Order limits and low-stock threshold must be whole numbers.", "error")
+            flash("Order limits, low-stock threshold, and preorder limits must be whole numbers.", "error")
             return redirect(url_for("product_manage", name=product["name"]))
+        preorder_enabled = request.form.get("preorder_enabled") == "1"
         if min_qty < 1:
             flash("Minimum order quantity must be at least 1.", "error")
             return redirect(url_for("product_manage", name=product["name"]))
@@ -2629,11 +2642,24 @@ def register_routes(app: Flask) -> None:
         if low_stock_threshold < 1:
             flash("Low-stock alert threshold must be at least 1.", "error")
             return redirect(url_for("product_manage", name=product["name"]))
+        if preorder_max_quantity < 1:
+            flash("Maximum preorder quantity must be at least 1.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        if preorder_total_limit < 1:
+            flash("Total active preorder limit must be at least 1.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
         app.db.products.update_one(
             {"_id": product["_id"]},
-            {"$set": {"min_order_quantity": min_qty, "max_order_quantity": max_qty, "low_stock_threshold": low_stock_threshold}},
+            {"$set": {
+                "min_order_quantity": min_qty,
+                "max_order_quantity": max_qty,
+                "low_stock_threshold": low_stock_threshold,
+                "preorder_enabled": preorder_enabled,
+                "preorder_max_quantity": preorder_max_quantity,
+                "preorder_total_limit": preorder_total_limit,
+            }},
         )
-        log_admin_action(app.db, "product_limits_saved", f"{product['name']} min={min_qty} max={max_qty} low_stock={low_stock_threshold}")
+        log_admin_action(app.db, "product_limits_saved", f"{product['name']} min={min_qty} max={max_qty} low_stock={low_stock_threshold} preorder={preorder_enabled} preorder_max={preorder_max_quantity} preorder_total={preorder_total_limit}")
         flash(f"Product settings saved for {product['name']}.", "success")
         return redirect(url_for("product_manage", name=product["name"]))
 
@@ -3568,30 +3594,40 @@ def register_routes(app: Flask) -> None:
             flash("Selected product was not found.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
-        # First clear any older paid pending-stock orders if stock already exists.
-        # New admin-created orders must never jump ahead of the existing queue.
-        process_pending_stock_orders(app.db, product["name"])
-
-        order, err = create_admin_created_order(user, product, quantity, admin_note=admin_note)
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
-        if not order:
-            flash(f"Could not create order for {user_label}: {err or 'unknown error'}", "error")
+        preorder_lock_token = acquire_product_preorder_lock(app.db, product["name"])
+        if not preorder_lock_token:
+            flash("This product is busy processing another preorder/order right now. Please try again in a few seconds.", "warning")
             return redirect(url_for("user_detail", user_id=user_id))
 
-        complete_order(app.db, user_id, order["order_id"])
-        updated_order = app.db.orders.find_one({"order_id": order["order_id"]}) or order
-        status = str(updated_order.get("status") or "").lower()
-        log_admin_action(
-            app.db,
-            "admin_order_created",
-            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={quantity} status={status}",
-        )
-        if status == "delivered":
-            flash(f"Created and delivered order {order['order_id']} for {user_label}.", "success")
-        elif status == "pending_stock":
-            flash(f"Created order {order['order_id']} for {user_label} and added it to Pending Stock Orders.", "warning")
-        else:
-            flash(f"Created order {order['order_id']} for {user_label}. Current status: {status_label(status)}.", "success")
+        try:
+            # First clear any older paid pending-stock orders if stock already exists.
+            # New admin-created orders must never jump ahead of the existing queue.
+            # Admin-created orders intentionally bypass preorder limits, but this
+            # lock makes their quantity visible to simultaneous user preorders.
+            process_pending_stock_orders(app.db, product["name"])
+
+            order, err = create_admin_created_order(user, product, quantity, admin_note=admin_note)
+            if not order:
+                flash(f"Could not create order for {user_label}: {err or 'unknown error'}", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+
+            complete_order(app.db, user_id, order["order_id"])
+            updated_order = app.db.orders.find_one({"order_id": order["order_id"]}) or order
+            status = str(updated_order.get("status") or "").lower()
+            log_admin_action(
+                app.db,
+                "admin_order_created",
+                f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={quantity} status={status}",
+            )
+            if status == "delivered":
+                flash(f"Created and delivered order {order['order_id']} for {user_label}.", "success")
+            elif status == "pending_stock":
+                flash(f"Created order {order['order_id']} for {user_label} and added it to Pending Stock Orders.", "warning")
+            else:
+                flash(f"Created order {order['order_id']} for {user_label}. Current status: {status_label(status)}.", "success")
+        finally:
+            release_product_preorder_lock(app.db, product["name"], preorder_lock_token)
         return redirect(url_for("user_detail", user_id=user_id))
 
     @app.post("/users/<int:user_id>/send-stock")
@@ -7438,12 +7474,81 @@ def rename_product_references(db, old_name: str, new_name: str) -> dict[str, int
     return {"orders": int(orders_result.modified_count or 0), "favorites": favorites_changed}
 
 
+def acquire_product_preorder_lock(db, product_name: str, *, lock_seconds: int = 15, wait_seconds: float = 3.0) -> str | None:
+    """Mongo-backed product lock shared by bot and WebAdmin preorder/order flows."""
+    clean_name = str(product_name or "").strip()
+    if not clean_name:
+        return None
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(0.2, float(wait_seconds or 0))
+    while True:
+        now = utcnow()
+        cutoff = now - timedelta(seconds=max(1, int(lock_seconds or 15)))
+        try:
+            locked = db.products.find_one_and_update(
+                {
+                    "name": name_regex(clean_name),
+                    "$or": [
+                        {"preorder_lock_token": {"$exists": False}},
+                        {"preorder_lock_token": None},
+                        {"preorder_lock_at": {"$exists": False}},
+                        {"preorder_lock_at": None},
+                        {"preorder_lock_at": {"$lte": cutoff}},
+                    ],
+                },
+                {"$set": {"preorder_lock_token": token, "preorder_lock_at": now}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            locked = None
+        if locked:
+            return token
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.08)
+
+
+def release_product_preorder_lock(db, product_name: str, token: str | None) -> bool:
+    if not token:
+        return False
+    res = db.products.update_one(
+        {"name": name_regex(str(product_name or "")), "preorder_lock_token": token},
+        {"$unset": {"preorder_lock_token": "", "preorder_lock_at": ""}},
+    )
+    return bool(res.modified_count)
+
+
 def get_pending_stock_quantity(db, product_name: str) -> int:
     rows = list(db.orders.aggregate([
         {"$match": {"product_name": name_regex(product_name), "status": "pending_stock"}},
         {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
     ]))
     return int(rows[0].get("total", 0)) if rows else 0
+
+
+def restore_popped_stock_items(
+    db,
+    product_name: str,
+    items: list[str],
+    *,
+    source: str = "webadmin",
+    note: str = "Restored after delivery finalization failure",
+) -> int:
+    """Put stock items back at the front of the live stock queue after rollback."""
+    clean_items = [str(item).strip() for item in (items or []) if str(item).strip()]
+    if not clean_items:
+        return 0
+    result = db.products.update_one(
+        {"name": name_regex(product_name)},
+        {"$push": {"stock": {"$each": clean_items, "$position": 0}}},
+    )
+    if not result.matched_count:
+        return 0
+    try:
+        record_stock_ledger_status(db, product_name, clean_items, "restored", source=source, note=note)
+    except Exception:
+        pass
+    return len(clean_items)
 
 
 def get_stock_count(db, product_name: str) -> int:
@@ -7453,6 +7558,98 @@ def get_stock_count(db, product_name: str) -> int:
 
 def get_available_stock_count(db, product_name: str) -> int:
     return max(0, get_stock_count(db, product_name) - get_pending_stock_quantity(db, product_name))
+
+
+def product_preorder_enabled(product: dict | None) -> bool:
+    return bool((product or {}).get("preorder_enabled"))
+
+
+def get_product_preorder_max_quantity(product: dict | None, default: int = 10) -> int:
+    try:
+        value = int((product or {}).get("preorder_max_quantity") or default or 10)
+    except Exception:
+        value = default or 10
+    return max(1, value)
+
+
+def get_product_preorder_total_limit(product: dict | None, default: int = 50) -> int:
+    try:
+        value = int((product or {}).get("preorder_total_limit") or default or 50)
+    except Exception:
+        value = default or 50
+    return max(1, value)
+
+
+def get_active_preorder_quantity(db, product_name: str) -> int:
+    rows = list(db.orders.aggregate([
+        {"$match": {
+            "product_name": name_regex(product_name),
+            "is_preorder": True,
+            "status": {"$in": ["pending", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+        }},
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ]))
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+def get_active_preorder_backorder_quantity(db, product_name: str) -> int:
+    """Total active demand that consumes public preorder capacity.
+
+    Counts all pending/pending-stock product orders, including admin-created
+    waiting-stock orders, so user preorders stop once the product's backlog
+    reaches the configured limit. Admin-created orders may still exceed it.
+    """
+    rows = list(db.orders.aggregate([
+        {"$match": {
+            "product_name": name_regex(product_name),
+            "status": {"$in": ["pending", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+        }},
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ]))
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+def get_active_user_preorder_quantity(db, user_id: int, product_name: str) -> int:
+    rows = list(db.orders.aggregate([
+        {"$match": {
+            "user_id": int(user_id),
+            "product_name": name_regex(product_name),
+            "is_preorder": True,
+            "status": {"$in": ["pending", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+        }},
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ]))
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+def get_paid_preorder_quantity(db, product_name: str) -> int:
+    rows = list(db.orders.aggregate([
+        {"$match": {
+            "product_name": name_regex(product_name),
+            "is_preorder": True,
+            "status": "pending_stock",
+        }},
+        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+    ]))
+    return int(rows[0].get("total", 0)) if rows else 0
+
+
+def get_preorder_capacity_remaining(product: dict | None, active_quantity: int) -> int:
+    if not product_preorder_enabled(product):
+        return 0
+    return max(0, get_product_preorder_total_limit(product) - int(active_quantity or 0))
+
+
+def get_user_preorder_capacity_remaining(product: dict | None, active_user_quantity: int) -> int:
+    try:
+        product_max = parse_positive_int((product or {}).get("max_order_quantity"), 100, minimum=1)
+    except Exception:
+        product_max = 100
+    user_limit = min(get_product_preorder_max_quantity(product), product_max)
+    return max(0, user_limit - int(active_user_quantity or 0))
 
 
 def get_product_restock_threshold(db, product: dict | None) -> int:
@@ -7677,7 +7874,13 @@ def get_products_with_availability(
         product["enabled"] = product.get("enabled", True)
         product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         product["low_stock_threshold"] = parse_positive_int(product.get("low_stock_threshold"), default_threshold, minimum=1)
+        active_preorders = get_active_preorder_backorder_quantity(db, product.get("name"))
         product["pending_stock_quantity"] = pending
+        product["preorder_enabled"] = product_preorder_enabled(product)
+        product["preorder_max_quantity"] = get_product_preorder_max_quantity(product)
+        product["preorder_total_limit"] = get_product_preorder_total_limit(product)
+        product["active_preorder_quantity"] = active_preorders
+        product["preorder_capacity_remaining"] = get_preorder_capacity_remaining(product, active_preorders)
         product["available_stock"] = max(0, actual - pending)
     return products
 
@@ -8104,6 +8307,14 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
     if order.get("status") != "pending_stock" and has_pending_stock_ahead(db, product_name, order.get("created_at"), order.get("order_id")):
         mark_order_pending_stock(db, ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
+        delete_payment_message(db, ref_id)
+        try:
+            process_pending_stock_orders(db, product_name)
+        except Exception:
+            current_app.logger.exception("Could not drain pending-stock queue after queuing %s", ref_id)
+        latest = db.orders.find_one({"order_id": str(ref_id or "").strip().upper()})
+        if latest and latest.get("status") == "delivered":
+            return
         send_pending_stock_notice(user_id, order, queued=True)
         send_admin_message(f"⏳ Paid order queued behind older pending stock orders.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}")
         return
@@ -8111,6 +8322,7 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
     if not items:
         mark_order_pending_stock(db, ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
+        delete_payment_message(db, ref_id)
         send_pending_stock_notice(user_id, order)
         send_admin_message(
             f"⚠️ Paid order is waiting for stock.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\n\nAdd stock from the web panel or with /addstock {product_name}."
@@ -8119,8 +8331,16 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
     was_pending_stock = order.get("status") == "pending_stock"
     updated = update_order_status(db, ref_id, "delivered", items, delivery_token=delivery_token)
     if not updated:
+        restore_popped_stock_items(
+            db,
+            product_name,
+            items,
+            source="webadmin",
+            note=f"Restored because paid order {ref_id} could not be finalized",
+        )
+        clear_order_delivery_lock(db, ref_id, delivery_token=delivery_token)
         send_admin_message(
-            f"🚨 Stock delivery finalization failed after stock was removed.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\nPlease inspect this order before taking action."
+            f"🚨 Stock delivery finalization failed after stock was removed, so the stock was restored.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\nPlease retry delivery after checking this order."
         )
         return
     if is_admin_created_order(order) and not was_pending_stock:
@@ -8128,39 +8348,93 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
     send_order_items(user_id, order, items, from_pending=was_pending_stock)
     delete_payment_message(db, ref_id)
     notify_low_stock_if_needed(db, product_name)
+    try:
+        process_pending_stock_orders(db, product_name)
+    except Exception:
+        current_app.logger.exception("Could not drain pending-stock queue after delivering %s", ref_id)
 
 
-def process_pending_stock_orders(db, product_name: str) -> dict[str, int]:
-    pending_orders = list(db.orders.find({"product_name": name_regex(product_name), "status": "pending_stock"}).sort("created_at", 1).limit(100))
+def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict[str, int]:
+    """Deliver paid pending-stock orders oldest-first and retry the queue safely."""
     delivered_orders = 0
     delivered_items = 0
-    for order in pending_orders:
-        qty = int(order.get("quantity", 1) or 1)
-        if get_stock_count(db, product_name) < qty:
+    locked_orders = 0
+    blocked_by_stock = 0
+    restored_items = 0
+    safe_limit = max(1, min(int(limit or 100), 500))
+    safe_passes = max(1, min(int(max_passes or 3), 10))
+
+    for _pass in range(safe_passes):
+        pending_orders = list(
+            db.orders.find({"product_name": name_regex(product_name), "status": "pending_stock"})
+            .sort("created_at", 1)
+            .limit(safe_limit)
+        )
+        if not pending_orders:
             break
-        claimed = claim_order_delivery(db, order.get("order_id"))
-        if not claimed:
-            continue
-        delivery_token = claimed.get("delivery_lock_token")
-        items = pop_stock(db, product_name, qty)
-        if not items:
-            mark_order_pending_stock(db, order.get("order_id"), delivery_token=delivery_token)
+
+        pass_delivered = 0
+        stop_pass = False
+        for order in pending_orders:
+            order_id = order.get("order_id")
+            qty = int(order.get("quantity", 1) or 1)
+            if get_stock_count(db, product_name) < qty:
+                blocked_by_stock += 1
+                stop_pass = True
+                break
+
+            claimed = claim_order_delivery(db, order_id)
+            if not claimed:
+                # Keep FIFO priority: do not skip an older locked order and
+                # deliver younger waiting-stock orders first.
+                locked_orders += 1
+                stop_pass = True
+                break
+            delivery_token = claimed.get("delivery_lock_token")
+
+            items = pop_stock(db, product_name, qty)
+            if not items:
+                mark_order_pending_stock(db, order_id, delivery_token=delivery_token)
+                blocked_by_stock += 1
+                stop_pass = True
+                break
+
+            updated = update_order_status(db, order_id, "delivered", items, delivery_token=delivery_token)
+            if not updated:
+                restored_items += restore_popped_stock_items(
+                    db,
+                    product_name,
+                    items,
+                    source="webadmin",
+                    note=f"Restored because pending-stock order {order_id} could not be finalized",
+                )
+                clear_order_delivery_lock(db, order_id, delivery_token=delivery_token)
+                send_admin_message(
+                    f"🚨 Pending-stock finalization failed after stock was removed, so the stock was restored.\n"
+                    f"Product: {product_name}\nQuantity: {qty}\nRef: {order_id}"
+                )
+                stop_pass = True
+                break
+
+            delivered_orders += 1
+            pass_delivered += 1
+            delivered_items += len(items)
+            send_order_items(int(order.get("user_id", 0) or 0), order, items, from_pending=True)
+            delete_payment_message(db, order_id)
+
+        if stop_pass or pass_delivered == 0:
             break
-        updated = update_order_status(db, order["order_id"], "delivered", items, delivery_token=delivery_token)
-        if not updated:
-            send_admin_message(
-                f"🚨 Pending-stock finalization failed after stock was removed.\nProduct: {product_name}\nQuantity: {qty}\nRef: {order.get('order_id')}"
-            )
-            continue
-        delivered_orders += 1
-        delivered_items += len(items)
-        send_order_items(int(order.get("user_id", 0) or 0), order, items, from_pending=True)
-        delete_payment_message(db, order["order_id"])
+
     if delivered_orders:
         send_admin_message(f"✅ Auto-delivered {delivered_orders} pending order(s) for {product_name} using {delivered_items} stock item(s).")
     notify_low_stock_if_needed(db, product_name)
-    return {"orders_delivered": delivered_orders, "items_delivered": delivered_items}
-
+    return {
+        "orders_delivered": delivered_orders,
+        "items_delivered": delivered_items,
+        "locked_orders": locked_orders,
+        "blocked_by_stock": blocked_by_stock,
+        "restored_items": restored_items,
+    }
 
 def complete_wallet_load(db, user_id: int, pending: dict) -> None:
     ref_id = pending.get("ref_id", "")
@@ -8225,6 +8499,24 @@ def update_order_status(
 
 def mark_order_pending_stock(db, order_id: str, *, delivery_token: str | None = None) -> bool:
     return update_order_status(db, order_id, "pending_stock", delivery_token=delivery_token)
+
+
+def claim_pending_stock_notice(db, order_id: str) -> bool:
+    """Claim the one-time pending-stock user notice for this order."""
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return False
+    res = db.orders.update_one(
+        {
+            "order_id": clean_order_id,
+            "$or": [
+                {"pending_stock_notice_sent_at": {"$exists": False}},
+                {"pending_stock_notice_sent_at": None},
+            ],
+        },
+        {"$set": {"pending_stock_notice_sent_at": utcnow()}},
+    )
+    return bool(res.modified_count)
 
 
 def notify_low_stock_if_needed(db, product_name: str) -> None:
@@ -8844,9 +9136,16 @@ def is_admin_created_order(order: dict | None) -> bool:
 
 
 def send_pending_stock_notice(user_id: int, order: dict, queued: bool = False) -> None:
+    order_id = str(order.get("order_id", "N/A") or "N/A")
+    try:
+        if not claim_pending_stock_notice(current_app.db, order_id):
+            current_app.logger.info("Pending-stock notice already sent for order=%s", order_id)
+            return
+    except Exception:
+        current_app.logger.exception("Could not claim pending-stock notice for order=%s", order_id)
+        return
     lang = get_user_language_sync(current_app.db, user_id)
     product_name = order.get("product_name", "Product")
-    order_id = order.get("order_id", "N/A")
     if is_admin_created_order(order):
         queue_note = tr(lang, "admin_created_order_stock_queued") if queued else tr(lang, "admin_created_order_stock_waiting")
         message = tr(
