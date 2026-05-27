@@ -94,7 +94,7 @@
   {% if payout_requests %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Admin</th><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Details</th></tr></thead>
+      <thead><tr><th>Admin</th><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Note</th></tr></thead>
       <tbody>
       {% for req in payout_requests %}
         <tr>
@@ -103,7 +103,7 @@
           <td>{{ req.payment_method_label or stock_manager_payment_method_label(req.payment_method) }}</td>
           <td class="center-cell status-cell"><span class="badge {{ 'success' if req.status == 'paid' else 'warning' }}">{{ (req.status or 'pending')|title }}</span></td>
           <td>{{ fmt_dt(req.requested_at) }}</td>
-          <td><pre class="compact-pre">{{ req.payment_details }}</pre></td>
+          <td><pre class="compact-pre">{{ req.note_label or req.note or '—' }}</pre></td>
         </tr>
       {% endfor %}
       </tbody>

@@ -216,7 +216,7 @@
   {% if payout_requests %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Paid at</th><th>Paid by</th><th>Payment details</th></tr></thead>
+      <thead><tr><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Paid at</th><th>Paid by</th><th>Note</th></tr></thead>
       <tbody>
       {% for req in payout_requests %}
         <tr>
@@ -226,7 +226,7 @@
           <td>{{ fmt_dt(req.requested_at) }}</td>
           <td>{{ fmt_dt(req.paid_at) if req.paid_at else '—' }}</td>
           <td>{{ req.paid_by_label or '—' }}</td>
-          <td><pre class="compact-pre">{{ req.payment_details }}</pre></td>
+          <td><pre class="compact-pre">{{ req.note_label or req.note or '—' }}</pre></td>
         </tr>
       {% endfor %}
       </tbody>

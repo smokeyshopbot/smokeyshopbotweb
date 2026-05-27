@@ -1586,7 +1586,10 @@ def register_routes(app: Flask) -> None:
         admin_accounts = get_admin_accounts(settings)
         stock_manager_rows = build_stock_manager_admin_rows(app.db, admin_accounts)
         stock_summary_by_id = {str(row.get("account", {}).get("id") or ""): row.get("summary", {}) for row in stock_manager_rows}
-        payout_requests = list(app.db.stock_manager_payment_requests.find().sort("requested_at", -1).limit(50))
+        payout_requests = [
+            _enrich_stock_manager_payout_request(app.db, doc)
+            for doc in app.db.stock_manager_payment_requests.find().sort("requested_at", -1).limit(50)
+        ]
         return render_template(
             "admins.html",
             admin_accounts=admin_accounts,
@@ -1816,6 +1819,7 @@ def register_routes(app: Flask) -> None:
                     "paid_by": current_admin_username() or "owner",
                     "paid_by_role": paid_by_role,
                     "paid_by_role_label": paid_by_role_label,
+                    "note": note,
                 }},
             )
         log_admin_action(app.db, "stock_manager_payout_cleared", f"{username}: {clear_amount:.2f} USDT")
@@ -6134,10 +6138,22 @@ def get_stock_manager_payout_history(db, username: str, limit: int = 50) -> list
 
 def _enrich_stock_manager_payout_request(db, request_doc: dict[str, Any]) -> dict[str, Any]:
     request_doc = dict(request_doc or {})
-    if str(request_doc.get("status") or "pending").strip().lower() == "paid":
+    status = str(request_doc.get("status") or "pending").strip().lower()
+    if status == "paid":
         request_doc["paid_by_label"] = stock_manager_payout_paid_by_label(db, request_doc)
+        if not str(request_doc.get("note") or "").strip() and request_doc.get("_id") is not None:
+            try:
+                linked_payout = db.stock_manager_payouts.find_one(
+                    {"payment_request_id": str(request_doc.get("_id"))},
+                    {"note": 1},
+                )
+            except Exception:
+                linked_payout = None
+            if linked_payout and str(linked_payout.get("note") or "").strip():
+                request_doc["note"] = str(linked_payout.get("note") or "").strip()
     else:
         request_doc["paid_by_label"] = "—"
+    request_doc["note_label"] = str(request_doc.get("note") or "").strip() or "—"
     return request_doc
 
 
@@ -6176,6 +6192,7 @@ def get_stock_manager_payout_requests(db, username: str, limit: int = 50) -> lis
             "source": "payout",
         }
         synthetic["paid_by_label"] = stock_manager_payout_paid_by_label(db, synthetic)
+        synthetic["note_label"] = str(synthetic.get("note") or "").strip() or "—"
         request_docs.append(synthetic)
 
     request_docs.sort(
