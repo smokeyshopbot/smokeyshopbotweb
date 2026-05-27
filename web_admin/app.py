@@ -716,6 +716,40 @@ def get_admin_login_config(db) -> tuple[str, str, bool]:
     return os.getenv("ADMIN_PANEL_USERNAME", "admin"), os.getenv("ADMIN_PANEL_PASSWORD", ""), False
 
 
+def admin_role_label_for_username(db, username: Any, fallback_role: str | None = None) -> str:
+    """Return a display label for an admin actor without exposing the login name."""
+    role = str(fallback_role or "").strip().lower()
+    if role in ADMIN_ROLE_LABELS:
+        return ADMIN_ROLE_LABELS[role]
+    username_key = normalize_admin_username(username)
+    if not username_key:
+        return ADMIN_ROLE_LABELS[ADMIN_ROLE_OWNER]
+    settings = get_secret_settings(db)
+    main_username = str(settings.get("admin_panel_username") or os.getenv("ADMIN_PANEL_USERNAME", "admin") or "admin").strip()
+    if normalize_admin_username(main_username) == username_key:
+        return ADMIN_ROLE_LABELS[ADMIN_ROLE_OWNER]
+    for account in get_admin_accounts(settings):
+        if normalize_admin_username(account.get("username")) == username_key:
+            account_role = normalize_admin_role(account.get("role"))
+            return ADMIN_ROLE_LABELS.get(account_role, account_role.replace("_", " ").title())
+    # Older payout records only saved the owner username. Keep the UI role-based.
+    return ADMIN_ROLE_LABELS[ADMIN_ROLE_OWNER]
+
+
+def stock_manager_payout_paid_by_label(db, record: dict | None) -> str:
+    record = record or {}
+    status = str(record.get("status") or "").strip().lower()
+    if status and status != "paid":
+        return "—"
+    explicit_label = str(record.get("paid_by_role_label") or "").strip()
+    if explicit_label:
+        return explicit_label
+    explicit_role = str(record.get("paid_by_role") or "").strip().lower()
+    if explicit_role in ADMIN_ROLE_LABELS:
+        return ADMIN_ROLE_LABELS[explicit_role]
+    return admin_role_label_for_username(db, record.get("paid_by"))
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.db = _connect_db()  # type: ignore[attr-defined]
@@ -1585,7 +1619,7 @@ def register_routes(app: Flask) -> None:
             payment_details_text = format_stock_manager_payment_details(account)
             payment_method_label = stock_manager_payment_method_label(account.get("payment_method"))
             payout_history = stats.get("payout_history", [])
-            payout_requests = list(app.db.stock_manager_payment_requests.find({"username_key": normalize_admin_username(username)}).sort("requested_at", -1).limit(50))
+            payout_requests = stats.get("payout_requests", [])
             all_products = list(app.db.products.find({}, {"name": 1}).sort("name", 1))
         return render_template(
             "admin_detail.html",
@@ -1753,6 +1787,8 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("admin_account_detail", account_id=account_id))
         note = (request.form.get("note") or "").strip()
         paid_at = utcnow()
+        paid_by_role = current_admin_role()
+        paid_by_role_label = ADMIN_ROLE_LABELS.get(paid_by_role, paid_by_role.replace("_", " ").title())
         payout_doc = {
             "username": username,
             "username_key": username_key,
@@ -1762,6 +1798,8 @@ def register_routes(app: Flask) -> None:
             "payment_details": format_stock_manager_payment_details(account),
             "note": note,
             "paid_by": current_admin_username() or "owner",
+            "paid_by_role": paid_by_role,
+            "paid_by_role_label": paid_by_role_label,
             "created_at": paid_at,
         }
         if pending_request:
@@ -1776,6 +1814,8 @@ def register_routes(app: Flask) -> None:
                     "paid_at": paid_at,
                     "paid_amount_usdt": clear_amount,
                     "paid_by": current_admin_username() or "owner",
+                    "paid_by_role": paid_by_role,
+                    "paid_by_role_label": paid_by_role_label,
                 }},
             )
         log_admin_action(app.db, "stock_manager_payout_cleared", f"{username}: {clear_amount:.2f} USDT")
@@ -6092,6 +6132,59 @@ def get_stock_manager_payout_history(db, username: str, limit: int = 50) -> list
     return list(db.stock_manager_payouts.find({"username_key": username_key}).sort("created_at", -1).limit(limit))
 
 
+def _enrich_stock_manager_payout_request(db, request_doc: dict[str, Any]) -> dict[str, Any]:
+    request_doc = dict(request_doc or {})
+    if str(request_doc.get("status") or "pending").strip().lower() == "paid":
+        request_doc["paid_by_label"] = stock_manager_payout_paid_by_label(db, request_doc)
+    else:
+        request_doc["paid_by_label"] = "—"
+    return request_doc
+
+
+def get_stock_manager_payout_requests(db, username: str, limit: int = 50) -> list[dict[str, Any]]:
+    username_key = normalize_admin_username(username)
+    if not username_key:
+        return []
+    request_docs = [
+        _enrich_stock_manager_payout_request(db, doc)
+        for doc in db.stock_manager_payment_requests.find({"username_key": username_key}).sort("requested_at", -1).limit(limit)
+    ]
+    linked_request_ids = {str(doc.get("_id")) for doc in request_docs if doc.get("_id") is not None}
+
+    # Older/direct owner clears live in stock_manager_payouts only. Surface them in
+    # the single payout request history so the UI no longer needs a separate
+    # payment history table. Linked payouts are skipped to avoid duplicates.
+    for payout in db.stock_manager_payouts.find({"username_key": username_key}).sort("created_at", -1).limit(limit):
+        payment_request_id = str(payout.get("payment_request_id") or "").strip()
+        if payment_request_id and payment_request_id in linked_request_ids:
+            continue
+        synthetic = {
+            "username": payout.get("username") or username,
+            "username_key": username_key,
+            "amount_usdt": payout.get("requested_amount_usdt") or payout.get("amount_usdt"),
+            "paid_amount_usdt": payout.get("amount_usdt"),
+            "payment_method": payout.get("payment_method"),
+            "payment_method_label": payout.get("payment_method_label"),
+            "payment_details": payout.get("payment_details"),
+            "status": "paid",
+            "requested_at": payout.get("created_at"),
+            "paid_at": payout.get("created_at"),
+            "paid_by": payout.get("paid_by"),
+            "paid_by_role": payout.get("paid_by_role"),
+            "paid_by_role_label": payout.get("paid_by_role_label"),
+            "note": payout.get("note"),
+            "source": "payout",
+        }
+        synthetic["paid_by_label"] = stock_manager_payout_paid_by_label(db, synthetic)
+        request_docs.append(synthetic)
+
+    request_docs.sort(
+        key=lambda doc: sort_dt(doc.get("requested_at") or doc.get("paid_at") or doc.get("created_at")),
+        reverse=True,
+    )
+    return request_docs[:limit]
+
+
 def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
     username_key = normalize_admin_username(username)
     assigned_product_names = get_stock_manager_assigned_product_names(db, username)
@@ -6258,6 +6351,7 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
     clearable_payout = round(max(0.0, clearable_payout), 2)
     payment_details = get_stock_manager_payment_details(db, username)
     payout_history = get_stock_manager_payout_history(db, username)
+    payout_requests = get_stock_manager_payout_requests(db, username)
     replacement_summary = get_stock_manager_replacement_summary(db, username)
     summary = {
         "username": username,
@@ -6279,7 +6373,7 @@ def build_stock_manager_dashboard(db, username: str) -> dict[str, Any]:
         "assigned_product_names": assigned_product_names,
         **payment_details,
     }
-    return {"summary": summary, "products": products, "payout_history": payout_history, "replacement_summary": replacement_summary}
+    return {"summary": summary, "products": products, "payout_history": payout_history, "payout_requests": payout_requests, "replacement_summary": replacement_summary}
 
 
 def build_stock_manager_admin_rows(db, admin_accounts: list[dict]) -> list[dict[str, Any]]:

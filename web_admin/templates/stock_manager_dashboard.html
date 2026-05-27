@@ -133,7 +133,7 @@
         </div>
       </div>
 
-      {% if summary.payment_details_updated_at %}<small class="muted">Last updated: {{ summary.payment_details_updated_at }}</small>{% endif %}
+      {% if summary.payment_details_updated_at %}<small class="muted">Last updated: {{ fmt_dt(summary.payment_details_updated_at) }}</small>{% endif %}
       <button class="primary" type="submit">Save payment details</button>
     </form>
     <div class="payout-request-box payout-request-box-centered">
@@ -166,31 +166,33 @@
 <section class="panel">
   <div class="toolbar">
     <div>
-      <h2>Payment history</h2>
-      <p class="muted">Payments the owner has marked as paid to you.</p>
+      <h2>Payout request history</h2>
+      <p class="muted">Your payout requests and paid owner clears are shown here.</p>
     </div>
   </div>
-  {% if stats.payout_history %}
+  {% if stats.payout_requests %}
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Date</th><th>Amount</th><th>Paid by</th><th>Method</th><th>Owner note</th></tr>
+        <tr><th>Amount</th><th>Method</th><th class="status-col">Status</th><th>Requested</th><th>Paid at</th><th>Paid by</th><th>Payment details</th></tr>
       </thead>
       <tbody>
-      {% for payout in stats.payout_history %}
+      {% for req in stats.payout_requests %}
         <tr>
-          <td>{{ fmt_dt(payout.created_at) }}</td>
-          <td><strong>{{ money_usdt(payout.amount_usdt) }}</strong></td>
-          <td>{{ payout.paid_by or 'owner' }}</td>
-          <td>{{ payout.payment_method_label or stock_manager_payment_method_label(payout.payment_method) }}</td>
-          <td>{{ payout.note or '—' }}</td>
+          <td><strong>{{ money_usdt(req.amount_usdt) }}</strong></td>
+          <td>{{ req.payment_method_label or stock_manager_payment_method_label(req.payment_method) }}</td>
+          <td class="center-cell status-cell"><span class="badge {{ 'success' if req.status == 'paid' else 'warning' }}">{{ (req.status or 'pending')|title }}</span></td>
+          <td>{{ fmt_dt(req.requested_at) }}</td>
+          <td>{{ fmt_dt(req.paid_at) if req.paid_at else '—' }}</td>
+          <td>{{ req.paid_by_label or '—' }}</td>
+          <td><pre class="compact-pre">{{ req.payment_details }}</pre></td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
   </div>
   {% else %}
-    <p class="muted">No paid payout history yet.</p>
+    <p class="muted">No payout requests yet.</p>
   {% endif %}
 </section>
 
