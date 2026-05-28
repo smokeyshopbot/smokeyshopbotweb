@@ -26,6 +26,35 @@ from config import MONGO_URI, DB_NAME
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
+_SETTING_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _cache_get(key: str, ttl_seconds: float) -> Any:
+    try:
+        created_at, value = _SETTING_CACHE.get(key, (0.0, None))
+        if ttl_seconds > 0 and (time.monotonic() - float(created_at)) <= ttl_seconds:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _SETTING_CACHE[key] = (time.monotonic(), value)
+
+
+def _cache_forget(key: str) -> None:
+    _SETTING_CACHE.pop(key, None)
+
+
+async def get_setting_cached(key: str, default=None, *, ttl_seconds: float = 5.0):
+    cache_key = f"setting:{key}"
+    cached = _cache_get(cache_key, ttl_seconds)
+    if cached is not None:
+        return cached
+    value = await get_setting(key, default)
+    _cache_set(cache_key, value)
+    return value
 
 
 def _name_regex(name: str) -> dict:
@@ -421,8 +450,7 @@ async def set_user_language(user_id: int, language: str) -> str:
 
 
 async def get_enabled_languages() -> list[str]:
-    doc = await get_db().settings.find_one({"key": "language_settings"}) or {}
-    value = doc.get("value") if isinstance(doc, dict) else {}
+    value = await get_setting_cached("language_settings", {}, ttl_seconds=10.0)
     enabled = value.get("enabled_languages") if isinstance(value, dict) else None
     if not isinstance(enabled, list):
         enabled = ["en", "es"]
@@ -983,8 +1011,18 @@ async def restore_popped_stock_items(
 
 
 async def get_stock_count(product_name: str) -> int:
-    product = await get_product(product_name)
-    return len(product.get("stock", [])) if product else 0
+    """Count live stock without downloading the full stock array from MongoDB."""
+    rows = await get_db().products.aggregate([
+        {"$match": {"name": _name_regex(product_name)}},
+        {"$project": {"_id": 0, "stock_count": _product_stock_count_expr()}},
+        {"$limit": 1},
+    ]).to_list(length=1)
+    if not rows:
+        return 0
+    try:
+        return max(0, int(rows[0].get("stock_count") or 0))
+    except Exception:
+        return 0
 
 
 async def get_pending_stock_quantity(product_name: str) -> int:
@@ -2257,8 +2295,7 @@ def _clean_payment_settings(settings: dict | None) -> dict:
 
 
 async def get_payment_settings() -> dict:
-    doc = await get_db().settings.find_one({"key": PAYMENT_SETTINGS_KEY})
-    value = doc.get("value") if doc else None
+    value = await get_setting_cached(PAYMENT_SETTINGS_KEY, None, ttl_seconds=5.0)
     return _clean_payment_settings(value if isinstance(value, dict) else None)
 
 
@@ -2269,6 +2306,7 @@ async def set_payment_settings(settings: dict) -> dict:
         {"$set": {"key": PAYMENT_SETTINGS_KEY, "value": cleaned, "updated_at": datetime.now(timezone.utc)}},
         upsert=True,
     )
+    _cache_forget(f"setting:{PAYMENT_SETTINGS_KEY}")
     return cleaned
 
 
@@ -2307,6 +2345,9 @@ async def set_setting(key: str, value):
         {"$set": {"key": key, "value": value, "updated_at": datetime.now(timezone.utc)}},
         upsert=True,
     )
+    _cache_forget(f"setting:{key}")
+    if key == "secret_settings":
+        _cache_forget("secret_settings_full")
 
 
 async def get_setting(key: str, default=None):
@@ -2315,7 +2356,10 @@ async def get_setting(key: str, default=None):
 
 
 async def get_secret_settings() -> dict:
-    value = await get_setting("secret_settings", {})
+    cached = _cache_get("secret_settings_full", 15.0)
+    if isinstance(cached, dict):
+        return dict(cached)
+    value = await get_setting_cached("secret_settings", {}, ttl_seconds=15.0)
     settings = dict(value) if isinstance(value, dict) else {}
     try:
         token_doc = await get_db().runtime_config.find_one({"key": "telegram_bot_token"})
@@ -2325,6 +2369,7 @@ async def get_secret_settings() -> dict:
             settings["bot_token_runtime_updated_at"] = (token_doc or {}).get("updated_at")
     except Exception:
         pass
+    _cache_set("secret_settings_full", dict(settings))
     return settings
 
 
@@ -2349,7 +2394,7 @@ async def set_maintenance_mode(enabled: bool):
 
 
 async def is_maintenance_mode() -> bool:
-    return bool(await get_setting("maintenance_mode", False))
+    return bool(await get_setting_cached("maintenance_mode", False, ttl_seconds=2.0))
 
 
 def _stock_notification_key(product_name: Any) -> str:
