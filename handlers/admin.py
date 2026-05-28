@@ -1750,7 +1750,7 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _log_telegram_admin_action(
         update,
         "telegram_stock_added",
-        f"{product_name}: added={count} skipped={skipped_count} rejected_by_pool={rejected_by_pool_count} delivered_orders={delivered_orders} delivered_items={delivered_items} available={available} pending={pending_qty}",
+        f"{product_name}: added={count} skipped={skipped_count} rejected_by_pool={rejected_by_pool_count} pending_orders_sent={delivered_orders} pending_units_sent={delivered_items} available={available} pending={pending_qty}",
     )
     skipped_line = f"↩️ Skipped duplicate item(s): *{skipped_count}*\n" if skipped_count else ""
     rejected_line = f"🚫 Rejected not in owner-approved pool: *{rejected_by_pool_count}* item(s).\n" if rejected_by_pool_count else ""
