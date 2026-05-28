@@ -43,14 +43,14 @@
   <div class="toolbar">
     <div>
       <h2>Admin accounts</h2>
-      <p class="muted">Stock-manager details are inside each account’s Manage page, not expanded here.</p>
+      <p class="muted">See each stock manager’s pending replacement count here; open Manage only when you need details.</p>
     </div>
     {% if pending_payout_request_count %}<span class="badge warning">{{ pending_payout_request_count }} payout request{{ '' if pending_payout_request_count == 1 else 's' }} pending</span>{% endif %}
   </div>
   {% if admin_accounts %}
   <div class="table-wrap">
     <table class="admins-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Created</th><th class="status-col">Payment requests</th><th class="actions-col">Actions</th></tr></thead>
+      <thead><tr><th>Username</th><th>Role</th><th>Created</th><th class="status-col">Pending replacements</th><th class="status-col">Payment requests</th><th class="actions-col">Actions</th></tr></thead>
       <tbody>
       {% for account in admin_accounts %}
         {% set summary = stock_summary_by_id.get(account.id, {}) %}
@@ -58,6 +58,18 @@
           <td><strong>{{ account.username }}</strong></td>
           <td>{{ admin_role_labels.get(account.role, account.role) }}</td>
           <td>{{ fmt_dt(account.created_at) }}</td>
+          <td class="status-cell admin-status-cell">
+            {% if account.role == 'stock_manager' %}
+              {% set pending_replacements = summary.get('pending_replacement_count', 0)|int %}
+              {% if pending_replacements %}
+                <span class="badge warning compact-badge">{{ pending_replacements }}</span>
+              {% else %}
+                <span class="muted admin-not-stock">0</span>
+              {% endif %}
+            {% else %}
+              <span class="muted admin-not-stock">—</span>
+            {% endif %}
+          </td>
           <td class="status-cell admin-status-cell">
             {% if account.role == 'stock_manager' and summary.get('pending_payment_request') %}
               <span class="badge warning compact-badge manager-pending-badge">Request pending</span>
