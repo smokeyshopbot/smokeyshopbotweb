@@ -7949,6 +7949,23 @@ def _pending_stock_quantity_map(db) -> dict[str, int]:
     return totals
 
 
+def _active_preorder_backorder_quantity_map(db) -> dict[str, int]:
+    """Return all active preorder/backorder demand in one DB round trip."""
+    rows = db.orders.aggregate([
+        {"$match": {
+            "status": {"$in": ["pending", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+        }},
+        {"$group": {"_id": "$product_name", "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+    ])
+    totals: dict[str, int] = {}
+    for row in rows:
+        key = product_name_key(row.get("_id"))
+        if key:
+            totals[key] = totals.get(key, 0) + int(row.get("total") or 0)
+    return totals
+
+
 def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_items: bool = False) -> list[dict]:
     project: dict[str, Any] = {
         "name": 1,
@@ -7964,6 +7981,9 @@ def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_item
         "description": 1,
         "description_en": 1,
         "description_es": 1,
+        "preorder_enabled": 1,
+        "preorder_max_quantity": 1,
+        "preorder_total_limit": 1,
         "stock_manager_earning_rate_usdt": 1,
         "stock_manager_owner_rate_usdt": 1,
         "actual_stock": _product_stock_count_expr(),
@@ -8042,14 +8062,16 @@ def get_products_with_availability(
         query = product_query or visibility_query
     products = sort_products_for_shop(_products_with_stock_counts(db, query, include_stock_items=include_stock_items))
     pending_by_product = _pending_stock_quantity_map(db)
+    active_backorder_by_product = _active_preorder_backorder_quantity_map(db)
     default_threshold = max(1, get_runtime_int(db, "low_stock_alert_threshold", LOW_STOCK_ALERT_THRESHOLD))
     for product in products:
+        key = product_name_key(product.get("name"))
         actual = int(product.get("actual_stock") or 0)
-        pending = int(pending_by_product.get(product_name_key(product.get("name")), 0) or 0)
+        pending = int(pending_by_product.get(key, 0) or 0)
+        active_preorders = int(active_backorder_by_product.get(key, 0) or 0)
         product["enabled"] = product.get("enabled", True)
         product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         product["low_stock_threshold"] = parse_positive_int(product.get("low_stock_threshold"), default_threshold, minimum=1)
-        active_preorders = get_active_preorder_backorder_quantity(db, product.get("name"))
         product["pending_stock_quantity"] = pending
         product["preorder_enabled"] = product_preorder_enabled(product)
         product["preorder_max_quantity"] = get_product_preorder_max_quantity(product)

@@ -33,6 +33,14 @@ def _name_regex(name: str) -> dict:
     return {"$regex": f"^{re.escape(name.strip())}$", "$options": "i"}
 
 
+def _product_name_key(name: Any) -> str:
+    return str(name or "").strip().lower()
+
+
+def _product_stock_count_expr() -> dict:
+    return {"$cond": [{"$isArray": "$stock"}, {"$size": "$stock"}, 0]}
+
+
 def normalize_approved_stock_item(item: Any) -> str:
     """Normalize stock text for owner-approved pool matching.
 
@@ -988,10 +996,24 @@ async def get_pending_stock_quantity(product_name: str) -> int:
                 "status": "pending_stock",
             }
         },
-        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
     ])
     rows = await cursor.to_list(length=1)
     return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_pending_stock_quantity_map() -> dict[str, int]:
+    """Return pending-stock quantities for all products in one DB round trip."""
+    rows = await get_db().orders.aggregate([
+        {"$match": {"status": "pending_stock"}},
+        {"$group": {"_id": "$product_name", "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+    ]).to_list(length=None)
+    totals: dict[str, int] = {}
+    for row in rows:
+        key = _product_name_key(row.get("_id"))
+        if key:
+            totals[key] = totals.get(key, 0) + int(row.get("total") or 0)
+    return totals
 
 
 async def get_available_stock_count(product_name: str) -> int:
@@ -1055,10 +1077,29 @@ async def get_active_preorder_backorder_quantity(product_name: str) -> int:
                 "is_replacement": {"$ne": True},
             }
         },
-        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
     ])
     rows = await cursor.to_list(length=1)
     return int(rows[0].get("total", 0)) if rows else 0
+
+
+async def get_active_preorder_backorder_quantity_map() -> dict[str, int]:
+    """Return active preorder/backorder demand for all products in one DB round trip."""
+    rows = await get_db().orders.aggregate([
+        {
+            "$match": {
+                "status": {"$in": ["pending", "pending_stock"]},
+                "is_replacement": {"$ne": True},
+            }
+        },
+        {"$group": {"_id": "$product_name", "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+    ]).to_list(length=None)
+    totals: dict[str, int] = {}
+    for row in rows:
+        key = _product_name_key(row.get("_id"))
+        if key:
+            totals[key] = totals.get(key, 0) + int(row.get("total") or 0)
+    return totals
 
 
 async def get_active_user_preorder_quantity(user_id: int, product_name: str) -> int:
@@ -1223,26 +1264,54 @@ async def claim_restock_notification_slot(
 
 
 async def get_all_products_with_availability(include_disabled: bool = False) -> list[dict]:
-    """Return products with available_stock and pending_stock_quantity fields.
+    """Return products with stock/preorder availability using bulk queries.
 
-    By default, disabled products are hidden from the shop. Admin views can pass
-    include_disabled=True to see everything. Missing "enabled" means enabled for
-    backwards compatibility with existing products.
+    The old version queried pending/preorder counts once per product and also
+    downloaded every stock item just to count them. This version keeps the same
+    availability logic but uses MongoDB aggregation/count maps so shop pages stay
+    fast even with many products, many stock items, or many pending orders.
     """
-    if include_disabled:
-        products = await get_all_products()
-    else:
-        products = await get_db().products.find({
-            "$or": [{"enabled": True}, {"enabled": {"$exists": False}}]
-        }).to_list(length=None)
-        products = sort_products_for_shop(products)
+    visibility_query = {} if include_disabled else {
+        "$or": [{"enabled": True}, {"enabled": {"$exists": False}}]
+    }
+    project = {
+        "name": 1,
+        "price_inr": 1,
+        "price_usdt": 1,
+        "enabled": 1,
+        "created_at": 1,
+        "shop_order": 1,
+        "low_stock_threshold": 1,
+        "min_order_quantity": 1,
+        "max_order_quantity": 1,
+        "warranty_days": 1,
+        "description": 1,
+        "description_en": 1,
+        "description_es": 1,
+        "preorder_enabled": 1,
+        "preorder_max_quantity": 1,
+        "preorder_total_limit": 1,
+        "stock_manager_earning_rate_usdt": 1,
+        "stock_manager_owner_rate_usdt": 1,
+        "actual_stock": _product_stock_count_expr(),
+    }
+    products = await get_db().products.aggregate([
+        {"$match": visibility_query},
+        {"$project": project},
+    ]).to_list(length=None)
+    products = sort_products_for_shop(products)
+
+    pending_by_product = await get_pending_stock_quantity_map()
+    active_backorder_by_product = await get_active_preorder_backorder_quantity_map()
+
     for product in products:
-        actual_stock = len(product.get("stock", []) or [])
-        pending_qty = await get_pending_stock_quantity(product.get("name", ""))
+        key = _product_name_key(product.get("name"))
+        actual_stock = int(product.get("actual_stock") or 0)
+        pending_qty = int(pending_by_product.get(key, 0) or 0)
+        active_preorders = int(active_backorder_by_product.get(key, 0) or 0)
         product["enabled"] = product.get("enabled", True)
         product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         product["actual_stock"] = actual_stock
-        active_preorders = await get_active_preorder_backorder_quantity(product.get("name", ""))
         product["pending_stock_quantity"] = pending_qty
         product["preorder_enabled"] = product_preorder_enabled(product)
         product["preorder_max_quantity"] = get_product_preorder_max_quantity(product)
