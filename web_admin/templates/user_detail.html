@@ -74,7 +74,7 @@
           <select name="product_name" required>
             <option value="">Select product</option>
             {% for product in products_for_send %}
-              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.available_stock or 0 }} available</option>
+              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}" data-total-stock="{{ product.actual_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.actual_stock or 0 }} in stock</option>
             {% endfor %}
           </select>
         </label>
@@ -88,7 +88,7 @@
           <label>Quantity from stock
             <input name="stock_quantity" type="number" min="1" max="1000" step="1" value="1">
           </label>
-          <small class="muted">This removes the selected quantity from available product stock. Paid pending-stock orders stay reserved first.</small>
+          <small class="muted">This removes the selected quantity from current product stock. Normal shop purchases still respect pending-stock reservations.</small>
         </div>
 
         <div id="user-stock-manual-fields" hidden>
@@ -119,7 +119,7 @@
           <select name="product_name" required>
             <option value="">Select product</option>
             {% for product in products_for_send %}
-              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.available_stock or 0 }} available</option>
+              <option value="{{ product.name }}" data-available-stock="{{ product.available_stock or 0 }}" data-total-stock="{{ product.actual_stock or 0 }}">{{ product.name }}{% if product.enabled is sameas false %} (disabled){% endif %} — {{ product.actual_stock or 0 }} in stock</option>
             {% endfor %}
           </select>
         </label>
@@ -133,7 +133,7 @@
           <label>Quantity from stock
             <input name="replacement_quantity" type="number" min="1" max="1000" step="1" value="1">
           </label>
-          <small class="muted">This removes the selected quantity from available product stock and sends it as a replacement.</small>
+          <small class="muted">This removes the selected quantity from current product stock and sends it as a replacement. Normal shop purchases still respect pending-stock reservations.</small>
         </div>
 
         <div id="user-replacement-manual-fields" hidden>
@@ -528,9 +528,9 @@
     return option ? option.text.trim() : 'selected product';
   }
 
-  function selectedAvailableStock() {
+  function selectedInventoryStock() {
     const option = selectedProductOption();
-    const raw = option ? option.getAttribute('data-available-stock') : '';
+    const raw = option ? option.getAttribute('data-total-stock') : '';
     const parsed = parseInt(raw || '0', 10);
     return Number.isFinite(parsed) ? parsed : 0;
   }
@@ -563,13 +563,13 @@
 
     if (source === 'inventory') {
       itemCount = parseInt(quantityInput ? quantityInput.value : '0', 10) || 0;
-      const available = selectedAvailableStock();
+      const stockCount = selectedInventoryStock();
       if (itemCount < 1) {
         if (quantityInput) quantityInput.focus();
         return;
       }
-      if (available > 0 && itemCount > available) {
-        confirmText.textContent = `Only ${available} available item(s) are shown for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
+      if (itemCount > stockCount) {
+        confirmText.textContent = `Only ${stockCount} item(s) are currently in product stock for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
         modal.hidden = false;
         document.body.classList.add('modal-open');
         sendButton.hidden = true;
@@ -686,9 +686,9 @@
     return option ? option.text.trim() : 'selected product';
   }
 
-  function selectedAvailableStock() {
+  function selectedInventoryStock() {
     const option = selectedProductOption();
-    const raw = option ? option.getAttribute('data-available-stock') : '';
+    const raw = option ? option.getAttribute('data-total-stock') : '';
     const parsed = parseInt(raw || '0', 10);
     return Number.isFinite(parsed) ? parsed : 0;
   }
@@ -721,13 +721,13 @@
 
     if (source === 'inventory') {
       itemCount = parseInt(quantityInput ? quantityInput.value : '0', 10) || 0;
-      const available = selectedAvailableStock();
+      const stockCount = selectedInventoryStock();
       if (itemCount < 1) {
         if (quantityInput) quantityInput.focus();
         return;
       }
-      if (available > 0 && itemCount > available) {
-        confirmText.textContent = `Only ${available} available item(s) are shown for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
+      if (itemCount > stockCount) {
+        confirmText.textContent = `Only ${stockCount} item(s) are currently in product stock for ${selectedProductName()}. Refresh the page or reduce the quantity before sending.`;
         modal.hidden = false;
         document.body.classList.add('modal-open');
         sendButton.hidden = true;

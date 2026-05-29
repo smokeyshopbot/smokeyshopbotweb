@@ -3698,25 +3698,24 @@ def register_routes(app: Flask) -> None:
             if quantity > 1000:
                 flash("Too many stock items in one send. Send 1000 items or fewer at a time.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            available = get_available_stock_count(app.db, product["name"])
-            pending = get_pending_stock_quantity(app.db, product["name"])
-            if available < quantity:
-                flash(f"Not enough available stock for {product.get('name')}. Available: {available}. Pending paid orders reserve: {pending}.", "error")
+            total_stock = get_stock_count(app.db, product["name"])
+            if total_stock < quantity:
+                flash(f"Not enough product stock for {product.get('name')}. In stock: {total_stock}. Pending paid orders still remain queued.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
             product_stock = [str(item).strip() for item in (product.get("stock", []) or []) if str(item).strip()]
-            candidate_items = product_stock[pending:pending + quantity]
+            candidate_items = product_stock[:quantity]
             if len(candidate_items) != quantity:
                 flash("Stock changed before it could be sent. Please refresh the user page and try again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            other_stock = product_stock[:pending] + product_stock[pending + quantity:]
+            other_stock = product_stock[quantity:]
             duplicate_report = build_stock_duplicate_report(product["name"], candidate_items, existing_stock=other_stock)
             if has_stock_duplicate_report(duplicate_report):
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source)
                 flash("Duplicate stock detected. Nothing was sent. Review the popup warning and clean the stock before trying again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
-            items = pop_available_stock_for_admin_send(app.db, product["name"], quantity)
+            items = pop_available_stock_for_admin_send(app.db, product["name"], quantity, reserve_pending=False)
             if len(items) != quantity:
                 flash("Stock changed before it could be sent. Please refresh the user page and try again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
@@ -3733,7 +3732,7 @@ def register_routes(app: Flask) -> None:
                 )
                 app.db.products.update_one(
                     {"_id": product["_id"]},
-                    {"$push": {"stock": {"$each": items, "$position": pending}, "stock_added_by": {"$each": restore_records}}},
+                    {"$push": {"stock": {"$each": items, "$position": 0}, "stock_added_by": {"$each": restore_records}}},
                 )
                 record_stock_ledger_add(
                     app.db,
@@ -3851,25 +3850,24 @@ def register_routes(app: Flask) -> None:
             if quantity > 1000:
                 flash("Too many replacement items in one send. Send 1000 items or fewer at a time.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            available = get_available_stock_count(app.db, product["name"])
-            pending = get_pending_stock_quantity(app.db, product["name"])
-            if available < quantity:
-                flash(f"Not enough available stock for {product.get('name')}. Available: {available}. Pending paid orders reserve: {pending}.", "error")
+            total_stock = get_stock_count(app.db, product["name"])
+            if total_stock < quantity:
+                flash(f"Not enough product stock for {product.get('name')}. In stock: {total_stock}. Pending paid orders still remain queued.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
             product_stock = [str(item).strip() for item in (product.get("stock", []) or []) if str(item).strip()]
-            candidate_items = product_stock[pending:pending + quantity]
+            candidate_items = product_stock[:quantity]
             if len(candidate_items) != quantity:
                 flash("Stock changed before the replacement could be sent. Please refresh the user page and try again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            other_stock = product_stock[:pending] + product_stock[pending + quantity:]
+            other_stock = product_stock[quantity:]
             duplicate_report = build_stock_duplicate_report(product["name"], candidate_items, existing_stock=other_stock)
             if has_stock_duplicate_report(duplicate_report):
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source, flow="replacement")
                 flash("Duplicate stock detected. Nothing was sent. Review the popup warning and clean the stock before trying again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
-            items = pop_available_stock_for_admin_send(app.db, product["name"], quantity)
+            items = pop_available_stock_for_admin_send(app.db, product["name"], quantity, reserve_pending=False)
             if len(items) != quantity:
                 flash("Stock changed before the replacement could be sent. Please refresh the user page and try again.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
@@ -3885,7 +3883,7 @@ def register_routes(app: Flask) -> None:
                 )
                 app.db.products.update_one(
                     {"_id": product["_id"]},
-                    {"$push": {"stock": {"$each": items, "$position": pending}, "stock_added_by": {"$each": restore_records}}},
+                    {"$push": {"stock": {"$each": items, "$position": 0}, "stock_added_by": {"$each": restore_records}}},
                 )
                 record_stock_ledger_add(
                     app.db,
@@ -8153,23 +8151,21 @@ def pop_stock(db, product_name: str, quantity: int) -> list[str]:
     return items
 
 
-def pop_available_stock_for_admin_send(db, product_name: str, quantity: int) -> list[str]:
-    """Remove stock for an admin-to-user delivery without stealing pending paid stock.
+def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, reserve_pending: bool = True) -> list[str]:
+    """Remove stock for an admin-to-user delivery.
 
-    Pending-stock orders are treated as reserving the oldest stock items. This
-    function deliberately uses a simple read + exact-array update instead of a
-    MongoDB aggregation-pipeline update because some hosts/Mongo-compatible
-    providers do not support the more advanced pipeline form consistently.
-
-    The exact stock-array condition keeps the operation race-safe: if another
-    process changes stock between the read and update, this retries instead of
-    removing the wrong items.
+    By default, paid pending-stock orders reserve the oldest stock items. User
+    detail manual sends pass ``reserve_pending=False`` so an owner/admin can
+    intentionally send current inventory even while the public shop keeps that
+    inventory reserved from normal buyers. The exact stock-array condition keeps
+    the operation race-safe: if another process changes stock between the read
+    and update, this retries instead of removing the wrong items.
     """
     if quantity < 1:
         return []
 
     for _attempt in range(5):
-        pending_qty = max(0, get_pending_stock_quantity(db, product_name))
+        pending_qty = max(0, get_pending_stock_quantity(db, product_name)) if reserve_pending else 0
         product = db.products.find_one({"name": name_regex(product_name)}, {"stock": 1, "stock_added_by": 1})
         if not product:
             return []
