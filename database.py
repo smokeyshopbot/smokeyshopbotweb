@@ -70,6 +70,68 @@ def _product_stock_count_expr() -> dict:
     return {"$cond": [{"$isArray": "$stock"}, {"$size": "$stock"}, 0]}
 
 
+_HISTORY_SORT_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _history_date_sort_expr(field_name: str = "created_at") -> dict:
+    """Mongo expression that sorts mixed stored date types consistently.
+
+    Some old rows have ISO strings while newer rows have Mongo Date values.
+    A plain Mongo ``.sort("created_at", -1)`` groups BSON types separately, so a
+    newer string date can appear below older Date rows. This expression converts
+    Date, ISO string, and numeric Unix timestamps to one Date sort key.
+    """
+    field_ref = f"${field_name}"
+    field_type = {"$type": field_ref}
+    numeric_to_date = {
+        "$let": {
+            "vars": {"n": {"$toDouble": field_ref}},
+            "in": {
+                "$toDate": {
+                    "$cond": [
+                        {"$gt": ["$$n", 100000000000]},  # already milliseconds
+                        "$$n",
+                        {"$multiply": ["$$n", 1000]},  # Unix seconds
+                    ]
+                }
+            },
+        }
+    }
+    return {
+        "$switch": {
+            "branches": [
+                {"case": {"$eq": [field_type, "date"]}, "then": field_ref},
+                {"case": {"$in": [field_type, ["int", "long", "double", "decimal"]]}, "then": numeric_to_date},
+                {
+                    "case": {"$eq": [field_type, "string"]},
+                    "then": {
+                        "$dateFromString": {
+                            "dateString": field_ref,
+                            "onError": _HISTORY_SORT_EPOCH,
+                            "onNull": _HISTORY_SORT_EPOCH,
+                        }
+                    },
+                },
+            ],
+            "default": _HISTORY_SORT_EPOCH,
+        }
+    }
+
+
+def _newest_history_pipeline(match: dict, *, skip: int = 0, limit: int = 20, date_field: str = "created_at") -> list[dict]:
+    """Newest-first pipeline used by user-facing history pages."""
+    safe_skip = max(0, int(skip or 0))
+    safe_limit = max(1, min(int(limit or 20), 100))
+    return [
+        {"$match": match},
+        {"$addFields": {"_history_sort_at": _history_date_sort_expr(date_field)}},
+        {"$sort": {"_history_sort_at": -1, "_id": -1}},
+        {"$skip": safe_skip},
+        {"$limit": safe_limit},
+        {"$project": {"_history_sort_at": 0}},
+    ]
+
+
 def normalize_approved_stock_item(item: Any) -> str:
     """Normalize stock text for owner-approved pool matching.
 
@@ -1907,9 +1969,14 @@ async def get_user_orders(user_id: int, limit: int = 20, skip: int = 0) -> list[
     Replacement deliveries are shown separately in /replacements so normal
     order history does not get mixed with replacement history.
     """
-    return await get_db().orders.find(
-        {"user_id": user_id, "is_replacement": {"$ne": True}}
-    ).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+    safe_limit = max(1, min(int(limit or 20), 100))
+    return await get_db().orders.aggregate(
+        _newest_history_pipeline(
+            {"user_id": user_id, "is_replacement": {"$ne": True}},
+            skip=skip,
+            limit=safe_limit,
+        )
+    ).to_list(length=safe_limit)
 
 
 async def count_user_orders(user_id: int) -> int:
@@ -1919,9 +1986,14 @@ async def count_user_orders(user_id: int) -> int:
 
 async def get_user_replacement_orders(user_id: int, limit: int = 20, skip: int = 0) -> list[dict]:
     """Return newest replacement deliveries belonging to one user."""
-    return await get_db().orders.find(
-        {"user_id": user_id, "is_replacement": True}
-    ).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+    safe_limit = max(1, min(int(limit or 20), 100))
+    return await get_db().orders.aggregate(
+        _newest_history_pipeline(
+            {"user_id": user_id, "is_replacement": True},
+            skip=skip,
+            limit=safe_limit,
+        )
+    ).to_list(length=safe_limit)
 
 
 async def count_user_replacement_orders(user_id: int) -> int:
@@ -1934,7 +2006,8 @@ async def get_recent_orders(limit: int = 20, skip: int = 0) -> list[dict]:
     limit = max(1, min(int(limit or 20), 100))
     skip = max(0, int(skip or 0))
     pipeline = [
-        {"$sort": {"created_at": -1}},
+        {"$addFields": {"_history_sort_at": _history_date_sort_expr("created_at")}},
+        {"$sort": {"_history_sort_at": -1, "_id": -1}},
         {"$skip": skip},
         {"$limit": limit},
         {"$lookup": {
@@ -1953,6 +2026,7 @@ async def get_recent_orders(limit: int = 20, skip: int = 0) -> list[dict]:
             },
             "user_blocked": {"$ifNull": ["$user_doc.blocked", False]},
         }},
+        {"$project": {"user_doc": 0, "_history_sort_at": 0}},
     ]
     return await get_db().orders.aggregate(pipeline).to_list(length=limit)
 
@@ -2195,10 +2269,16 @@ async def get_user_wallet_logs(user_id: int, limit: int = 10, skip: int = 0) -> 
     """
     limit = max(1, min(int(limit or 10), 50))
     skip = max(0, int(skip or 0))
-    return await get_db().pending_payments.find({
-        "user_id": user_id,
-        "pay_type": "wallet",
-    }).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+    return await get_db().pending_payments.aggregate(
+        _newest_history_pipeline(
+            {
+                "user_id": user_id,
+                "pay_type": "wallet",
+            },
+            skip=skip,
+            limit=limit,
+        )
+    ).to_list(length=limit)
 
 
 async def count_user_wallet_logs(user_id: int) -> int:

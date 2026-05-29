@@ -1924,11 +1924,10 @@ def register_routes(app: Flask) -> None:
         query: dict[str, Any] = status_queries[status]
         page = int_arg("page", 1, minimum=1)
         total = app.db.replacement_reports.count_documents(query)
-        reports = list(
-            app.db.replacement_reports.find(query)
-            .sort("created_at", -1)
-            .skip((page - 1) * PAGE_SIZE)
-            .limit(PAGE_SIZE)
+        reports = recent_created_rows(
+            app.db.replacement_reports.find(query),
+            skip=(page - 1) * PAGE_SIZE,
+            limit=PAGE_SIZE,
         )
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         counts = {key: app.db.replacement_reports.count_documents(q) for key, q in status_queries.items()}
@@ -1962,7 +1961,7 @@ def register_routes(app: Flask) -> None:
         query: dict[str, Any] = status_queries[status]
         page = 1
         total = app.db.replacement_reports.count_documents(query)
-        reports = list(app.db.replacement_reports.find(query).sort("created_at", -1).limit(PAGE_SIZE))
+        reports = recent_created_rows(app.db.replacement_reports.find(query), limit=PAGE_SIZE)
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         counts = {key: app.db.replacement_reports.count_documents(q) for key, q in status_queries.items()}
         manual_lookup = None
@@ -4610,7 +4609,11 @@ def register_routes(app: Flask) -> None:
             query["$or"] = ors
         page = int_arg("page", 1, minimum=1)
         total = app.db.orders.count_documents(query)
-        rows = list(app.db.orders.find(query).sort("created_at", -1).skip((page - 1) * PAGE_SIZE).limit(PAGE_SIZE))
+        rows = recent_created_rows(
+            app.db.orders.find(query),
+            skip=(page - 1) * PAGE_SIZE,
+            limit=PAGE_SIZE,
+        )
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         return render_template("replacement_orders.html", orders=rows, page=page, total_pages=total_pages, total=total, q=q)
 
