@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Buyer Ranking{% endblock %}
 {% block content %}
-<div class="page-header"><div><h1>Buyer Ranking</h1><p>Counts delivered paid orders and paid orders waiting for stock.</p></div></div>
+<div class="page-header"><div><h1>Buyer Ranking</h1><p>Counts paid buyer orders: delivered + waiting stock. Includes admin-created/manual stock sends with value. Excludes replacements, cancelled/refunded orders, unpaid, failed, and expired orders.</p></div></div>
 <section class="panel">
 {% if rows %}
 <table>

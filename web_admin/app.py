@@ -8524,7 +8524,12 @@ def has_pending_stock_ahead(db, product_name: str, created_at: Any, order_id: st
 def get_bot_stats(db) -> dict[str, Any]:
     def build() -> dict[str, Any]:
         revenue_rows = list(db.orders.aggregate([
-            {"$match": {"status": {"$in": ["delivered", "pending_stock"]}, "is_replacement": {"$ne": True}}},
+            {"$match": {
+                "status": {"$in": ["delivered", "pending_stock"]},
+                "is_replacement": {"$ne": True},
+                "payment_method": {"$nin": ["replacement"]},
+                "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
+            }},
             {"$group": {"_id": None, "inr": {"$sum": paid_inr_expr()}, "usdt": {"$sum": paid_usdt_expr()}}},
         ]))
         revenue = revenue_rows[0] if revenue_rows else {"inr": 0, "usdt": 0}
@@ -8553,7 +8558,12 @@ def get_bot_stats(db) -> dict[str, Any]:
 
 def get_user_order_stats(db, user_id: int) -> dict[str, Any]:
     orders = list(db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}))
-    paid_orders = [o for o in orders if o.get("status") in {"delivered", "pending_stock"}]
+    paid_orders = [
+        o for o in orders
+        if o.get("status") in {"delivered", "pending_stock"}
+        and o.get("payment_method") != "replacement"
+        and o.get("refund_status") not in {"wallet_credited", "refund_requested", "refund_paid"}
+    ]
     paid_amounts = [order_paid_amounts(o) for o in paid_orders]
     return {
         "total_orders": len(orders),
@@ -8566,21 +8576,96 @@ def get_user_order_stats(db, user_id: int) -> dict[str, Any]:
     }
 
 
-def buyer_ranking_match() -> dict:
-    """Only real paid buyer orders should affect Buyer Ranking."""
+def numeric_amount_expr(field_name: str) -> dict:
+    """Mongo expression that safely treats old string amounts as numbers."""
+    return {
+        "$convert": {
+            "input": {"$ifNull": [f"${field_name}", 0]},
+            "to": "double",
+            "onError": 0,
+            "onNull": 0,
+        }
+    }
+
+
+def paid_inr_expr() -> dict:
+    method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
+    return {"$cond": [
+        {"$or": [
+            {"$in": [method, ["upi", "wallet_inr", "inr"]]},
+            {"$regexMatch": {"input": method, "regex": "upi"}},
+            {"$regexMatch": {"input": method, "regex": "_inr$"}},
+        ]},
+        numeric_amount_expr("amount_inr"),
+        0,
+    ]}
+
+
+def paid_usdt_expr() -> dict:
+    method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
+    return {"$cond": [
+        {"$or": [
+            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_created_order", "admin_stock"]]},
+            {"$regexMatch": {"input": method, "regex": "usdt"}},
+            {"$regexMatch": {"input": method, "regex": "polygon"}},
+            {"$regexMatch": {"input": method, "regex": "binance"}},
+            {"$regexMatch": {"input": method, "regex": "bep20"}},
+            {"$regexMatch": {"input": method, "regex": "admin_created"}},
+        ]},
+        numeric_amount_expr("amount_usdt"),
+        0,
+    ]}
+
+
+def buyer_ranking_base_match() -> dict:
+    """Only real paid buyer orders should affect Buyer Ranking.
+
+    Delivered paid orders and paid waiting-stock orders are counted. Unpaid,
+    failed, expired, cancelled/refunded and replacement records are excluded.
+    Admin-created orders and direct admin stock sends are included when they
+    have an order value.
+    """
     return {
         "status": {"$in": ["delivered", "pending_stock"]},
         "is_replacement": {"$ne": True},
-        "admin_stock_delivery": {"$ne": True},
-        "admin_created_order": {"$ne": True},
-        "payment_method": {"$nin": ["admin_stock", "admin_created_order", "replacement"]},
-        "$or": [{"amount_inr": {"$gt": 0}}, {"amount_usdt": {"$gt": 0}}],
+        "pending_stock_cancelled": {"$ne": True},
+        "payment_method": {"$nin": ["replacement"]},
+        "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
+    }
+
+
+# Backwards-compatible name used by older helper code/tests.
+def buyer_ranking_match() -> dict:
+    return buyer_ranking_base_match()
+
+
+def buyer_ranking_paid_value_stage() -> dict:
+    return {
+        "$addFields": {
+            "_ranking_paid_inr": paid_inr_expr(),
+            "_ranking_paid_usdt": paid_usdt_expr(),
+        }
+    }
+
+
+def buyer_ranking_has_value_match() -> dict:
+    return {
+        "$match": {
+            "$expr": {
+                "$or": [
+                    {"$gt": ["$_ranking_paid_inr", 0]},
+                    {"$gt": ["$_ranking_paid_usdt", 0]},
+                ]
+            }
+        }
     }
 
 
 def count_ranked_buyers(db) -> int:
     rows = list(db.orders.aggregate([
-        {"$match": buyer_ranking_match()},
+        {"$match": buyer_ranking_base_match()},
+        buyer_ranking_paid_value_stage(),
+        buyer_ranking_has_value_match(),
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]))
@@ -8589,14 +8674,16 @@ def count_ranked_buyers(db) -> int:
 
 def get_buyer_ranking(db, limit: int = 10, skip: int = 0) -> list[dict]:
     pipeline = [
-        {"$match": buyer_ranking_match()},
+        {"$match": buyer_ranking_base_match()},
+        buyer_ranking_paid_value_stage(),
+        buyer_ranking_has_value_match(),
         {"$group": {
             "_id": "$user_id",
             "total_orders": {"$sum": 1},
             "delivered_orders": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
             "pending_stock_orders": {"$sum": {"$cond": [{"$eq": ["$status", "pending_stock"]}, 1, 0]}},
-            "total_inr": {"$sum": paid_inr_expr()},
-            "total_usdt": {"$sum": paid_usdt_expr()},
+            "total_inr": {"$sum": "$_ranking_paid_inr"},
+            "total_usdt": {"$sum": "$_ranking_paid_usdt"},
             "last_order_at": {"$max": "$created_at"},
         }},
         {"$lookup": {"from": "users", "localField": "_id", "foreignField": "user_id", "as": "user_doc"}},
@@ -8617,36 +8704,6 @@ def get_buyer_ranking(db, limit: int = 10, skip: int = 0) -> list[dict]:
         {"$limit": limit},
     ]
     return list(db.orders.aggregate(pipeline))
-
-
-def paid_inr_expr() -> dict:
-    method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
-    return {"$cond": [
-        {"$or": [
-            {"$in": [method, ["upi", "wallet_inr", "inr"]]},
-            {"$regexMatch": {"input": method, "regex": "upi"}},
-            {"$regexMatch": {"input": method, "regex": "_inr$"}},
-        ]},
-        {"$ifNull": ["$amount_inr", 0]},
-        0,
-    ]}
-
-
-def paid_usdt_expr() -> dict:
-    method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
-    return {"$cond": [
-        {"$or": [
-            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock", "admin_created_order"]]},
-            {"$regexMatch": {"input": method, "regex": "usdt"}},
-            {"$regexMatch": {"input": method, "regex": "binance"}},
-            {"$regexMatch": {"input": method, "regex": "bep20"}},
-            {"$regexMatch": {"input": method, "regex": "admin_stock"}},
-            {"$regexMatch": {"input": method, "regex": "admin_created"}},
-        ]},
-        {"$ifNull": ["$amount_usdt", 0]},
-        0,
-    ]}
-
 
 
 
@@ -10044,7 +10101,7 @@ def order_paid_amounts(order: dict) -> tuple[float, float]:
     usdt = float(order.get("amount_usdt") or 0)
     if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
         return inr, 0.0
-    if method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_stock", "admin_created_order"} or "usdt" in method or "polygon" in method or "binance" in method or "bep20" in method or "admin_stock" in method or "admin_created" in method:
+    if method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_created_order", "admin_stock"} or "usdt" in method or "polygon" in method or "binance" in method or "bep20" in method or "admin_created" in method:
         return 0.0, usdt
     if usdt and not inr:
         return 0.0, usdt

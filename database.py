@@ -2314,16 +2314,30 @@ def _order_paid_amounts(order: dict) -> tuple[float, float]:
     if method in {"upi", "wallet_inr", "inr"} or "upi" in method or method.endswith("_inr"):
         return amount_inr, 0.0
     if (
-        method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"}
+        method in {"usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_created_order", "admin_stock"}
         or "usdt" in method
+        or "polygon" in method
         or "binance" in method
         or "bep20" in method
+        or "admin_created" in method
     ):
         return 0.0, amount_usdt
 
     if amount_usdt and not amount_inr:
         return 0.0, amount_usdt
     return amount_inr, 0.0
+
+
+def _numeric_amount_expr(field_name: str) -> dict:
+    """Mongo expression that safely treats old string amounts as numbers."""
+    return {
+        "$convert": {
+            "input": {"$ifNull": [f"${field_name}", 0]},
+            "to": "double",
+            "onError": 0,
+            "onNull": 0,
+        }
+    }
 
 
 def _paid_inr_mongo_expr() -> dict:
@@ -2335,7 +2349,7 @@ def _paid_inr_mongo_expr() -> dict:
             {"$regexMatch": {"input": method, "regex": "upi"}},
             {"$regexMatch": {"input": method, "regex": "_inr$"}},
         ]},
-        {"$ifNull": ["$amount_inr", 0]},
+        _numeric_amount_expr("amount_inr"),
         0,
     ]}
 
@@ -2345,12 +2359,14 @@ def _paid_usdt_mongo_expr() -> dict:
     method = {"$toLower": {"$ifNull": ["$payment_method", ""]}}
     return {"$cond": [
         {"$or": [
-            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20"]]},
+            {"$in": [method, ["usdt", "polygon", "usdt_polygon", "wallet_usdt", "binance", "binance_pay", "binance_usdt", "bep20", "admin_created_order", "admin_stock"]]},
             {"$regexMatch": {"input": method, "regex": "usdt"}},
+            {"$regexMatch": {"input": method, "regex": "polygon"}},
             {"$regexMatch": {"input": method, "regex": "binance"}},
             {"$regexMatch": {"input": method, "regex": "bep20"}},
+            {"$regexMatch": {"input": method, "regex": "admin_created"}},
         ]},
-        {"$ifNull": ["$amount_usdt", 0]},
+        _numeric_amount_expr("amount_usdt"),
         0,
     ]}
 
@@ -2358,13 +2374,18 @@ def _paid_usdt_mongo_expr() -> dict:
 async def get_user_order_stats(user_id: int) -> dict:
     """Aggregated order stats for one user."""
     db = get_db()
-    orders = await db.orders.find({"user_id": user_id}).to_list(length=None)
+    orders = await db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}).to_list(length=None)
     total_orders = len(orders)
     delivered = sum(1 for o in orders if o.get("status") == "delivered")
     pending_stock = sum(1 for o in orders if o.get("status") == "pending_stock")
     pending = sum(1 for o in orders if o.get("status") == "pending")
     failed = sum(1 for o in orders if o.get("status") in {"failed", "expired"})
-    paid_orders = [o for o in orders if o.get("status") in {"delivered", "pending_stock"}]
+    paid_orders = [
+        o for o in orders
+        if o.get("status") in {"delivered", "pending_stock"}
+        and o.get("payment_method") != "replacement"
+        and o.get("refund_status") not in {"wallet_credited", "refund_requested", "refund_paid"}
+    ]
     paid_amounts = [_order_paid_amounts(o) for o in paid_orders]
     total_inr = sum(v[0] for v in paid_amounts)
     total_usdt = sum(v[1] for v in paid_amounts)
@@ -2393,7 +2414,12 @@ async def get_bot_stats() -> dict:
     products_enabled = await db.products.count_documents({"$or": [{"enabled": True}, {"enabled": {"$exists": False}}]})
 
     revenue_rows = await db.orders.aggregate([
-        {"$match": {"status": {"$in": ["delivered", "pending_stock"]}}},
+        {"$match": {
+            "status": {"$in": ["delivered", "pending_stock"]},
+            "is_replacement": {"$ne": True},
+            "payment_method": {"$nin": ["replacement"]},
+            "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
+        }},
         {"$group": {
             "_id": None,
             "inr": {"$sum": _paid_inr_mongo_expr()},
@@ -2421,38 +2447,71 @@ async def get_bot_stats() -> dict:
     }
 
 
-def _buyer_ranking_match() -> dict:
-    """Only real paid buyer orders should affect Buyer Ranking.
+def _buyer_ranking_base_match() -> dict:
+    """Base filter for Buyer Ranking.
 
-    Free admin stock sends and replacement deliveries are delivered order records too,
-    but they are not paid purchases, so they must not move buyer ranks.
+    Includes paid buyer orders that are either delivered or still waiting
+    for stock. It excludes replacements, cancelled/refunded orders, and unpaid
+    checkout rows. Admin-created orders and direct admin stock sends are included
+    when they have an order value.
     """
     return {
         "status": {"$in": ["delivered", "pending_stock"]},
         "is_replacement": {"$ne": True},
-        "admin_stock_delivery": {"$ne": True},
-        "payment_method": {"$nin": ["admin_stock", "replacement"]},
-        "$or": [{"amount_inr": {"$gt": 0}}, {"amount_usdt": {"$gt": 0}}],
+        "pending_stock_cancelled": {"$ne": True},
+        "payment_method": {"$nin": ["replacement"]},
+        "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
     }
+
+
+def _buyer_ranking_paid_value_stage() -> dict:
+    return {
+        "$addFields": {
+            "_ranking_paid_inr": _paid_inr_mongo_expr(),
+            "_ranking_paid_usdt": _paid_usdt_mongo_expr(),
+        }
+    }
+
+
+def _buyer_ranking_has_value_match() -> dict:
+    return {
+        "$match": {
+            "$expr": {
+                "$or": [
+                    {"$gt": ["$_ranking_paid_inr", 0]},
+                    {"$gt": ["$_ranking_paid_usdt", 0]},
+                ]
+            }
+        }
+    }
+
+
+# Backwards-compatible name used by older helper code/tests.
+def _buyer_ranking_match() -> dict:
+    return _buyer_ranking_base_match()
 
 
 async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
     """Return top buyers by paid order value with user info.
 
     Counts delivered paid orders and paid orders waiting for stock. Pending/unpaid,
-    failed, expired, replacements, and free admin stock sends are excluded.
+    failed, expired, cancelled/refunded orders and replacements are excluded.
+    Admin-created orders and direct admin stock sends are included when they
+    have an order value.
     """
     limit = max(1, min(int(limit or 10), 50))
     skip = max(0, int(skip or 0))
     pipeline = [
-        {"$match": _buyer_ranking_match()},
+        {"$match": _buyer_ranking_base_match()},
+        _buyer_ranking_paid_value_stage(),
+        _buyer_ranking_has_value_match(),
         {"$group": {
             "_id": "$user_id",
             "total_orders": {"$sum": 1},
             "delivered_orders": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
             "pending_stock_orders": {"$sum": {"$cond": [{"$eq": ["$status", "pending_stock"]}, 1, 0]}},
-            "total_inr": {"$sum": _paid_inr_mongo_expr()},
-            "total_usdt": {"$sum": _paid_usdt_mongo_expr()},
+            "total_inr": {"$sum": "$_ranking_paid_inr"},
+            "total_usdt": {"$sum": "$_ranking_paid_usdt"},
             "last_order_at": {"$max": "$created_at"},
         }},
         {"$lookup": {
@@ -2483,12 +2542,13 @@ async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
 async def count_ranked_buyers() -> int:
     """Count users with at least one real paid buyer order."""
     rows = await get_db().orders.aggregate([
-        {"$match": _buyer_ranking_match()},
+        {"$match": _buyer_ranking_base_match()},
+        _buyer_ranking_paid_value_stage(),
+        _buyer_ranking_has_value_match(),
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]).to_list(length=1)
     return int(rows[0].get("count", 0)) if rows else 0
-
 
 
 
