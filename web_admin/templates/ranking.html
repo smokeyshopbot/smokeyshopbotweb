@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Buyer Ranking{% endblock %}
 {% block content %}
-<div class="page-header"><div><h1>Buyer Ranking</h1><p>Counts paid buyer orders: delivered + waiting stock. Includes admin-created/manual stock sends with value. Excludes replacements, cancelled/refunded orders, unpaid, failed, and expired orders.</p></div></div>
+<div class="page-header"><div><h1>Buyer Ranking</h1><p>Orders matches User Details: all non-replacement sales orders placed. Delivered counts successful deliveries. Waiting stock counts paid pending-stock orders. Revenue excludes replacements, cancelled/refunded, unpaid, failed and expired orders.</p></div></div>
 <section class="panel">
 {% if rows %}
 <table>
@@ -25,7 +25,7 @@
   {% endfor %}
   </tbody>
 </table>
-{% else %}<p class="muted">No paid buyer data yet.</p>{% endif %}
+{% else %}<p class="muted">No buyer order data yet.</p>{% endif %}
 {% include "pagination.html" %}
 </section>
 {% endblock %}

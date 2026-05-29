@@ -8618,19 +8618,17 @@ def paid_usdt_expr() -> dict:
 
 
 def buyer_ranking_base_match() -> dict:
-    """Only real paid buyer orders should affect Buyer Ranking.
+    """Base filter for Buyer Ranking order counts.
 
-    Delivered paid orders and paid waiting-stock orders are counted. Unpaid,
-    failed, expired, cancelled/refunded and replacement records are excluded.
-    Admin-created orders and direct admin stock sends are included when they
-    have an order value.
+    Orders should match the User Details page: every non-replacement sales
+    order placed for the user is counted, regardless of whether it later
+    delivered, failed, expired, was cancelled, or is still pending. Revenue is
+    calculated separately and only includes valid paid delivered/waiting-stock
+    value.
     """
     return {
-        "status": {"$in": ["delivered", "pending_stock"]},
         "is_replacement": {"$ne": True},
-        "pending_stock_cancelled": {"$ne": True},
         "payment_method": {"$nin": ["replacement"]},
-        "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
     }
 
 
@@ -8639,33 +8637,36 @@ def buyer_ranking_match() -> dict:
     return buyer_ranking_base_match()
 
 
+def buyer_ranking_revenue_eligible_expr() -> dict:
+    return {
+        "$and": [
+            {"$in": ["$status", ["delivered", "pending_stock"]]},
+            {"$ne": ["$pending_stock_cancelled", True]},
+            {"$not": [{"$in": [{"$ifNull": ["$refund_status", ""]}, ["wallet_credited", "refund_requested", "refund_paid"]]}]},
+            {"$not": [{"$in": [{"$ifNull": ["$status", ""]}, ["cancelled", "refunded", "failed", "expired"]]}]},
+        ]
+    }
+
+
 def buyer_ranking_paid_value_stage() -> dict:
+    revenue_ok = buyer_ranking_revenue_eligible_expr()
     return {
         "$addFields": {
-            "_ranking_paid_inr": paid_inr_expr(),
-            "_ranking_paid_usdt": paid_usdt_expr(),
+            "_ranking_paid_inr": {"$cond": [revenue_ok, paid_inr_expr(), 0]},
+            "_ranking_paid_usdt": {"$cond": [revenue_ok, paid_usdt_expr(), 0]},
+            "_ranking_waiting_paid": {"$cond": [{"$and": [revenue_ok, {"$eq": ["$status", "pending_stock"]}]}, 1, 0]},
         }
     }
 
 
 def buyer_ranking_has_value_match() -> dict:
-    return {
-        "$match": {
-            "$expr": {
-                "$or": [
-                    {"$gt": ["$_ranking_paid_inr", 0]},
-                    {"$gt": ["$_ranking_paid_usdt", 0]},
-                ]
-            }
-        }
-    }
+    """Kept for older tests/helpers; Buyer Ranking now counts all order rows."""
+    return {"$match": {}}
 
 
 def count_ranked_buyers(db) -> int:
     rows = list(db.orders.aggregate([
         {"$match": buyer_ranking_base_match()},
-        buyer_ranking_paid_value_stage(),
-        buyer_ranking_has_value_match(),
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]))
@@ -8676,12 +8677,11 @@ def get_buyer_ranking(db, limit: int = 10, skip: int = 0) -> list[dict]:
     pipeline = [
         {"$match": buyer_ranking_base_match()},
         buyer_ranking_paid_value_stage(),
-        buyer_ranking_has_value_match(),
         {"$group": {
             "_id": "$user_id",
             "total_orders": {"$sum": 1},
             "delivered_orders": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
-            "pending_stock_orders": {"$sum": {"$cond": [{"$eq": ["$status", "pending_stock"]}, 1, 0]}},
+            "pending_stock_orders": {"$sum": "$_ranking_waiting_paid"},
             "total_inr": {"$sum": "$_ranking_paid_inr"},
             "total_usdt": {"$sum": "$_ranking_paid_usdt"},
             "last_order_at": {"$max": "$created_at"},
@@ -8699,12 +8699,11 @@ def get_buyer_ranking(db, limit: int = 10, skip: int = 0) -> list[dict]:
             "total_usdt": 1,
             "last_order_at": 1,
         }},
-        {"$sort": {"total_usdt": -1, "total_inr": -1, "total_orders": -1, "user_id": 1}},
+        {"$sort": {"total_usdt": -1, "total_inr": -1, "delivered_orders": -1, "pending_stock_orders": -1, "total_orders": -1, "user_id": 1}},
         {"$skip": skip},
         {"$limit": limit},
     ]
     return list(db.orders.aggregate(pipeline))
-
 
 
 def activity_action_label(action: Any) -> str:

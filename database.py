@@ -2448,42 +2448,49 @@ async def get_bot_stats() -> dict:
 
 
 def _buyer_ranking_base_match() -> dict:
-    """Base filter for Buyer Ranking.
+    """Base filter for Buyer Ranking order counts.
 
-    Includes paid buyer orders that are either delivered or still waiting
-    for stock. It excludes replacements, cancelled/refunded orders, and unpaid
-    checkout rows. Admin-created orders and direct admin stock sends are included
-    when they have an order value.
+    Orders should match the User Details page: every non-replacement sales
+    order placed for the user is counted, regardless of whether it later
+    delivered, failed, expired, was cancelled, or is still pending. Revenue is
+    calculated separately and only includes valid paid delivered/waiting-stock
+    value.
     """
     return {
-        "status": {"$in": ["delivered", "pending_stock"]},
         "is_replacement": {"$ne": True},
-        "pending_stock_cancelled": {"$ne": True},
         "payment_method": {"$nin": ["replacement"]},
-        "refund_status": {"$nin": ["wallet_credited", "refund_requested", "refund_paid"]},
+    }
+
+
+def _buyer_ranking_revenue_eligible_expr() -> dict:
+    return {
+        "$and": [
+            {"$in": ["$status", ["delivered", "pending_stock"]]},
+            {"$ne": ["$pending_stock_cancelled", True]},
+            {"$not": [{"$in": [{"$ifNull": ["$refund_status", ""]}, ["wallet_credited", "refund_requested", "refund_paid"]]}]},
+            {"$not": [{"$in": [{"$ifNull": ["$status", ""]}, ["cancelled", "refunded", "failed", "expired"]]}]},
+        ]
     }
 
 
 def _buyer_ranking_paid_value_stage() -> dict:
+    revenue_ok = _buyer_ranking_revenue_eligible_expr()
     return {
         "$addFields": {
-            "_ranking_paid_inr": _paid_inr_mongo_expr(),
-            "_ranking_paid_usdt": _paid_usdt_mongo_expr(),
+            "_ranking_paid_inr": {"$cond": [revenue_ok, _paid_inr_mongo_expr(), 0]},
+            "_ranking_paid_usdt": {"$cond": [revenue_ok, _paid_usdt_mongo_expr(), 0]},
+            "_ranking_waiting_paid": {"$cond": [{"$and": [revenue_ok, {"$eq": ["$status", "pending_stock"]}]}, 1, 0]},
         }
     }
 
 
 def _buyer_ranking_has_value_match() -> dict:
-    return {
-        "$match": {
-            "$expr": {
-                "$or": [
-                    {"$gt": ["$_ranking_paid_inr", 0]},
-                    {"$gt": ["$_ranking_paid_usdt", 0]},
-                ]
-            }
-        }
-    }
+    """Kept for older tests/helpers; Buyer Ranking now counts all order rows.
+
+    Revenue can be zero for users who only have unpaid/failed/expired orders,
+    but the Orders column should still match User Details totals.
+    """
+    return {"$match": {}}
 
 
 # Backwards-compatible name used by older helper code/tests.
@@ -2492,24 +2499,24 @@ def _buyer_ranking_match() -> dict:
 
 
 async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
-    """Return top buyers by paid order value with user info.
+    """Return buyer ranking with User Details-compatible order counts.
 
-    Counts delivered paid orders and paid orders waiting for stock. Pending/unpaid,
-    failed, expired, cancelled/refunded orders and replacements are excluded.
-    Admin-created orders and direct admin stock sends are included when they
-    have an order value.
+    Orders = all non-replacement sales orders placed by the user.
+    Delivered = successfully delivered non-replacement orders.
+    Waiting stock = paid pending-stock orders only.
+    Revenue = valid paid delivered/waiting-stock value only; cancelled,
+    refunded, unpaid, failed, expired and replacement rows add no revenue.
     """
     limit = max(1, min(int(limit or 10), 50))
     skip = max(0, int(skip or 0))
     pipeline = [
         {"$match": _buyer_ranking_base_match()},
         _buyer_ranking_paid_value_stage(),
-        _buyer_ranking_has_value_match(),
         {"$group": {
             "_id": "$user_id",
             "total_orders": {"$sum": 1},
             "delivered_orders": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
-            "pending_stock_orders": {"$sum": {"$cond": [{"$eq": ["$status", "pending_stock"]}, 1, 0]}},
+            "pending_stock_orders": {"$sum": "$_ranking_waiting_paid"},
             "total_inr": {"$sum": "$_ranking_paid_inr"},
             "total_usdt": {"$sum": "$_ranking_paid_usdt"},
             "last_order_at": {"$max": "$created_at"},
@@ -2532,7 +2539,7 @@ async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
             "total_usdt": 1,
             "last_order_at": 1,
         }},
-        {"$sort": {"total_usdt": -1, "total_inr": -1, "total_orders": -1, "user_id": 1}},
+        {"$sort": {"total_usdt": -1, "total_inr": -1, "delivered_orders": -1, "pending_stock_orders": -1, "total_orders": -1, "user_id": 1}},
         {"$skip": skip},
         {"$limit": limit},
     ]
@@ -2540,16 +2547,13 @@ async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
 
 
 async def count_ranked_buyers() -> int:
-    """Count users with at least one real paid buyer order."""
+    """Count users with at least one non-replacement sales order."""
     rows = await get_db().orders.aggregate([
         {"$match": _buyer_ranking_base_match()},
-        _buyer_ranking_paid_value_stage(),
-        _buyer_ranking_has_value_match(),
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]).to_list(length=1)
     return int(rows[0].get("count", 0)) if rows else 0
-
 
 
 # ─────────────────────── WALLET HISTORY ──────────────────────
