@@ -947,6 +947,7 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _shop_flow.pop(user_id, None)
     _clear_wallet_flow_if_available(user_id)
     products = await db.get_all_products_with_availability()
+    products = await db.apply_effective_prices_to_products_for_user(products, user_id)
     payment_settings = await db.get_payment_settings()
     if not products:
         await update.message.reply_text(
@@ -973,6 +974,7 @@ async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     favorite_names = await db.get_user_favorite_products(user_id)
     payment_settings = await db.get_payment_settings()
     products = await db.get_all_products_with_availability()
+    products = await db.apply_effective_prices_to_products_for_user(products, user_id)
     if not products:
         await update.message.reply_text(
             tr(lang, "favorites_empty_products"),
@@ -1095,6 +1097,7 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _shop_flow.pop(user_id, None)
         _clear_wallet_flow_if_available(user_id)
         products = await db.get_all_products_with_availability()
+        products = await db.apply_effective_prices_to_products_for_user(products, user_id)
         payment_settings = await db.get_payment_settings()
         if not products:
             await query.edit_message_text(
@@ -1188,6 +1191,7 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         favorite_names = await db.get_user_favorite_products(user_id)
         payment_settings = await db.get_payment_settings()
         products = await db.get_all_products_with_availability()
+        products = await db.apply_effective_prices_to_products_for_user(products, user_id)
         if not products:
             await query.edit_message_text(
                 tr(lang, "favorites_empty_products"),
@@ -1215,6 +1219,7 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         favorite_names = await db.get_user_favorite_products(user_id)
         payment_settings = await db.get_payment_settings()
         products = await db.get_all_products_with_availability()
+        products = await db.apply_effective_prices_to_products_for_user(products, user_id)
         if not products:
             await query.edit_message_text(
                 tr(lang, "favorites_edit_empty"),
@@ -1276,6 +1281,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     _clear_wallet_flow_if_available(user_id)
 
     product = await db.get_product(product_name)
+    product = await db.get_effective_product_for_user(product, user_id) if product else None
     if not product:
         await query.edit_message_text(
             tr(lang, "product_not_found"),
@@ -1420,7 +1426,7 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
         _shop_flow.pop(user_id, None)
         await update.message.reply_text(tr(lang, "product_now_unavailable"))
         return True
-    product = fresh_product
+    product = await db.get_effective_product_for_user(fresh_product, user_id) or fresh_product
 
     try:
         qty = int((update.message.text or "").strip())
@@ -1664,7 +1670,7 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         _shop_flow.pop(user_id, None)
         await query.edit_message_text(tr(lang, "product_now_unavailable"))
         return
-    product = latest_product
+    product = await db.get_effective_product_for_user(latest_product, user_id) or latest_product
     qty = state["quantity"]
     is_preorder = bool(state.get("is_preorder"))
     stock_count = await db.get_available_stock_count(product["name"])

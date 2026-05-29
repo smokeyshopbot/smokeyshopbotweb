@@ -66,6 +66,238 @@ def _product_name_key(name: Any) -> str:
     return str(name or "").strip().lower()
 
 
+
+# ─────────────────────── CUSTOM PRICING ───────────────────────
+PRICE_GROUPS = [
+    {"key": "normal", "label": "Normal"},
+    {"key": "vip", "label": "VIP"},
+    {"key": "reseller", "label": "Reseller"},
+    {"key": "wholesale", "label": "Wholesale"},
+]
+PRICE_GROUP_KEYS = {row["key"] for row in PRICE_GROUPS}
+DEFAULT_PRICE_GROUP = "normal"
+
+
+def normalize_price_group(value: Any) -> str:
+    key = str(value or "").strip().lower().replace(" ", "_")
+    return key if key in PRICE_GROUP_KEYS else DEFAULT_PRICE_GROUP
+
+
+def price_group_label(value: Any) -> str:
+    key = normalize_price_group(value)
+    for row in PRICE_GROUPS:
+        if row["key"] == key:
+            return row["label"]
+    return "Normal"
+
+
+def _clean_price_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount < 0:
+        return None
+    return round(amount, 2)
+
+
+def _has_price_field(row: Any, field: str) -> bool:
+    return isinstance(row, dict) and field in row and row.get(field) is not None
+
+
+def _price_from_row(row: Any, field: str) -> float | None:
+    if not _has_price_field(row, field):
+        return None
+    return _clean_price_value(row.get(field))
+
+
+def clean_price_group_prices(value: Any) -> dict[str, dict[str, float]]:
+    """Sanitize a product's group price map.
+
+    Only non-normal groups are stored. Missing/blank fields mean "use default".
+    """
+    value = value if isinstance(value, dict) else {}
+    cleaned: dict[str, dict[str, float]] = {}
+    for group in PRICE_GROUPS:
+        key = group["key"]
+        if key == DEFAULT_PRICE_GROUP:
+            continue
+        row = value.get(key) if isinstance(value.get(key), dict) else {}
+        group_prices: dict[str, float] = {}
+        inr = _price_from_row(row, "price_inr")
+        usdt = _price_from_row(row, "price_usdt")
+        if inr is not None:
+            group_prices["price_inr"] = inr
+        if usdt is not None:
+            group_prices["price_usdt"] = usdt
+        if group_prices:
+            cleaned[key] = group_prices
+    return cleaned
+
+
+def _custom_price_map(custom_prices: list[dict] | None) -> dict[str, dict]:
+    rows = custom_prices if isinstance(custom_prices, list) else []
+    result: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _product_name_key(row.get("product_key") or row.get("product_name"))
+        if key:
+            result[key] = row
+    return result
+
+
+def apply_effective_price_to_product(product: dict, user: dict | None = None, custom_price: dict | None = None) -> dict:
+    """Return a product copy with the price this user should see/pay.
+
+    Priority per currency:
+    1. direct per-user product override
+    2. user's price group price for this product
+    3. product default price
+    """
+    product = dict(product or {})
+    group_key = normalize_price_group((user or {}).get("pricing_group"))
+    group_prices_all = clean_price_group_prices(product.get("price_group_prices"))
+    group_prices = group_prices_all.get(group_key) if group_key != DEFAULT_PRICE_GROUP else None
+    custom_price = custom_price if isinstance(custom_price, dict) else None
+
+    default_inr = _clean_price_value(product.get("price_inr")) or 0.0
+    default_usdt = _clean_price_value(product.get("price_usdt")) or 0.0
+    price_inr = default_inr
+    price_usdt = default_usdt
+    source = "default"
+
+    group_inr = _price_from_row(group_prices, "price_inr")
+    group_usdt = _price_from_row(group_prices, "price_usdt")
+    if group_inr is not None:
+        price_inr = group_inr
+        source = f"group:{group_key}"
+    if group_usdt is not None:
+        price_usdt = group_usdt
+        source = f"group:{group_key}"
+
+    custom_inr = _price_from_row(custom_price, "price_inr")
+    custom_usdt = _price_from_row(custom_price, "price_usdt")
+    if custom_inr is not None:
+        price_inr = custom_inr
+        source = "custom"
+    if custom_usdt is not None:
+        price_usdt = custom_usdt
+        source = "custom"
+
+    product["default_price_inr"] = default_inr
+    product["default_price_usdt"] = default_usdt
+    product["price_inr"] = round(max(0.0, price_inr), 2)
+    product["price_usdt"] = round(max(0.0, price_usdt), 2)
+    product["effective_price_group"] = group_key
+    product["effective_price_group_label"] = price_group_label(group_key)
+    product["effective_price_source"] = source
+    return product
+
+
+async def get_user_product_custom_price(user_id: int, product_name: str) -> dict | None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    key = _product_name_key(product_name)
+    if not key:
+        return None
+    return await get_db().user_product_prices.find_one({"user_id": uid, "product_key": key})
+
+
+async def get_user_product_custom_prices(user_id: int) -> list[dict]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return []
+    return await get_db().user_product_prices.find({"user_id": uid}).to_list(length=None)
+
+
+async def get_effective_product_for_user(product: dict | None, user_id: int) -> dict | None:
+    if not product:
+        return None
+    user = await get_user(user_id) or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
+    custom_price = await get_user_product_custom_price(user_id, str(product.get("name") or ""))
+    return apply_effective_price_to_product(product, user, custom_price)
+
+
+async def apply_effective_prices_to_products_for_user(products: list[dict], user_id: int) -> list[dict]:
+    if not products:
+        return []
+    user = await get_user(user_id) or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
+    custom_map = _custom_price_map(await get_user_product_custom_prices(user_id))
+    return [
+        apply_effective_price_to_product(product, user, custom_map.get(_product_name_key(product.get("name"))))
+        for product in products
+    ]
+
+
+async def set_user_pricing_group(user_id: int, pricing_group: str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    group_key = normalize_price_group(pricing_group)
+    res = await get_db().users.update_one(
+        {"user_id": uid},
+        {"$set": {"pricing_group": group_key, "pricing_group_updated_at": datetime.now(timezone.utc)}},
+        upsert=False,
+    )
+    return res.matched_count > 0
+
+
+async def set_user_product_custom_price(
+    user_id: int,
+    product_name: str,
+    *,
+    price_inr: float | None = None,
+    price_usdt: float | None = None,
+) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    product_name = str(product_name or "").strip()
+    product_key = _product_name_key(product_name)
+    if not product_key:
+        return False
+    fields: dict[str, Any] = {
+        "user_id": uid,
+        "product_key": product_key,
+        "product_name": product_name,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    inr = _clean_price_value(price_inr)
+    usdt = _clean_price_value(price_usdt)
+    if inr is not None:
+        fields["price_inr"] = inr
+    if usdt is not None:
+        fields["price_usdt"] = usdt
+    if "price_inr" not in fields and "price_usdt" not in fields:
+        return await clear_user_product_custom_price(uid, product_name)
+    await get_db().user_product_prices.update_one(
+        {"user_id": uid, "product_key": product_key},
+        {"$set": fields, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return True
+
+
+async def clear_user_product_custom_price(user_id: int, product_name: str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    product_key = _product_name_key(product_name)
+    if not product_key:
+        return False
+    res = await get_db().user_product_prices.delete_one({"user_id": uid, "product_key": product_key})
+    return res.deleted_count > 0
+
+
 def _product_stock_count_expr() -> dict:
     return {"$cond": [{"$isArray": "$stock"}, {"$size": "$stock"}, 0]}
 
@@ -466,6 +698,7 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
         "blocked_by_delivery": False,
         "wallet_inr": 0.0,
         "wallet_usdt": 0.0,
+        "pricing_group": DEFAULT_PRICE_GROUP,
         "joined_at": now,
         "last_user_interaction_at": now,
         "language": None,
@@ -1378,6 +1611,7 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "name": 1,
         "price_inr": 1,
         "price_usdt": 1,
+        "price_group_prices": 1,
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,

@@ -26,6 +26,7 @@
     <div class="card"><span>Wallet</span><strong>Hidden</strong><small>No active payment currency</small></div>
   {% endif %}
   <div class="card"><span>Total orders</span><strong>{{ stats.total_orders }}</strong><small>{{ stats.delivered }} delivered</small></div>
+  <div class="card"><span>Pricing group</span><strong>{{ price_group_label(user.pricing_group) }}</strong><small>Default is Normal</small></div>
   <div class="card"><span>Paid value</span>
     {% if 'usdt' in active_payment_currencies %}<strong>{{ money_usdt(stats.total_usdt) }}</strong>{% endif %}
     {% if 'inr' in active_payment_currencies %}<strong>{{ money_inr(stats.total_inr) }}</strong>{% endif %}
@@ -62,6 +63,85 @@
     <p class="muted">Joined: {{ fmt_dt(user.joined_at) }}</p>
   </section>
 </div>
+
+
+{% if current_admin_role == 'owner' %}
+<section class="panel user-pricing-panel">
+  <h2>User pricing</h2>
+  <p class="muted">Everyone uses Normal pricing by default. Change only special users, or set a custom price for one product here.</p>
+  <div class="user-pricing-grid">
+    <form method="post" action="{{ url_for('update_user_pricing', user_id=user.user_id) }}" class="setting-card user-pricing-card stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="pricing_action" value="group">
+      <h3>Pricing group</h3>
+      <p class="muted small-text">Change only special users. Everyone else stays Normal.</p>
+      <label>Group
+        <select name="pricing_group">
+          {% for group in price_groups %}
+            <option value="{{ group.key }}" {% if group.key == user.pricing_group %}selected{% endif %}>{{ group.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="primary" type="submit">Save group</button>
+    </form>
+
+    <form method="post" action="{{ url_for('update_user_pricing', user_id=user.user_id) }}" class="setting-card user-pricing-card stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="pricing_action" value="override">
+      <h3>Custom product price</h3>
+      <p class="muted small-text">Leave price blank to remove that currency override.</p>
+      <label>Product
+        <select name="product_name" required>
+          <option value="">Select product</option>
+          {% for product in products_for_send %}
+            <option value="{{ product.name }}">{{ product.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="custom-price-fields">
+        {% if 'inr' in active_payment_currencies %}
+        <label>Custom INR
+          <div class="price-input-wrap"><input name="price_inr" type="number" step="0.01" min="0" placeholder="Use group/default"><span>INR</span></div>
+        </label>
+        {% endif %}
+        {% if 'usdt' in active_payment_currencies %}
+        <label>Custom USDT
+          <div class="price-input-wrap"><input name="price_usdt" type="number" step="0.01" min="0" placeholder="Use group/default"><span>USDT</span></div>
+        </label>
+        {% endif %}
+      </div>
+      <button class="primary" type="submit">Save custom price</button>
+    </form>
+  </div>
+
+  {% if user_price_overrides %}
+  <h3>Custom product prices</h3>
+  <div class="table-wrap"><table class="compact-table">
+    <thead><tr><th>Product</th>{% if 'inr' in active_payment_currencies %}<th>INR</th>{% endif %}{% if 'usdt' in active_payment_currencies %}<th>USDT</th>{% endif %}<th>Action</th></tr></thead>
+    <tbody>
+    {% for row in user_price_overrides %}
+      <tr>
+        <td><strong>{{ row.product_name }}</strong>{% if row.updated_at %}<br><small class="muted">Updated {{ fmt_dt(row.updated_at) }}</small>{% endif %}</td>
+        {% if 'inr' in active_payment_currencies %}<td>{{ '—' if row.price_inr is none else money_inr_price(row.price_inr) }}</td>{% endif %}
+        {% if 'usdt' in active_payment_currencies %}<td>{{ '—' if row.price_usdt is none else money_usdt_price(row.price_usdt) }}</td>{% endif %}
+        <td>
+          <form method="post" action="{{ url_for('update_user_pricing', user_id=user.user_id) }}" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="pricing_action" value="clear_override">
+            <input type="hidden" name="product_key" value="{{ row.product_key }}">
+            <input type="hidden" name="product_name" value="{{ row.product_name }}">
+            <button type="submit" class="small-button danger">Clear</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+    <p class="muted">No user-specific product prices saved. This user pays the {{ price_group_label(user.pricing_group) }} group price.</p>
+  {% endif %}
+</section>
+{% endif %}
 
 <div class="user-delivery-grid">
   <section class="panel">

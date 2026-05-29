@@ -3805,3 +3805,61 @@ button.small-button,
     grid-template-columns: 1fr;
   }
 }
+
+.user-pricing-grid {
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  align-items: start;
+}
+.custom-pricing-panel .compact-table input,
+.user-pricing-panel .compact-table input {
+  min-width: 120px;
+}
+@media (max-width: 980px) {
+  .user-pricing-grid { grid-template-columns: 1fr; }
+}
+
+/* Clean user pricing layout on user details page */
+.user-pricing-panel {
+  overflow: hidden;
+}
+.user-pricing-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: stretch;
+}
+.user-pricing-card {
+  min-width: 0;
+  margin: 0;
+  box-shadow: none;
+  align-content: start;
+}
+.user-pricing-card h3 {
+  margin: 0;
+}
+.user-pricing-card .small-text {
+  margin: -4px 0 2px;
+}
+.user-pricing-card label,
+.user-pricing-card select,
+.user-pricing-card input,
+.user-pricing-card .price-input-wrap {
+  min-width: 0;
+}
+.user-pricing-card button[type="submit"] {
+  width: 100%;
+  height: 46px;
+  min-height: 46px;
+  align-self: start;
+}
+.custom-price-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+@media (max-width: 980px) {
+  .user-pricing-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -891,6 +891,7 @@ def create_app() -> Flask:
             "stock_manager_payment_method_labels": STOCK_MANAGER_PAYMENT_METHOD_LABELS,
             "stock_manager_payment_method_label": stock_manager_payment_method_label,
             "format_stock_manager_payment_details": format_stock_manager_payment_details,
+            "price_group_label": price_group_label,
             "replacement_status_badge_class": replacement_status_badge_class,
             "replacement_status_label": replacement_status_label,
             "replacement_status_key": replacement_status_key,
@@ -947,6 +948,8 @@ def ensure_admin_indexes(db) -> None:
     db.users.create_index([("username", 1)])
     db.users.create_index([("joined_at", -1)])
     db.users.create_index([("blocked", 1), ("joined_at", -1)])
+    db.user_product_prices.create_index([("user_id", 1), ("product_key", 1)], unique=True)
+    db.user_product_prices.create_index([("product_key", 1)])
 
     db.products.create_index([("name", 1)])
     db.products.create_index([("enabled", 1), ("shop_order", 1), ("created_at", -1)])
@@ -2400,6 +2403,7 @@ def register_routes(app: Flask) -> None:
         product["description_en"] = str(product.get("description_en") or legacy_description)
         product["description_es"] = str(product.get("description_es") or "")
         product["warranty_days"] = parse_positive_int(product.get("warranty_days"), 0, minimum=0)
+        product["price_group_rows"] = build_price_group_rows(product)
         if product["max_order_quantity"] < product["min_order_quantity"]:
             product["max_order_quantity"] = product["min_order_quantity"]
         stock_view_items = build_current_stock_view(
@@ -2426,6 +2430,8 @@ def register_routes(app: Flask) -> None:
             hidden_stock_count=hidden_stock_count,
             approved_pool_stats=approved_pool_stats,
             recent_rejected_stock_uploads=recent_rejected_stock_uploads,
+            payment_currencies=get_active_payment_currencies(app.db),
+            price_groups=PRICE_GROUPS,
         )
 
     @app.post("/products/<path:name>/approved-stock")
@@ -2820,6 +2826,46 @@ def register_routes(app: Flask) -> None:
         flash("Price updated." if res.matched_count else "Product not found.", "success" if res.matched_count else "error")
         return redirect(url_for("products", q=request.args.get("q", "")))
 
+
+
+    @app.post("/products/<path:name>/group-prices")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_product_group_prices(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+        updated: dict[str, dict[str, float]] = {}
+        for group in PRICE_GROUPS:
+            key = group["key"]
+            if key == DEFAULT_PRICE_GROUP:
+                continue
+            inr_raw = str(request.form.get(f"{key}_price_inr", "") or "").strip()
+            usdt_raw = str(request.form.get(f"{key}_price_usdt", "") or "").strip()
+            group_prices: dict[str, float] = {}
+            if inr_raw:
+                price_inr = parse_price_for_currency(inr_raw, f"{group['label']} INR", True)
+                if price_inr is None:
+                    return redirect(url_for("product_manage", name=product["name"]))
+                group_prices["price_inr"] = price_inr
+            if usdt_raw:
+                price_usdt = parse_price_for_currency(usdt_raw, f"{group['label']} USDT", True)
+                if price_usdt is None:
+                    return redirect(url_for("product_manage", name=product["name"]))
+                group_prices["price_usdt"] = price_usdt
+            if group_prices:
+                updated[key] = group_prices
+        res = app.db.products.update_one(
+            {"_id": product["_id"]},
+            {"$set": {"price_group_prices": updated, "price_group_prices_updated_at": utcnow()}},
+        )
+        changed_groups = ", ".join(price_group_label(key) for key in updated) or "none"
+        log_admin_action(app.db, "product_group_prices_updated", f"{product.get('name', name)} groups={changed_groups}")
+        flash("Custom group prices updated.", "success" if res.matched_count else "error")
+        return redirect(url_for("product_manage", name=product["name"]))
+
     @app.post("/products/<path:name>/toggle")
     @login_required
     @csrf_required
@@ -3140,7 +3186,9 @@ def register_routes(app: Flask) -> None:
         )
 
         user_language = lang_from_user(user)
+        user["pricing_group"] = normalize_price_group(user.get("pricing_group"))
         products_for_send = get_products_with_availability(app.db, include_disabled=True)
+        user_price_overrides = build_user_price_override_rows(app.db, user, products_for_send)
         send_stock_duplicate_warning = session.pop("send_stock_duplicate_warning", None)
         return render_template(
             "user_detail.html",
@@ -3160,11 +3208,86 @@ def register_routes(app: Flask) -> None:
             wallet_logs_total=wallet_logs_total,
             user_detail_page_size=per_page,
             products_for_send=products_for_send,
+            price_groups=PRICE_GROUPS,
+            user_price_overrides=user_price_overrides,
             user_language=user_language,
             language_settings=get_language_settings(app.db),
             language_names=LANGUAGE_NAMES,
             send_stock_duplicate_warning=send_stock_duplicate_warning,
         )
+
+
+
+    @app.post("/users/<int:user_id>/pricing")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_user_pricing(user_id: int):
+        user = app.db.users.find_one({"user_id": user_id})
+        if not user:
+            flash("User not found.", "error")
+            return redirect(url_for("users"))
+        action = str(request.form.get("pricing_action") or "group").strip().lower()
+        user_label = telegram_user_display(app.db, user_id, user.get("username"))
+        if action == "group":
+            group_key = normalize_price_group(request.form.get("pricing_group"))
+            app.db.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"pricing_group": group_key, "pricing_group_updated_at": utcnow()}},
+            )
+            log_admin_action(app.db, "user_pricing_group_updated", f"user={user_label} group={group_key}")
+            flash(f"Pricing group updated to {price_group_label(group_key)} for {user_label}.", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        if action == "clear_override":
+            product_name = str(request.form.get("product_name") or "").strip()
+            key = product_name_key(request.form.get("product_key") or product_name)
+            if not key:
+                flash("Select a product override to clear.", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+            app.db.user_product_prices.delete_one({"user_id": user_id, "product_key": key})
+            log_admin_action(app.db, "user_custom_price_cleared", f"user={user_label} product_key={key}")
+            flash("Custom user price cleared.", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        if action == "override":
+            product_name = str(request.form.get("product_name") or "").strip()
+            product = app.db.products.find_one({"name": name_regex(product_name)})
+            if not product:
+                flash("Select a valid product before saving a custom price.", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+            inr_raw = str(request.form.get("price_inr", "") or "").strip()
+            usdt_raw = str(request.form.get("price_usdt", "") or "").strip()
+            fields: dict[str, Any] = {
+                "user_id": user_id,
+                "product_key": product_name_key(product.get("name")),
+                "product_name": product.get("name"),
+                "updated_at": utcnow(),
+            }
+            if inr_raw:
+                price_inr = parse_price_for_currency(inr_raw, "custom INR", True)
+                if price_inr is None:
+                    return redirect(url_for("user_detail", user_id=user_id))
+                fields["price_inr"] = price_inr
+            if usdt_raw:
+                price_usdt = parse_price_for_currency(usdt_raw, "custom USDT", True)
+                if price_usdt is None:
+                    return redirect(url_for("user_detail", user_id=user_id))
+                fields["price_usdt"] = price_usdt
+            if "price_inr" not in fields and "price_usdt" not in fields:
+                flash("Enter at least one custom price, or clear an existing override.", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+            app.db.user_product_prices.update_one(
+                {"user_id": user_id, "product_key": fields["product_key"]},
+                {"$set": fields, "$setOnInsert": {"created_at": utcnow()}},
+                upsert=True,
+            )
+            log_admin_action(app.db, "user_custom_price_updated", f"user={user_label} product={product.get('name')}")
+            flash(f"Custom price saved for {user_label}.", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+
+        flash("Unknown pricing action.", "error")
+        return redirect(url_for("user_detail", user_id=user_id))
 
     def create_admin_wallet_adjustment_log(user: dict, action: str, currency: str, amount: float, balance_after: float, note: str = "") -> str:
         """Store manual admin wallet credits/removals in the same wallet history used by users and WebAdmin."""
@@ -3204,6 +3327,8 @@ def register_routes(app: Flask) -> None:
             "notes": str(note or "").strip(),
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            "effective_price_group": priced_product.get("effective_price_group"),
+            "effective_price_source": priced_product.get("effective_price_source"),
         }
         doc["wallet_adjusted_at"] = now
         if normalized_action == "add":
@@ -3274,7 +3399,8 @@ def register_routes(app: Flask) -> None:
         product_name = str(product.get("name") or "").strip()
         quantity = len(items)
         clean_note = str(admin_note or "").strip()[:1000]
-        display_amount_usdt = round(max(0.0, safe_float(product.get("price_usdt"), 0.0)) * quantity, 2)
+        priced_product = effective_product_for_user(app.db, product, user) or product
+        display_amount_usdt = round(max(0.0, safe_float(priced_product.get("price_usdt"), 0.0)) * quantity, 2)
         order_base = {
             "user_id": user_id_value,
             "username": username,
@@ -3293,6 +3419,8 @@ def register_routes(app: Flask) -> None:
             "admin_stock_note": clean_note,
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            "effective_price_group": priced_product.get("effective_price_group"),
+            "effective_price_source": priced_product.get("effective_price_source"),
         }
         for attempt in range(25):
             order_id_len = 8 if attempt < 20 else 12
@@ -3326,8 +3454,9 @@ def register_routes(app: Flask) -> None:
         except Exception:
             quantity_value = 1
         clean_note = str(admin_note or "").strip()[:1000]
-        amount_usdt = round(max(0.0, safe_float(product.get("price_usdt"), 0.0)) * quantity_value, 2)
-        amount_inr = round(max(0.0, safe_float(product.get("price_inr"), 0.0)) * quantity_value, 2)
+        priced_product = effective_product_for_user(app.db, product, user) or product
+        amount_usdt = round(max(0.0, safe_float(priced_product.get("price_usdt"), 0.0)) * quantity_value, 2)
+        amount_inr = round(max(0.0, safe_float(priced_product.get("price_inr"), 0.0)) * quantity_value, 2)
         order_base = {
             "user_id": user_id_value,
             "username": username,
@@ -6207,6 +6336,174 @@ def product_name_key(name: Any) -> str:
     return str(name or "").strip().lower()
 
 
+
+# ─────────────────────── CUSTOM PRICING ───────────────────────
+PRICE_GROUPS = [
+    {"key": "normal", "label": "Normal"},
+    {"key": "vip", "label": "VIP"},
+    {"key": "reseller", "label": "Reseller"},
+    {"key": "wholesale", "label": "Wholesale"},
+]
+PRICE_GROUP_KEYS = {row["key"] for row in PRICE_GROUPS}
+DEFAULT_PRICE_GROUP = "normal"
+
+
+def normalize_price_group(value: Any) -> str:
+    key = str(value or "").strip().lower().replace(" ", "_")
+    return key if key in PRICE_GROUP_KEYS else DEFAULT_PRICE_GROUP
+
+
+def price_group_label(value: Any) -> str:
+    key = normalize_price_group(value)
+    for row in PRICE_GROUPS:
+        if row["key"] == key:
+            return row["label"]
+    return "Normal"
+
+
+def clean_price_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount < 0:
+        return None
+    return round(amount, 2)
+
+
+def price_row_value(row: Any, field: str) -> float | None:
+    if not isinstance(row, dict) or field not in row or row.get(field) is None:
+        return None
+    return clean_price_value(row.get(field))
+
+
+def clean_price_group_prices(value: Any) -> dict[str, dict[str, float]]:
+    value = value if isinstance(value, dict) else {}
+    cleaned: dict[str, dict[str, float]] = {}
+    for group in PRICE_GROUPS:
+        key = group["key"]
+        if key == DEFAULT_PRICE_GROUP:
+            continue
+        row = value.get(key) if isinstance(value.get(key), dict) else {}
+        prices: dict[str, float] = {}
+        inr = price_row_value(row, "price_inr")
+        usdt = price_row_value(row, "price_usdt")
+        if inr is not None:
+            prices["price_inr"] = inr
+        if usdt is not None:
+            prices["price_usdt"] = usdt
+        if prices:
+            cleaned[key] = prices
+    return cleaned
+
+
+def build_price_group_rows(product: dict) -> list[dict[str, Any]]:
+    group_prices = clean_price_group_prices((product or {}).get("price_group_prices"))
+    rows = []
+    for group in PRICE_GROUPS:
+        key = group["key"]
+        if key == DEFAULT_PRICE_GROUP:
+            continue
+        prices = group_prices.get(key, {})
+        rows.append({
+            "key": key,
+            "label": group["label"],
+            "price_inr": prices.get("price_inr"),
+            "price_usdt": prices.get("price_usdt"),
+        })
+    return rows
+
+
+def product_effective_price(product: dict, user: dict | None = None, custom_price: dict | None = None) -> dict:
+    product = dict(product or {})
+    group_key = normalize_price_group((user or {}).get("pricing_group"))
+    group_prices = clean_price_group_prices(product.get("price_group_prices")).get(group_key) if group_key != DEFAULT_PRICE_GROUP else None
+    default_inr = clean_price_value(product.get("price_inr")) or 0.0
+    default_usdt = clean_price_value(product.get("price_usdt")) or 0.0
+    price_inr = default_inr
+    price_usdt = default_usdt
+    source = "default"
+    group_inr = price_row_value(group_prices, "price_inr")
+    group_usdt = price_row_value(group_prices, "price_usdt")
+    if group_inr is not None:
+        price_inr = group_inr
+        source = f"group:{group_key}"
+    if group_usdt is not None:
+        price_usdt = group_usdt
+        source = f"group:{group_key}"
+    custom_inr = price_row_value(custom_price, "price_inr")
+    custom_usdt = price_row_value(custom_price, "price_usdt")
+    if custom_inr is not None:
+        price_inr = custom_inr
+        source = "custom"
+    if custom_usdt is not None:
+        price_usdt = custom_usdt
+        source = "custom"
+    product["default_price_inr"] = default_inr
+    product["default_price_usdt"] = default_usdt
+    product["price_inr"] = round(max(0.0, price_inr), 2)
+    product["price_usdt"] = round(max(0.0, price_usdt), 2)
+    product["effective_price_group"] = group_key
+    product["effective_price_group_label"] = price_group_label(group_key)
+    product["effective_price_source"] = source
+    return product
+
+
+def user_product_custom_price_map(db, user_id: int) -> dict[str, dict]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return {}
+    rows = list(db.user_product_prices.find({"user_id": uid}))
+    result = {}
+    for row in rows:
+        key = product_name_key(row.get("product_key") or row.get("product_name"))
+        if key:
+            result[key] = row
+    return result
+
+
+def effective_product_for_user(db, product: dict | None, user: dict | None) -> dict | None:
+    if not product:
+        return None
+    user = user or {}
+    try:
+        uid = int(user.get("user_id") or 0)
+    except Exception:
+        uid = 0
+    custom = None
+    if uid:
+        custom = db.user_product_prices.find_one({"user_id": uid, "product_key": product_name_key(product.get("name"))})
+    return product_effective_price(product, user, custom)
+
+
+def build_user_price_override_rows(db, user: dict, products: list[dict]) -> list[dict[str, Any]]:
+    product_by_key = {product_name_key(product.get("name")): product for product in products or []}
+    rows = []
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+    except Exception:
+        uid = 0
+    if not uid:
+        return rows
+    for custom in db.user_product_prices.find({"user_id": uid}).sort("product_name", 1):
+        key = product_name_key(custom.get("product_key") or custom.get("product_name"))
+        product = product_by_key.get(key) or {"name": custom.get("product_name") or key}
+        effective = product_effective_price(product, user, custom)
+        rows.append({
+            "product_key": key,
+            "product_name": custom.get("product_name") or product.get("name") or key,
+            "price_inr": custom.get("price_inr"),
+            "price_usdt": custom.get("price_usdt"),
+            "effective_price_inr": effective.get("price_inr"),
+            "effective_price_usdt": effective.get("price_usdt"),
+            "updated_at": custom.get("updated_at"),
+        })
+    return rows
+
+
 def stock_record_rates(record: dict, product: dict | None = None) -> tuple[float, float]:
     product = product or {}
     earning_rate = safe_float(
@@ -7647,7 +7944,12 @@ def rename_product_references(db, old_name: str, new_name: str) -> dict[str, int
             db.users.update_one({"_id": user["_id"]}, {"$set": {"favorite_products": updated}})
             favorites_changed += 1
 
-    return {"orders": int(orders_result.modified_count or 0), "favorites": favorites_changed}
+    custom_price_result = db.user_product_prices.update_many(
+        {"product_key": product_name_key(old_name)},
+        {"$set": {"product_name": new_name, "product_key": product_name_key(new_name), "updated_at": utcnow()}},
+    )
+
+    return {"orders": int(orders_result.modified_count or 0), "favorites": favorites_changed, "custom_prices": int(custom_price_result.modified_count or 0)}
 
 
 def acquire_product_preorder_lock(db, product_name: str, *, lock_seconds: int = 15, wait_seconds: float = 3.0) -> str | None:
@@ -7972,6 +8274,7 @@ def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_item
         "name": 1,
         "price_inr": 1,
         "price_usdt": 1,
+        "price_group_prices": 1,
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
@@ -8360,6 +8663,10 @@ def activity_action_label(action: Any) -> str:
         "product_deleted": "Product deleted",
         "product_renamed": "Product renamed",
         "product_price_updated": "Product price updated",
+        "product_group_prices_updated": "Product group prices updated",
+        "user_pricing_group_updated": "User pricing group updated",
+        "user_custom_price_updated": "User custom price updated",
+        "user_custom_price_cleared": "User custom price cleared",
         "product_enabled": "Product enabled",
         "product_disabled": "Product disabled",
         "product_description_saved": "Product details saved",

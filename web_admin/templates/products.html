@@ -167,9 +167,6 @@
             {% else %}
               <span class="stock-number stock-good">{{ stock_count }}</span>
             {% endif %}
-            {% if p.preorder_enabled and stock_count <= 0 and (p.preorder_capacity_remaining or 0) > 0 %}
-              <small class="date-pill">Preorder open</small>
-            {% endif %}
           {% endif %}
         </td>
         {% if show_status_controls %}

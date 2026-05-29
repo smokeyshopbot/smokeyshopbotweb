@@ -379,6 +379,37 @@ item 2"></textarea>
   </div>
 </details>
 
+
+{% if can_access('update_product_price') and current_admin_role == 'owner' %}
+<section class="panel custom-pricing-panel">
+  <h2>Custom pricing groups</h2>
+  <p class="muted">Normal users use the default product price from the Products page. Fill only the group prices you want to override. Blank fields use the default price.</p>
+  <form method="post" action="{{ url_for('update_product_group_prices', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="table-wrap">
+      <table class="compact-table">
+        <thead><tr><th>Group</th>{% if 'inr' in payment_currencies %}<th>INR price</th>{% endif %}{% if 'usdt' in payment_currencies %}<th>USDT price</th>{% endif %}<th>Fallback</th></tr></thead>
+        <tbody>
+          {% for row in product.price_group_rows %}
+          <tr>
+            <td><strong>{{ row.label }}</strong></td>
+            {% if 'inr' in payment_currencies %}
+            <td><div class="price-input-wrap compact"><input name="{{ row.key }}_price_inr" type="number" step="0.01" min="0" value="{{ '' if row.price_inr is none else '%.2f'|format(row.price_inr) }}" placeholder="{{ money_inr_price(product.price_inr or 0).replace('₹', '') }}"><span>INR</span></div></td>
+            {% endif %}
+            {% if 'usdt' in payment_currencies %}
+            <td><div class="price-input-wrap compact"><input name="{{ row.key }}_price_usdt" type="number" step="0.01" min="0" value="{{ '' if row.price_usdt is none else '%.2f'|format(row.price_usdt) }}" placeholder="{{ money_usdt_price(product.price_usdt or 0).replace('$', '').replace(' USDT', '') }}"><span>USDT</span></div></td>
+            {% endif %}
+            <td><span class="muted">Blank = default price</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button class="primary" type="submit">Save group prices</button>
+  </form>
+</section>
+{% endif %}
+
 {% if can_access('update_stock_manager_rates') %}
 <section class="panel stock-manager-rates-panel">
   <h2>Stock manager settlement rates</h2>
