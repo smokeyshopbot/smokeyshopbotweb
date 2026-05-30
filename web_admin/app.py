@@ -3327,8 +3327,6 @@ def register_routes(app: Flask) -> None:
             "notes": str(note or "").strip(),
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
-            "effective_price_group": priced_product.get("effective_price_group"),
-            "effective_price_source": priced_product.get("effective_price_source"),
         }
         doc["wallet_adjusted_at"] = now
         if normalized_action == "add":
@@ -3367,23 +3365,35 @@ def register_routes(app: Flask) -> None:
         if action == "remove" and float(user.get(field, 0) or 0) < amount:
             flash("Cannot remove more than the current wallet balance.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
+        if action not in {"add", "remove"}:
+            flash("Choose whether to add or remove wallet balance.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
         delta = amount if action == "add" else -amount
-        app.db.users.update_one({"user_id": user_id}, {"$inc": {field: delta}})
-        updated = app.db.users.find_one({"user_id": user_id}) or {}
+        updated = app.db.users.find_one_and_update(
+            {"user_id": user_id},
+            {"$inc": {field: delta}},
+            return_document=ReturnDocument.AFTER,
+        ) or {}
         new_balance = float(updated.get(field, 0) or 0)
         label = "INR" if currency == "inr" else "USDT"
         amount_text = money_inr(amount) if currency == "inr" else money_usdt(amount)
         balance_text = money_inr(new_balance) if currency == "inr" else money_usdt(new_balance)
         verb = "added to" if action == "add" else "removed from"
-        user_label = telegram_user_display(app.db, user_id, user.get("username"))
-        wallet_log_ref = create_admin_wallet_adjustment_log(user, action or "add", currency, amount, new_balance, note)
-        log_details = f"user={user_label} {label} {action} {amount_text}"
+        user_label = telegram_user_display(app.db, user_id, updated.get("username") or user.get("username"))
+        wallet_log_ref = create_admin_wallet_adjustment_log(updated or user, action, currency, amount, new_balance, note)
+        log_details = f"user={user_label} {label} {action} {amount_text} balance_after={balance_text}"
         if wallet_log_ref:
             log_details += f" ref={wallet_log_ref}"
+        else:
+            log_details += " wallet_history_failed=1"
         log_admin_action(app.db, "wallet_adjusted", log_details)
-        history_text = f" Wallet history ref: {wallet_log_ref}." if wallet_log_ref else " Wallet changed, but the history log could not be saved."
-        flash(f"{amount_text} {verb} user {user_label}. New {label} balance: {balance_text}.{history_text}", "success" if wallet_log_ref else "warning")
-        notify_user_balance_adjustment(user_id, action or "add", amount_text, balance_text, label, note)
+        notification_sent = notify_user_balance_adjustment(user_id, action, amount_text, balance_text, label, note)
+        history_text = f" Wallet history ref: {wallet_log_ref}." if wallet_log_ref else " Wallet changed, but the wallet history log could not be saved."
+        notice_text = "" if notification_sent else " Telegram notice could not be delivered."
+        flash(
+            f"{amount_text} {verb} user {user_label}. New {label} balance: {balance_text}.{history_text}{notice_text}",
+            "success" if wallet_log_ref and notification_sent else "warning",
+        )
         return redirect(url_for("user_detail", user_id=user_id))
 
     def create_admin_stock_order(user: dict, product: dict, items: list[str], source: str = "manual", admin_note: str = "") -> tuple[dict | None, str | None]:
@@ -9995,7 +10005,7 @@ def send_wallet_load_status(db, user_id: int, pending: dict, already: bool = Fal
         text = f"{title}\n\n{tr(lang, 'wallet_added_usdt', amount=wallet_usdt_display(amount))}\n{tr(lang, 'wallet_current_usdt', balance=wallet_usdt_display(bal))}\n\n{tr(lang, 'wallet_use_wallet')}"
     send_telegram_message(user_id, text, parse_mode="Markdown")
 
-def notify_user_balance_adjustment(user_id: int, action: str, amount_text: str, balance_text: str, label: str, note: str = "") -> None:
+def notify_user_balance_adjustment(user_id: int, action: str, amount_text: str, balance_text: str, label: str, note: str = "") -> bool:
     if action == "add":
         lines = ["✅ Wallet balance added by admin.", f"Added: {amount_text}"]
     else:
@@ -10003,7 +10013,17 @@ def notify_user_balance_adjustment(user_id: int, action: str, amount_text: str, 
     if note:
         lines.append(f"Note: {note}")
     lines.extend([f"New {label} balance: {balance_text}", "Use /wallet to check your balance."])
-    send_telegram_message(user_id, "\n".join(lines))
+    status = send_telegram_message_status(user_id, "\n".join(lines))
+    try:
+        db = current_app.db if has_request_context() else None
+        if db is not None:
+            if status.get("ok"):
+                mark_user_delivery_success(db, user_id, source="wallet_adjustment")
+            elif status.get("blocked"):
+                mark_user_delivery_failure(db, user_id, source="wallet_adjustment", error=str(status.get("error") or ""))
+    except Exception:
+        pass
+    return bool(status.get("ok"))
 
 
 # ───────────────────────── Formatting ─────────────────────────
