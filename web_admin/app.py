@@ -48,6 +48,8 @@ from utils.bscscan import public_usdt_error_text, extract_usdt_received_amount_f
 load_dotenv()
 
 PAGE_SIZE = 10
+TELEGRAM_DELETE_WINDOW_HOURS = 48
+RECENT_NOTIFICATIONS_PAGE_SIZE = 20
 LOW_STOCK_ALERT_THRESHOLD = int(os.getenv("LOW_STOCK_ALERT_THRESHOLD", "10") or 10)
 RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES = int(os.getenv("RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES", "30") or 30)
 RESTOCK_NOTIFICATION_COOLDOWN_MINUTES = int(os.getenv("RESTOCK_NOTIFICATION_COOLDOWN_MINUTES", "60") or 60)
@@ -901,6 +903,8 @@ def create_app() -> Flask:
             "activity_action_label": activity_action_label,
             "activity_actor_label": activity_actor_label,
             "activity_source_label": activity_source_label,
+            "notification_type_label": notification_type_label,
+            "notification_expires_in": notification_expires_in,
             "replacement_orders_label": replacement_orders_label,
             "pending_payment_review_count": int(sidebar_state.get("pending_review_count") or 0),
             "pending_stock_order_count": int(sidebar_state.get("pending_stock_order_count") or 0),
@@ -971,6 +975,10 @@ def ensure_admin_indexes(db) -> None:
     db.pending_payments.create_index([("usdt_manual_auto_check_result", 1), ("created_at", -1)])
 
     db.admin_activity.create_index([("created_at", -1)])
+    db.sent_notifications.create_index([("sent_at", -1)])
+    db.sent_notifications.create_index([("batch_id", 1), ("sent_at", -1)])
+    db.sent_notifications.create_index([("chat_id", 1), ("message_id", 1)], unique=True, sparse=True)
+    db.sent_notifications.create_index([("expires_at", 1)])
     db.replacement_reports.create_index([("status", 1), ("created_at", -1)])
     db.replacement_reports.create_index([("items.item_hash", 1), ("status", 1)])
     db.stock_manager_payment_requests.create_index([("status", 1), ("requested_at", -1)])
@@ -5202,6 +5210,7 @@ def register_routes(app: Flask) -> None:
         skipped = 0
         sent_by_language = {"en": 0, "es": 0}
         skipped_by_language = {"en": 0, "es": 0}
+        batch_id = new_notification_batch_id("broadcast")
         seen: set[int] = set()
         for user in users:
             try:
@@ -5219,8 +5228,17 @@ def register_routes(app: Flask) -> None:
                 skipped_by_language[normalized_lang] = skipped_by_language.get(normalized_lang, 0) + 1
                 continue
             prefix = admin_panel_message_prefix("broadcast", lang)
-            ok = send_telegram_message(user_id, f"{prefix}\n\n{message}", parse_mode="Markdown")
-            if ok:
+            final_text = f"{prefix}\n\n{message}"
+            status = send_telegram_message_status(
+                user_id,
+                final_text,
+                parse_mode="Markdown",
+                notification_type="broadcast",
+                notification_batch_id=batch_id,
+                notification_title="Broadcast",
+                notification_source="web_admin_broadcast",
+            )
+            if status.get("ok"):
                 sent += 1
                 sent_by_language[normalized_lang] = sent_by_language.get(normalized_lang, 0) + 1
             else:
@@ -5242,6 +5260,49 @@ def register_routes(app: Flask) -> None:
         )
         flash(f"Broadcast complete. Sent: {sent}, failed: {failed}, skipped: {skipped}.", "success")
         return redirect(url_for("broadcast_form"))
+
+    @app.get("/recent-notifications")
+    @login_required
+    def recent_notifications():
+        page = int_arg("page", 1, minimum=1)
+        backfill_legacy_product_notifications(app.db)
+        rows, page, total_pages = recent_notification_batches(app.db, page=page)
+        total = len(list(app.db.sent_notifications.distinct(
+            "batch_id",
+            {"sent_at": {"$gte": utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)}, "target_kind": "customer"},
+        )))
+        return render_template(
+            "recent_notifications.html",
+            rows=rows,
+            page=page,
+            total_pages=total_pages,
+            total=total,
+            delete_window_hours=TELEGRAM_DELETE_WINDOW_HOURS,
+        )
+
+    @app.post("/recent-notifications/<path:batch_id>/delete")
+    @login_required
+    @csrf_required
+    def delete_recent_notification(batch_id: str):
+        info = delete_recent_notification_batch(app.db, batch_id, deleted_by=current_admin_username())
+        log_admin_action(
+            app.db,
+            "recent_notification_deleted",
+            f"batch={batch_id} attempted={info.get('attempted', 0)} deleted={info.get('deleted', 0)} failed={info.get('failed', 0)} expired={info.get('expired', 0)}",
+        )
+        if info.get("deleted"):
+            flash(
+                f"Deleted {info.get('deleted', 0)} Telegram message(s). Failed: {info.get('failed', 0)}, expired: {info.get('expired', 0)}.",
+                "success" if not info.get("failed") and not info.get("expired") else "info",
+            )
+        elif info.get("attempted"):
+            flash(
+                f"No messages were deleted. Failed: {info.get('failed', 0)}, expired: {info.get('expired', 0)}.",
+                "error",
+            )
+        else:
+            flash("No deletable messages found for this notification batch.", "info")
+        return redirect(url_for("recent_notifications"))
 
 
     @app.get("/activity")
@@ -9372,6 +9433,316 @@ def claim_pending_stock_notice(db, order_id: str) -> bool:
     return bool(res.modified_count)
 
 
+
+def notification_type_label(value: str | None) -> str:
+    key = str(value or "message").strip().lower()
+    labels = {
+        "broadcast": "Broadcast",
+        "new_product": "New product",
+        "new_stock": "Fresh stock",
+        "price_drop": "Price drop",
+        "wallet_adjustment": "Wallet adjustment",
+        "payment": "Payment notice",
+        "order": "Order notice",
+        "replacement": "Replacement notice",
+        "document": "Document",
+        "photo": "Photo",
+        "message": "Message",
+    }
+    return labels.get(key, key.replace("_", " ").title())
+
+
+def _parse_utc_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        try:
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def notification_expires_in(value: Any) -> str:
+    dt = _parse_utc_dt(value)
+    if not dt:
+        return "unknown"
+    remaining = int((dt - utcnow()).total_seconds())
+    if remaining <= 0:
+        return "expired"
+    hours, rem = divmod(remaining, 3600)
+    minutes = rem // 60
+    if hours >= 1:
+        return f"{hours}h {minutes}m"
+    return f"{max(1, minutes)}m"
+
+
+def _notification_preview(text_value: Any, limit: int = 220) -> str:
+    text_clean = str(text_value or "").strip()
+    text_clean = re.sub(r"<[^>]+>", " ", text_clean)
+    text_clean = re.sub(r"\s+", " ", text_clean).strip()
+    if len(text_clean) > limit:
+        return text_clean[: limit - 1].rstrip() + "…"
+    return text_clean
+
+
+def new_notification_batch_id(kind: str = "message") -> str:
+    return f"{str(kind or 'message').strip().lower()}:{uuid.uuid4().hex}"
+
+
+def record_sent_notification(
+    db,
+    *,
+    chat_id: int,
+    result: Any,
+    text: str = "",
+    notification_type: str = "message",
+    batch_id: str | None = None,
+    title: str = "",
+    source: str = "web_admin",
+    product_name: str = "",
+    parse_mode: str | None = None,
+    target_kind: str = "customer",
+) -> None:
+    """Store Telegram message IDs so WebAdmin can delete recent outbound notices.
+
+    Telegram only allows bot deletion for messages inside its deletion window, so
+    this log stores the exact chat/message pair and the calculated expiry time.
+    """
+    msg_id = _telegram_result_message_id(result)
+    if not msg_id:
+        return
+    try:
+        cid = int(chat_id)
+    except Exception:
+        return
+    if not cid:
+        return
+    try:
+        if target_kind == "customer" and cid in set(get_admin_ids(db)):
+            return
+    except Exception:
+        pass
+    sent_at = None
+    if isinstance(result, dict):
+        sent_at = _parse_utc_dt(result.get("date"))
+        result_chat = result.get("chat") if isinstance(result.get("chat"), dict) else {}
+        try:
+            cid = int(result_chat.get("id") or cid)
+        except Exception:
+            pass
+    sent_at = sent_at or utcnow()
+    expires_at = sent_at + timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    clean_type = str(notification_type or "message").strip().lower() or "message"
+    batch = str(batch_id or new_notification_batch_id(clean_type))
+    doc = {
+        "batch_id": batch,
+        "notification_type": clean_type,
+        "title": _notification_preview(title or notification_type_label(clean_type), 140),
+        "text_preview": _notification_preview(text),
+        "product_name": str(product_name or "").strip(),
+        "source": str(source or "web_admin").strip(),
+        "target_kind": str(target_kind or "customer").strip(),
+        "chat_id": cid,
+        "user_id": cid,
+        "message_id": int(msg_id),
+        "parse_mode": str(parse_mode or "").strip(),
+        "sent_at": sent_at,
+        "expires_at": expires_at,
+        "deleted": False,
+        "created_at": utcnow(),
+        "updated_at": utcnow(),
+    }
+    try:
+        db.sent_notifications.update_one(
+            {"chat_id": cid, "message_id": int(msg_id)},
+            {"$setOnInsert": doc, "$set": {"updated_at": utcnow()}},
+            upsert=True,
+        )
+    except Exception:
+        try:
+            current_app.logger.exception("Could not record sent notification chat=%s msg=%s", cid, msg_id)
+        except Exception:
+            pass
+
+
+def delete_telegram_message_status(chat_id: int, message_id: int) -> dict:
+    bot_token = get_bot_token()
+    if not bot_token or not chat_id or not message_id:
+        return {"ok": False, "error": "Missing bot token, chat ID, or message ID"}
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/deleteMessage",
+            json={"chat_id": int(chat_id), "message_id": int(message_id)},
+            timeout=10,
+        )
+        payload = resp.json() if resp.content else {}
+        if resp.ok and payload.get("ok"):
+            return {"ok": True}
+        return {
+            "ok": False,
+            "error": str(payload.get("description") or resp.text or "Telegram delete failed"),
+            "status_code": resp.status_code,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+
+def backfill_legacy_product_notifications(db) -> None:
+    """Expose stock notifications saved by the older per-product cleanup log.
+
+    Older code already kept the latest stock notification message ID per user so
+    it could clean up duplicate stock alerts. This one-time lightweight backfill
+    makes those messages visible in Recent Notifications even if they were sent
+    shortly before this update was deployed.
+    """
+    cutoff = utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    try:
+        rows = db.user_product_notifications.find(
+            {"updated_at": {"$gte": cutoff}, "message_id": {"$exists": True}},
+            {"user_id": 1, "message_id": 1, "product_name": 1, "product_key": 1, "kind": 1, "updated_at": 1},
+        ).limit(5000)
+    except Exception:
+        return
+    for row in rows:
+        try:
+            uid = int(row.get("user_id") or 0)
+            mid = int(row.get("message_id") or 0)
+        except Exception:
+            continue
+        if not uid or not mid:
+            continue
+        try:
+            if uid in set(get_admin_ids(db)):
+                continue
+        except Exception:
+            pass
+        kind = str(row.get("kind") or "new_stock").strip().lower() or "new_stock"
+        product_name = str(row.get("product_name") or "").strip()
+        product_key = str(row.get("product_key") or product_name).strip().lower()
+        sent_at = _parse_utc_dt(row.get("updated_at")) or utcnow()
+        batch_id = f"legacy_product:{kind}:{product_key}:{int(sent_at.timestamp() // 300)}"
+        try:
+            db.sent_notifications.update_one(
+                {"chat_id": uid, "message_id": mid},
+                {
+                    "$setOnInsert": {
+                        "batch_id": batch_id,
+                        "notification_type": kind,
+                        "title": f"{notification_type_label(kind)}: {product_name}" if product_name else notification_type_label(kind),
+                        "text_preview": "Imported from previous product notification log.",
+                        "product_name": product_name,
+                        "source": "legacy_product_notification_log",
+                        "target_kind": "customer",
+                        "chat_id": uid,
+                        "user_id": uid,
+                        "message_id": mid,
+                        "parse_mode": "",
+                        "sent_at": sent_at,
+                        "expires_at": sent_at + timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS),
+                        "deleted": False,
+                        "created_at": utcnow(),
+                        "updated_at": utcnow(),
+                    },
+                    "$set": {"updated_at": utcnow()},
+                },
+                upsert=True,
+            )
+        except Exception:
+            continue
+
+
+def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, int]:
+    now = utcnow()
+    cutoff = now - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    match = {"sent_at": {"$gte": cutoff}, "target_kind": "customer"}
+    total = len(list(db.sent_notifications.distinct("batch_id", match)))
+    total_pages = max(1, math.ceil(total / RECENT_NOTIFICATIONS_PAGE_SIZE)) if total else 1
+    safe_page = max(1, min(int(page or 1), total_pages))
+    pipeline = [
+        {"$match": match},
+        {"$sort": {"sent_at": -1}},
+        {
+            "$group": {
+                "_id": "$batch_id",
+                "batch_id": {"$first": "$batch_id"},
+                "notification_type": {"$first": "$notification_type"},
+                "title": {"$first": "$title"},
+                "text_preview": {"$first": "$text_preview"},
+                "product_name": {"$first": "$product_name"},
+                "source": {"$first": "$source"},
+                "first_sent_at": {"$min": "$sent_at"},
+                "last_sent_at": {"$max": "$sent_at"},
+                "expires_at": {"$min": "$expires_at"},
+                "total_count": {"$sum": 1},
+                "deleted_count": {"$sum": {"$cond": [{"$eq": ["$deleted", True]}, 1, 0]}},
+                "failed_delete_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": [{"$ne": ["$deleted", True]}, {"$gt": [{"$strLenCP": {"$ifNull": ["$deletion_error", ""]}}, 0]}]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {"$addFields": {"deletable_count": {"$subtract": ["$total_count", "$deleted_count"]}}},
+        {"$sort": {"last_sent_at": -1}},
+        {"$skip": (safe_page - 1) * RECENT_NOTIFICATIONS_PAGE_SIZE},
+        {"$limit": RECENT_NOTIFICATIONS_PAGE_SIZE},
+    ]
+    rows = list(db.sent_notifications.aggregate(pipeline))
+    return rows, safe_page, total_pages
+
+
+def delete_recent_notification_batch(db, batch_id: str, *, deleted_by: str = "") -> dict[str, int]:
+    now = utcnow()
+    cutoff = now - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    query = {
+        "batch_id": str(batch_id or ""),
+        "target_kind": "customer",
+        "deleted": {"$ne": True},
+        "sent_at": {"$gte": cutoff},
+    }
+    rows = list(db.sent_notifications.find(query, {"chat_id": 1, "message_id": 1, "expires_at": 1}))
+    result = {"attempted": 0, "deleted": 0, "failed": 0, "expired": 0}
+    for row in rows:
+        result["attempted"] += 1
+        expires_at = _parse_utc_dt(row.get("expires_at"))
+        if expires_at and expires_at <= now:
+            result["expired"] += 1
+            db.sent_notifications.update_one(
+                {"_id": row.get("_id")},
+                {"$set": {"deletion_error": "Expired outside Telegram's 48-hour deletion window", "delete_attempted_at": now, "updated_at": now}},
+            )
+            continue
+        status = delete_telegram_message_status(int(row.get("chat_id") or 0), int(row.get("message_id") or 0))
+        if status.get("ok"):
+            result["deleted"] += 1
+            db.sent_notifications.update_one(
+                {"_id": row.get("_id")},
+                {"$set": {"deleted": True, "deleted_at": utcnow(), "deleted_by": str(deleted_by or "").strip(), "deletion_error": "", "updated_at": utcnow()}},
+            )
+        else:
+            result["failed"] += 1
+            db.sent_notifications.update_one(
+                {"_id": row.get("_id")},
+                {"$set": {"delete_attempted_at": utcnow(), "deletion_error": str(status.get("error") or "Telegram delete failed")[:500], "updated_at": utcnow()}},
+            )
+    return result
+
+
 def notify_low_stock_if_needed(db, product_name: str) -> None:
     product = db.products.find_one({"name": name_regex(product_name)})
     if not product or product.get("enabled", True) is False:
@@ -9609,12 +9980,15 @@ def notify_active_users(
     admin_only: bool = False,
     include_admins: bool = True,
     cleanup_previous_stock_notification: bool = False,
+    notification_type: str = "message",
+    notification_title: str = "",
 ) -> int:
     sent = 0
     admin_ids = set(get_admin_ids(db))
     product = db.products.find_one({"name": name_regex(product_name)}, {"_id": 1, "name": 1})
     product_id = product.get("_id") if product else None
     clean_product_name = str((product or {}).get("name") or product_name or "").strip()
+    notification_batch_id = new_notification_batch_id(notification_type)
     if admin_only:
         users = get_admin_recipient_users(db)
     else:
@@ -9643,7 +10017,18 @@ def notify_active_users(
                 previous_message_id = int((previous or {}).get("message_id") or 0) or None
             except Exception:
                 previous_message_id = None
-        status = send_telegram_message_status(user_id, body, parse_mode=parse_mode, reply_markup=markup)
+        status = send_telegram_message_status(
+            user_id,
+            body,
+            parse_mode=parse_mode,
+            reply_markup=markup,
+            notification_type=notification_type,
+            notification_batch_id=notification_batch_id,
+            notification_title=notification_title or notification_type_label(notification_type),
+            notification_source="web_admin_product_notice",
+            notification_product_name=clean_product_name or product_name,
+            notification_target_kind="customer",
+        )
         result = status.get("result") if status.get("ok") else False
         new_message_id = _telegram_result_message_id(result)
         if result:
@@ -9687,8 +10072,8 @@ def notify_users_new_product(db, product: dict, *, include_admins: bool = True) 
             product_name,
             {"price_inr": product.get("price_inr"), "price_usdt": product.get("price_usdt")},
         )
-        return notify_active_users(db, text_for, product_name=product_name, admin_only=True)
-    return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins)
+        return notify_active_users(db, text_for, product_name=product_name, admin_only=True, notification_type="new_product", notification_title=f"New product: {product_name}")
+    return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins, notification_type="new_product", notification_title=f"New product: {product_name}")
 
 
 def notify_users_new_stock(db, product_name: str, available_stock: int | None = None, *, include_admins: bool = True) -> int:
@@ -9708,8 +10093,8 @@ def notify_users_new_stock(db, product_name: str, available_stock: int | None = 
 
     if get_setting(db, "maintenance_mode", False):
         queue_maintenance_notification(db, "new_stock", clean_name, {"available_stock": available_stock})
-        return notify_active_users(db, text_for, product_name=clean_name, admin_only=True, cleanup_previous_stock_notification=True)
-    return notify_active_users(db, text_for, product_name=clean_name, include_admins=include_admins, cleanup_previous_stock_notification=True)
+        return notify_active_users(db, text_for, product_name=clean_name, admin_only=True, cleanup_previous_stock_notification=True, notification_type="new_stock", notification_title=f"Fresh stock: {clean_name}")
+    return notify_active_users(db, text_for, product_name=clean_name, include_admins=include_admins, cleanup_previous_stock_notification=True, notification_type="new_stock", notification_title=f"Fresh stock: {clean_name}")
 
 
 def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None, include_admins: bool = True) -> int:
@@ -9742,10 +10127,22 @@ def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, ol
             product_name,
             {"old_inr": old_inr, "new_inr": new_inr, "old_usdt": old_usdt, "new_usdt": new_usdt},
         )
-        return notify_active_users(db, text_for, product_name=product_name, admin_only=True)
-    return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins)
+        return notify_active_users(db, text_for, product_name=product_name, admin_only=True, notification_type="price_drop", notification_title=f"Price drop: {product_name}")
+    return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins, notification_type="price_drop", notification_title=f"Price drop: {product_name}")
 
-def send_telegram_message_status(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
+def send_telegram_message_status(
+    chat_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+    *,
+    notification_type: str | None = "message",
+    notification_batch_id: str | None = None,
+    notification_title: str = "",
+    notification_source: str = "web_admin",
+    notification_product_name: str = "",
+    notification_target_kind: str = "customer",
+) -> dict:
     bot_token = get_bot_token()
     if not bot_token or not chat_id:
         return {"ok": False, "blocked": False, "error": "Missing bot token or chat ID"}
@@ -9758,7 +10155,26 @@ def send_telegram_message_status(chat_id: int, text: str, parse_mode: str | None
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=15)
         payload_resp = resp.json() if resp.content else {}
         if resp.ok and payload_resp.get("ok"):
-            return {"ok": True, "result": payload_resp.get("result") or {"ok": True}, "blocked": False}
+            result = payload_resp.get("result") or {"ok": True}
+            try:
+                db_conn = current_app.db if has_request_context() else None
+                if db_conn is not None and notification_type:
+                    record_sent_notification(
+                        db_conn,
+                        chat_id=chat_id,
+                        result=result,
+                        text=text,
+                        notification_type=notification_type or "message",
+                        batch_id=notification_batch_id,
+                        title=notification_title or notification_type_label(notification_type),
+                        source=notification_source,
+                        product_name=notification_product_name,
+                        parse_mode=parse_mode,
+                        target_kind=notification_target_kind,
+                    )
+            except Exception:
+                pass
+            return {"ok": True, "result": result, "blocked": False}
         description = str(payload_resp.get("description") or resp.text or "Telegram delivery failed")
         return {
             "ok": False,
@@ -9806,7 +10222,22 @@ def send_telegram_document(chat_id: int, filename: str, content: str, caption: s
         resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendDocument", data=data, files=files, timeout=30)
         payload = resp.json() if resp.content else {}
         if resp.ok and payload.get("ok"):
-            return payload.get("result") or {"ok": True}
+            result = payload.get("result") or {"ok": True}
+            try:
+                db_conn = current_app.db if has_request_context() else None
+                if db_conn is not None:
+                    record_sent_notification(
+                        db_conn,
+                        chat_id=chat_id,
+                        result=result,
+                        text=caption or filename,
+                        notification_type="document",
+                        title=f"Document: {filename}",
+                        source="web_admin_document",
+                    )
+            except Exception:
+                pass
+            return result
         current_app.logger.warning("Telegram sendDocument failed for chat=%s filename=%s: %s", chat_id, filename, payload or resp.text)
         return False
     except Exception:

@@ -67,6 +67,7 @@
       {% if can_access('ranking') %}<a href="{{ url_for('ranking') }}">Buyer Ranking</a>{% endif %}
       {% if can_access('activity_log') %}<a href="{{ url_for('activity_log') }}">Activity Log</a>{% endif %}
       {% if can_access('broadcast_form') %}<a href="{{ url_for('broadcast_form') }}">Broadcast</a>{% endif %}
+      {% if can_access('recent_notifications') %}<a href="{{ url_for('recent_notifications') }}">Recent Notifications</a>{% endif %}
       {% if can_access('help_page') %}<a href="{{ url_for('help_page') }}">Admin Map</a>{% endif %}
     </nav>
     <form method="post" action="{{ url_for('logout') }}" class="logout-form">

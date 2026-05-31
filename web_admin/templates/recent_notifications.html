@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Recent Notifications{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Recent Notifications</h1>
+    <p>Delete Telegram messages sent to customers during the last {{ delete_window_hours }} hours. Telegram does not allow bot deletion after this window.</p>
+  </div>
+  <div class="page-actions">
+    <a class="secondary-button" href="{{ url_for('broadcast_form') }}">Send broadcast</a>
+  </div>
+</div>
+
+<section class="panel">
+  {% if rows %}
+  <div class="table-wrap">
+    <table class="activity-table recent-notifications-table">
+      <thead>
+        <tr>
+          <th>Sent</th>
+          <th>Type</th>
+          <th>Notification</th>
+          <th>Customers</th>
+          <th>Status</th>
+          <th>Delete until</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in rows %}
+        {% set remaining = row.deletable_count or 0 %}
+        <tr>
+          <td>{{ fmt_dt(row.last_sent_at) }}</td>
+          <td><span class="badge">{{ notification_type_label(row.notification_type) }}</span></td>
+          <td>
+            <strong>{{ row.title or notification_type_label(row.notification_type) }}</strong>
+            {% if row.product_name %}<br><span class="muted">Product: {{ row.product_name }}</span>{% endif %}
+            {% if row.text_preview %}<br><span class="muted">{{ row.text_preview }}</span>{% endif %}
+          </td>
+          <td>{{ row.total_count or 0 }}</td>
+          <td>
+            <span class="status-badge status-green">Deleted: {{ row.deleted_count or 0 }}</span>
+            {% if row.failed_delete_count %}<br><span class="status-badge status-red">Failed: {{ row.failed_delete_count }}</span>{% endif %}
+            {% if remaining %}<br><span class="muted">Remaining: {{ remaining }}</span>{% endif %}
+          </td>
+          <td>{{ fmt_dt(row.expires_at) }}<br><span class="muted">{{ notification_expires_in(row.expires_at) }}</span></td>
+          <td>
+            {% if remaining > 0 and notification_expires_in(row.expires_at) != 'expired' %}
+            <form method="post" action="{{ url_for('delete_recent_notification', batch_id=row.batch_id) }}" class="inline-form recent-delete-form" data-delete-count="{{ remaining }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button class="danger" type="submit">Delete sent messages</button>
+            </form>
+            {% else %}
+              <span class="muted">No deletable messages</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No customer notifications have been logged in the last {{ delete_window_hours }} hours yet. New broadcasts, stock alerts, price drops, order documents, and bot messages will appear here after they are sent.</p>
+  {% endif %}
+  {% include "pagination.html" %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  document.addEventListener('submit', function (event) {
+    const form = event.target.closest && event.target.closest('.recent-delete-form');
+    if (!form || form.dataset.confirmed === '1') return;
+    const count = form.dataset.deleteCount || 'these';
+    if (!window.confirm(`Delete ${count} Telegram message(s) from customer chats? This cannot be undone.`)) {
+      event.preventDefault();
+      return;
+    }
+    form.dataset.confirmed = '1';
+  });
+})();
+</script>
+{% endblock %}
