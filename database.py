@@ -1124,6 +1124,24 @@ async def record_stock_upload_rejection(
     return doc
 
 
+def delivered_order_blocks_stock_reuse(order: dict | None) -> bool:
+    """Whether a delivered order's items should block future stock reuse.
+
+    Revoked orders continue to block reuse until an admin either returns the
+    delivery to stock or transfers it. Returned stock is then controlled by the
+    live product stock array; transferred stock is blocked by the new transfer
+    order rather than the old revoked order.
+    """
+    if not order:
+        return True
+    if order.get("delivery_revoked"):
+        if order.get("delivery_returned_to_stock"):
+            return False
+        if str(order.get("delivery_transferred_to_order_id") or "").strip():
+            return False
+    return True
+
+
 async def add_stock(
     product_name: str,
     items: list[str],
@@ -1155,9 +1173,16 @@ async def add_stock(
     }
     cursor = get_db().orders.find(
         {"product_name": _name_regex(product_name), "items.0": {"$exists": True}},
-        {"items": 1},
+        {
+            "items": 1,
+            "delivery_revoked": 1,
+            "delivery_returned_to_stock": 1,
+            "delivery_transferred_to_order_id": 1,
+        },
     )
     async for order in cursor:
+        if not delivered_order_blocks_stock_reuse(order):
+            continue
         existing.update(normalize_approved_stock_item(item) for item in (order.get("items", []) or []) if normalize_approved_stock_item(item))
 
     seen_in_upload: set[str] = set()

@@ -3673,8 +3673,12 @@ def register_routes(app: Flask) -> None:
         including stock already delivered by normal paid orders, replacements, or
         previous admin sends. It also protects manual sends from duplicating items
         still sitting in product stock, because those could later be sold again.
+
+        Revoked deliveries that were explicitly added back to stock are not
+        considered "already sent" here. Once returned, the live product stock
+        row is the source of truth and can be sent again from inventory.
         """
-        normalized_items = [str(item).strip() for item in (items or []) if str(item).strip()]
+        normalized_items = [normalize_approved_stock_item(item) for item in (items or []) if normalize_approved_stock_item(item)]
         seen: set[str] = set()
         duplicate_in_send: list[str] = []
         for item in normalized_items:
@@ -3683,11 +3687,11 @@ def register_routes(app: Flask) -> None:
             seen.add(item)
 
         item_set = set(normalized_items)
-        existing_set = {str(item).strip() for item in (existing_stock or []) if str(item).strip()}
+        existing_set = {normalize_approved_stock_item(item) for item in (existing_stock or []) if normalize_approved_stock_item(item)}
         duplicate_in_current_stock = sorted(item_set & existing_set)
 
         already_delivered = get_used_stock_items(app.db, product_name)
-        delivered_set = {str(item).strip() for item in already_delivered if str(item).strip()}
+        delivered_set = {normalize_approved_stock_item(item) for item in already_delivered if normalize_approved_stock_item(item)}
         duplicate_already_sent = sorted(item_set & delivered_set)
 
         return {
@@ -3825,6 +3829,10 @@ def register_routes(app: Flask) -> None:
             flash("Selected product was not found.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
+        manual_inventory_removed_items: list[str] = []
+        manual_inventory_removed_keys: set[str] = set()
+        manual_ledger_items: list[str] = []
+
         if source == "inventory":
             try:
                 quantity = int(str(request.form.get("stock_quantity", "")).strip())
@@ -3894,23 +3902,95 @@ def register_routes(app: Flask) -> None:
             if len(items) > 1000:
                 flash("Too many stock items in one send. Send 1000 items or fewer at a time.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=product.get("stock", []) or [])
+
+            # Check repeated pasted blocks and active delivered items first, but
+            # do not treat current inventory as fatal yet. If the pasted item is
+            # already in product stock (for example after "Add back to stock"),
+            # remove that exact item from inventory and send it instead of
+            # leaving a second sellable copy behind.
+            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=[])
+            blocking_report = {**duplicate_report, "duplicate_in_current_stock": []}
+            if has_stock_duplicate_report(blocking_report):
+                queue_stock_duplicate_warning(product["name"], blocking_report, source=source)
+                flash("Duplicate stock detected. Nothing was sent. Review the popup warning and enter only fresh stock.", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+
+            current_stock_keys = {
+                normalize_approved_stock_item(item)
+                for item in (product.get("stock") or [])
+                if normalize_approved_stock_item(item)
+            }
+            current_stock_items_to_send = [
+                item for item in items
+                if normalize_approved_stock_item(item) in current_stock_keys
+            ]
+            removed_by_key: dict[str, str] = {}
+            if current_stock_items_to_send:
+                removal = pop_specific_stock_items_for_admin_send(app.db, product["name"], current_stock_items_to_send)
+                removed_by_key = removal.get("removed_by_key", {}) or {}
+                missing = removal.get("missing", []) or []
+                if missing:
+                    flash("Stock changed before it could be sent. Please refresh the user page and try again.", "error")
+                    return redirect(url_for("user_detail", user_id=user_id))
+                manual_inventory_removed_keys = set(removed_by_key.keys())
+                manual_inventory_removed_items = list(removed_by_key.values())
+
+            delivery_items: list[str] = []
+            for item in items:
+                clean_key = normalize_approved_stock_item(item)
+                if not clean_key:
+                    continue
+                delivery_items.append(removed_by_key.get(clean_key) or clean_key)
+            items = delivery_items
+            manual_ledger_items = [
+                item for item in items
+                if normalize_approved_stock_item(item) not in manual_inventory_removed_keys
+            ]
+
+            refreshed_product = app.db.products.find_one({"_id": product["_id"]}, {"stock": 1, "name": 1}) or product
+            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=refreshed_product.get("stock", []) or [])
             if has_stock_duplicate_report(duplicate_report):
+                if manual_inventory_removed_items:
+                    restore_admin_send_stock_items(
+                        app.db,
+                        product["name"],
+                        manual_inventory_removed_items,
+                        username=current_admin_username() or "owner",
+                        role=current_admin_role(),
+                        stock_upload_kind="manual_admin_send_duplicate_rollback",
+                        note="Restored after manual admin send duplicate check rollback",
+                    )
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source)
                 flash("Duplicate stock detected. Nothing was sent. Review the popup warning and enter only fresh stock.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
-        order, err = create_admin_stock_order(user, product, items, source=source, admin_note=admin_note)
+        order_source = source
+        if source == "manual" and items:
+            item_keys = {normalize_approved_stock_item(item) for item in items if normalize_approved_stock_item(item)}
+            if item_keys and item_keys == manual_inventory_removed_keys:
+                order_source = "inventory"
+
+        order, err = create_admin_stock_order(user, product, items, source=order_source, admin_note=admin_note)
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
         if not order:
+            if manual_inventory_removed_items:
+                restore_admin_send_stock_items(
+                    app.db,
+                    product["name"],
+                    manual_inventory_removed_items,
+                    username=current_admin_username() or "owner",
+                    role=current_admin_role(),
+                    stock_upload_kind="manual_admin_send_order_create_rollback",
+                    note="Restored after manual admin send order creation failed",
+                )
             flash(f"Could not create order history for {user_label}: {err or 'unknown error'}", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
-        if source == "manual":
+        if source == "manual" and manual_ledger_items:
             record_stock_ledger_add(
                 app.db,
                 product["name"],
-                items,
+                manual_ledger_items,
                 username=current_admin_username() or "owner",
                 role=current_admin_role(),
                 source="webadmin",
@@ -3944,7 +4024,7 @@ def register_routes(app: Flask) -> None:
         log_admin_action(
             app.db,
             "admin_stock_sent",
-            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={len(items)} source={source} sent={bool(sent)}",
+            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={len(items)} source={order_source} sent={bool(sent)}",
         )
         if sent:
             flash(f"Sent {len(items)} item(s) of {product.get('name')} to {user_label}. Order {order['order_id']} was added to their history.", "success")
@@ -3976,6 +4056,10 @@ def register_routes(app: Flask) -> None:
         if not product:
             flash("Selected product was not found.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
+
+        manual_inventory_removed_items: list[str] = []
+        manual_inventory_removed_keys: set[str] = set()
+        manual_ledger_items: list[str] = []
 
         if source == "inventory":
             try:
@@ -4045,23 +4129,90 @@ def register_routes(app: Flask) -> None:
             if len(items) > 1000:
                 flash("Too many replacement items in one send. Send 1000 items or fewer at a time.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
-            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=product.get("stock", []) or [])
+
+            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=[])
+            blocking_report = {**duplicate_report, "duplicate_in_current_stock": []}
+            if has_stock_duplicate_report(blocking_report):
+                queue_stock_duplicate_warning(product["name"], blocking_report, source=source, flow="replacement")
+                flash("Duplicate stock detected. Nothing was sent. Review the popup warning and enter only fresh replacement stock.", "error")
+                return redirect(url_for("user_detail", user_id=user_id))
+
+            current_stock_keys = {
+                normalize_approved_stock_item(item)
+                for item in (product.get("stock") or [])
+                if normalize_approved_stock_item(item)
+            }
+            current_stock_items_to_send = [
+                item for item in items
+                if normalize_approved_stock_item(item) in current_stock_keys
+            ]
+            removed_by_key: dict[str, str] = {}
+            if current_stock_items_to_send:
+                removal = pop_specific_stock_items_for_admin_send(app.db, product["name"], current_stock_items_to_send)
+                removed_by_key = removal.get("removed_by_key", {}) or {}
+                missing = removal.get("missing", []) or []
+                if missing:
+                    flash("Stock changed before the replacement could be sent. Please refresh the user page and try again.", "error")
+                    return redirect(url_for("user_detail", user_id=user_id))
+                manual_inventory_removed_keys = set(removed_by_key.keys())
+                manual_inventory_removed_items = list(removed_by_key.values())
+
+            delivery_items: list[str] = []
+            for item in items:
+                clean_key = normalize_approved_stock_item(item)
+                if not clean_key:
+                    continue
+                delivery_items.append(removed_by_key.get(clean_key) or clean_key)
+            items = delivery_items
+            manual_ledger_items = [
+                item for item in items
+                if normalize_approved_stock_item(item) not in manual_inventory_removed_keys
+            ]
+
+            refreshed_product = app.db.products.find_one({"_id": product["_id"]}, {"stock": 1, "name": 1}) or product
+            duplicate_report = build_stock_duplicate_report(product["name"], items, existing_stock=refreshed_product.get("stock", []) or [])
             if has_stock_duplicate_report(duplicate_report):
+                if manual_inventory_removed_items:
+                    restore_admin_send_stock_items(
+                        app.db,
+                        product["name"],
+                        manual_inventory_removed_items,
+                        username=current_admin_username() or "owner",
+                        role=current_admin_role(),
+                        stock_upload_kind="manual_replacement_duplicate_rollback",
+                        note="Restored after manual replacement duplicate check rollback",
+                    )
                 queue_stock_duplicate_warning(product["name"], duplicate_report, source=source, flow="replacement")
                 flash("Duplicate stock detected. Nothing was sent. Review the popup warning and enter only fresh replacement stock.", "error")
                 return redirect(url_for("user_detail", user_id=user_id))
 
-        order, err = create_manual_replacement_order(user, product, items, source=source, admin_note=admin_note)
+        order_source = source
+        if source == "manual" and items:
+            item_keys = {normalize_approved_stock_item(item) for item in items if normalize_approved_stock_item(item)}
+            if item_keys and item_keys == manual_inventory_removed_keys:
+                order_source = "inventory"
+
+        order, err = create_manual_replacement_order(user, product, items, source=order_source, admin_note=admin_note)
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
         if not order:
+            if manual_inventory_removed_items:
+                restore_admin_send_stock_items(
+                    app.db,
+                    product["name"],
+                    manual_inventory_removed_items,
+                    username=current_admin_username() or "owner",
+                    role=current_admin_role(),
+                    stock_upload_kind="manual_replacement_order_create_rollback",
+                    note="Restored after manual replacement order creation failed",
+                )
             flash(f"Could not create replacement history for {user_label}: {err or 'unknown error'}", "error")
             return redirect(url_for("user_detail", user_id=user_id))
 
-        if source == "manual":
+        if source == "manual" and manual_ledger_items:
             record_stock_ledger_add(
                 app.db,
                 product["name"],
-                items,
+                manual_ledger_items,
                 username=current_admin_username() or "owner",
                 role=current_admin_role(),
                 source="webadmin",
@@ -4095,7 +4246,7 @@ def register_routes(app: Flask) -> None:
         log_admin_action(
             app.db,
             "manual_replacement_sent",
-            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={len(items)} source={source} sent={bool(sent)}",
+            f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={len(items)} source={order_source} sent={bool(sent)}",
         )
         if sent:
             flash(f"Sent {len(items)} replacement item(s) of {product.get('name')} to {user_label}. Replacement {order['order_id']} was added to their history.", "success")
@@ -5303,13 +5454,38 @@ def split_stock(raw: str) -> list[str]:
     return [block.strip() for block in (raw or "").split("---") if block.strip()]
 
 
+def order_blocks_stock_reuse(order: dict | None) -> bool:
+    """Whether this order should make its items unavailable for future sends.
+
+    A revoked delivery normally still blocks reuse until an admin chooses what
+    happened next. Once that revoked delivery has been returned to stock, the
+    current product stock row should be reusable. If it was transferred, the new
+    transfer order blocks reuse instead of the old revoked order.
+    """
+    if not order:
+        return True
+    if order.get("delivery_revoked"):
+        if order.get("delivery_returned_to_stock"):
+            return False
+        if str(order.get("delivery_transferred_to_order_id") or "").strip():
+            return False
+    return True
+
+
 def get_used_stock_items(db, product_name: str) -> list[str]:
-    """Return stock items that were already delivered for this product."""
+    """Return stock items that were already delivered and still block reuse."""
     used: list[str] = []
     for order in db.orders.find(
         {"product_name": name_regex(product_name), "items.0": {"$exists": True}},
-        {"items": 1},
+        {
+            "items": 1,
+            "delivery_revoked": 1,
+            "delivery_returned_to_stock": 1,
+            "delivery_transferred_to_order_id": 1,
+        },
     ):
+        if not order_blocks_stock_reuse(order):
+            continue
         used.extend([normalize_approved_stock_item(item) for item in (order.get("items", []) or []) if normalize_approved_stock_item(item)])
     return used
 
@@ -8520,6 +8696,114 @@ def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, 
         time.sleep(0.05)
 
     return []
+
+
+def pop_specific_stock_items_for_admin_send(db, product_name: str, requested_items: list[str]) -> dict[str, Any]:
+    """Remove exact stock item(s) from inventory for a manual admin send.
+
+    This supports the common revoked-delivery flow: admin adds the revoked item
+    back to stock, then pastes that exact item into "Send stock to this user".
+    Instead of flagging the pasted item as a current-stock duplicate, we remove
+    the matching inventory row first so the item cannot be sold twice.
+    """
+    requested_keys: list[str] = []
+    seen_keys: set[str] = set()
+    for item in requested_items or []:
+        key = normalize_approved_stock_item(item)
+        if key and key not in seen_keys:
+            requested_keys.append(key)
+            seen_keys.add(key)
+    if not requested_keys:
+        return {"removed_by_key": {}, "removed_items": [], "missing": []}
+
+    for _attempt in range(5):
+        product = db.products.find_one({"name": name_regex(product_name)}, {"stock": 1, "stock_added_by": 1})
+        if not product:
+            return {"removed_by_key": {}, "removed_items": [], "missing": requested_keys}
+
+        remaining_keys = set(requested_keys)
+        removed_by_key: dict[str, str] = {}
+        new_stock: list[Any] = []
+        for stock_item in list(product.get("stock", []) or []):
+            key = normalize_approved_stock_item(stock_item)
+            if key and key in remaining_keys:
+                removed_by_key[key] = normalize_approved_stock_item(stock_item)
+                remaining_keys.remove(key)
+                continue
+            new_stock.append(stock_item)
+
+        if remaining_keys:
+            return {"removed_by_key": removed_by_key, "removed_items": list(removed_by_key.values()), "missing": sorted(remaining_keys)}
+
+        removed_items = [removed_by_key[key] for key in requested_keys if key in removed_by_key]
+        removed_hashes = [stock_item_hash(item) for item in removed_items if stock_item_hash(item)]
+        update: dict[str, Any] = {"$set": {"stock": new_stock}}
+        if removed_hashes:
+            update["$pull"] = {"stock_added_by": {"item_hash": {"$in": removed_hashes}}}
+
+        try:
+            result = db.products.update_one({"_id": product["_id"], "stock": product.get("stock", []) or []}, update)
+        except Exception:
+            try:
+                current_app.logger.exception("Failed to remove exact inventory stock for admin send: product=%s", product_name)
+            except Exception:
+                pass
+            return {"removed_by_key": {}, "removed_items": [], "missing": requested_keys}
+
+        if result.modified_count:
+            try:
+                record_stock_ledger_status(db, product_name, removed_items, "popped", source="webadmin", note="Removed exact live stock for manual admin send")
+            except Exception:
+                pass
+            return {"removed_by_key": removed_by_key, "removed_items": removed_items, "missing": []}
+
+        time.sleep(0.05)
+
+    return {"removed_by_key": {}, "removed_items": [], "missing": requested_keys}
+
+
+def restore_admin_send_stock_items(
+    db,
+    product_name: str,
+    items: list[str],
+    *,
+    username: str = "",
+    role: str = "",
+    stock_upload_kind: str = "admin_send_rollback",
+    note: str = "Restored after admin send rollback",
+) -> int:
+    """Put exact inventory items back after a failed admin-send attempt."""
+    clean_items = [normalize_approved_stock_item(item) for item in (items or []) if normalize_approved_stock_item(item)]
+    if not clean_items:
+        return 0
+    stock_meta_records = build_stock_added_by_records(
+        clean_items,
+        username=username or "owner",
+        role=role,
+        manager_earning_rate_usdt=0.0,
+        owner_due_rate_usdt=0.0,
+        stock_upload_kind=stock_upload_kind,
+    )
+    result = db.products.update_one(
+        {"name": name_regex(product_name)},
+        {"$push": {"stock": {"$each": clean_items, "$position": 0}, "stock_added_by": {"$each": stock_meta_records}}},
+    )
+    if not result.matched_count:
+        return 0
+    try:
+        record_stock_ledger_add(
+            db,
+            product_name,
+            clean_items,
+            username=username or "owner",
+            role=role,
+            source="webadmin",
+            stock_upload_kind=stock_upload_kind,
+            note=note,
+        )
+    except Exception:
+        pass
+    return len(clean_items)
 
 
 def has_pending_stock_ahead(db, product_name: str, created_at: Any, order_id: str | None = None) -> bool:
