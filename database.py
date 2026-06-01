@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from urllib.parse import parse_qsl, urlsplit
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -3617,6 +3618,8 @@ async def clear_pending(user_id: int):
 
 _REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _REPORT_ORDER_ID_RE = re.compile(r"\border\s*id\s*[:#\-]?\s*([A-Z0-9]{6,16})\b", re.IGNORECASE)
+_REPORT_URL_RE = re.compile(r"https?://[^\s<>\]\[{}\\\"']+", re.IGNORECASE)
+
 
 
 def stock_item_hash(item: str) -> str:
@@ -3631,6 +3634,52 @@ def _normalize_report_match_text(value: str) -> str:
 
 def _emails_in_text(value: str) -> set[str]:
     return {m.group(0).lower() for m in _REPORT_EMAIL_RE.finditer(str(value or ""))}
+
+
+def _urls_in_report_text(value: str) -> list[str]:
+    """Return pasted URLs, normalized enough for matching.
+
+    Blank lines are preserved by splitlines(), but URL matching should not let
+    shared host/path tokens make the first URL match every later URL.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in _REPORT_URL_RE.finditer(str(value or "")):
+        url = match.group(0).strip().rstrip(".,;:!?)]}>'\"")
+        if not url:
+            continue
+        try:
+            parsed = urlsplit(url)
+            norm = parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower(), fragment="").geturl().rstrip("/").lower()
+        except Exception:
+            norm = url.rstrip("/").lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            urls.append(norm)
+    return urls
+
+
+def _url_identifier_tokens(value: str) -> set[str]:
+    """Return unique URL query/value tokens such as reward_code IDs.
+
+    For URLs like https://host/path?reward_code=A-B-C, the host/path are often
+    identical across many accounts. Only query values are used as fuzzy URL
+    identifiers so one URL does not accidentally match another URL from the same
+    product page.
+    """
+    tokens: set[str] = set()
+    for url in _urls_in_report_text(value):
+        try:
+            parsed = urlsplit(url)
+            pairs = parse_qsl(parsed.query, keep_blank_values=False)
+        except Exception:
+            pairs = []
+        for _key, val in pairs:
+            for token in re.findall(r"[a-z0-9][a-z0-9._%+\-]{4,}", str(val or "").lower(), flags=re.IGNORECASE):
+                cleaned = token.strip("._-+% ").lower()
+                if len(cleaned) >= 5:
+                    tokens.add(cleaned)
+    return tokens
 
 
 def _order_ids_in_report(value: str) -> set[str]:
@@ -3777,12 +3826,31 @@ def _report_submitted_item_matches(submitted: str, delivered_item: str) -> bool:
     submitted_values = _report_candidate_values(submitted)
     delivered_values = _report_candidate_values(delivered_item)
     delivered_value_norms = {_normalize_report_match_text(v) for v in delivered_values}
+    delivered_url_set = set(_urls_in_report_text(delivered_item))
+    delivered_url_tokens = _url_identifier_tokens(delivered_item)
+    delivered_tokens = _significant_report_tokens(delivered_norm)
 
     if submitted_values:
+        non_url_values: list[str] = []
+        saw_url_value = False
         for value in submitted_values:
             value_norm = _normalize_report_match_text(value)
             if not value_norm:
                 continue
+            value_url_set = set(_urls_in_report_text(value))
+            value_url_tokens = _url_identifier_tokens(value)
+            if value_url_set or value_url_tokens:
+                saw_url_value = True
+                # URL accounts commonly share the same host/path. Match them by
+                # exact URL or unique query values such as reward_code, not by
+                # broad path/domain tokens that make only the first URL count.
+                if value_url_set and delivered_url_set and value_url_set.intersection(delivered_url_set):
+                    return True
+                if value_url_tokens and value_url_tokens.intersection(delivered_url_tokens.union(delivered_tokens)):
+                    return True
+                continue
+
+            non_url_values.append(value)
             if value_norm == delivered_norm or value_norm in delivered_value_norms:
                 return True
             # Allow a pasted code to match a labeled delivered item such as
@@ -3790,14 +3858,18 @@ def _report_submitted_item_matches(submitted: str, delivered_item: str) -> bool:
             # broad substring matching.
             if len(value_norm) >= 6 and value_norm in delivered_norm:
                 return True
-        submitted_token_source = "\n".join(submitted_values)
+        # If the report was a list of URLs, stop here unless there were also
+        # non-URL account/code lines. This prevents a common URL path from
+        # matching every item in the user's order history.
+        if saw_url_value and not non_url_values:
+            return False
+        submitted_token_source = "\n".join(non_url_values if saw_url_value else submitted_values)
     else:
         submitted_token_source = submitted_norm
 
     # One pasted message can contain many account IDs/codes. Match useful tokens
     # from the delivered stock item instead of requiring the whole message to match.
     submitted_tokens = _significant_report_tokens(submitted_token_source)
-    delivered_tokens = _significant_report_tokens(delivered_norm)
     if submitted_tokens and delivered_tokens and submitted_tokens.intersection(delivered_tokens):
         return True
 

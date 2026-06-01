@@ -31,6 +31,22 @@
       {% if manual_lookup.searched_emails %}<span class="muted">{{ manual_lookup.searched_emails|length }} email{{ '' if manual_lookup.searched_emails|length == 1 else 's' }} detected in the pasted report.</span>{% endif %}
       {% if manual_lookup.limited %}<span class="warning">Showing first {{ manual_lookup.matches|length }} only.</span>{% endif %}
     </div>
+    {% if manual_lookup.addable_count %}
+      <div class="manual-bulk-due-panel">
+        <p><strong>{{ manual_lookup.addable_count }}</strong> addable item{{ '' if manual_lookup.addable_count == 1 else 's' }} will be grouped into <strong>{{ manual_lookup.addable_user_groups|length }}</strong> report{{ '' if manual_lookup.addable_user_groups|length == 1 else 's' }} by buyer.</p>
+        <div class="manual-bulk-groups">
+          {% for group in manual_lookup.addable_user_groups %}
+            <span class="mini-chip">{{ group.user_label }}: {{ group.count }} item{{ '' if group.count == 1 else 's' }}</span>
+          {% endfor %}
+        </div>
+        <form method="post" action="{{ url_for('add_manual_replacement_due_bulk') }}" class="manual-bulk-due-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <textarea name="manual_report_text" hidden>{{ manual_report_text or '' }}</textarea>
+          <label>Note for all grouped reports (optional)<input name="manual_note" placeholder="Example: reported on Telegram"></label>
+          <button type="submit" class="primary">Add all due as grouped reports</button>
+        </form>
+      </div>
+    {% endif %}
     {% if manual_lookup.matches %}
       <div class="manual-lookup-list">
         {% for match in manual_lookup.matches %}

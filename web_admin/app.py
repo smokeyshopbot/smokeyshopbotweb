@@ -22,6 +22,7 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlsplit
 
 import requests
 from dotenv import load_dotenv
@@ -1979,7 +1980,7 @@ def register_routes(app: Flask) -> None:
         if len(normalize_report_match_text(manual_report_text)) < 3:
             flash("Paste the user's reported account/code before searching.", "error")
         else:
-            manual_lookup = build_manual_replacement_lookup_results(app.db, manual_report_text)
+            manual_lookup = build_manual_replacement_lookup_results(app.db, manual_report_text, limit=500)
             if not manual_lookup.get("matches"):
                 flash("No delivered stock matched this manual report text.", "info")
         return render_template(
@@ -2017,6 +2018,42 @@ def register_routes(app: Flask) -> None:
         log_admin_action(app.db, "manual_replacement_due_added", f"{report_id} order={order_id}")
         flash(f"Manual replacement due added to the original stock manager. Report {report_id} was created.", "success")
         return redirect(url_for("replacement_detail", report_id=report_id))
+
+    @app.post("/replacements/manual-lookup/add-due-bulk")
+    @login_required
+    @owner_required
+    @csrf_required
+    def add_manual_replacement_due_bulk():
+        submitted_text = (request.form.get("manual_report_text") or "").strip()
+        note = (request.form.get("manual_note") or "").strip()
+        if len(normalize_report_match_text(submitted_text)) < 3:
+            flash("Paste the user's reported account/code before adding replacement due.", "error")
+            return redirect(url_for("replacements"))
+
+        result = create_manual_replacement_due_reports_from_lookup(
+            app.db,
+            submitted_text=submitted_text,
+            admin_note=note,
+            added_by=current_admin_username() or "owner",
+        )
+        created_reports = result.get("created_reports") or []
+        skipped_count = int(result.get("skipped_count") or 0)
+        if not created_reports:
+            flash(result.get("error") or "No addable matched items were found for this manual report.", "error")
+            return redirect(url_for("replacements"))
+
+        report_ids = [str(row.get("report_id") or "") for row in created_reports if row.get("report_id")]
+        total_items = sum(int(row.get("item_count") or 0) for row in created_reports)
+        log_admin_action(app.db, "manual_replacement_due_bulk_added", f"reports={','.join(report_ids)} items={total_items} skipped={skipped_count}")
+        suffix = f" Skipped {skipped_count} already-pending/unassignable item(s)." if skipped_count else ""
+        flash(
+            f"Created {len(created_reports)} grouped replacement report(s) for {total_items} item(s). "
+            f"Each due item was assigned to its original stock manager." + suffix,
+            "success",
+        )
+        if len(created_reports) == 1:
+            return redirect(url_for("replacement_detail", report_id=created_reports[0].get("report_id")))
+        return redirect(url_for("replacements"))
 
     @app.get("/replacements/<report_id>")
     @login_required
@@ -5913,6 +5950,7 @@ def stock_ledger_status_label(status: Any) -> tuple[str, str]:
 
 
 REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+REPORT_URL_RE = re.compile(r"https?://[^\s<>\]\[{}\\\"']+", re.IGNORECASE)
 
 
 def normalize_report_match_text(value: Any) -> str:
@@ -5923,6 +5961,88 @@ def normalize_report_match_text(value: Any) -> str:
 
 def report_emails_in_text(value: Any) -> set[str]:
     return {m.group(0).lower() for m in REPORT_EMAIL_RE.finditer(str(value or ""))}
+
+
+def report_urls_in_text(value: Any) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in REPORT_URL_RE.finditer(str(value or "")):
+        url = match.group(0).strip().rstrip(".,;:!?)]}>'\"")
+        if not url:
+            continue
+        try:
+            parsed = urlsplit(url)
+            norm = parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower(), fragment="").geturl().rstrip("/").lower()
+        except Exception:
+            norm = url.rstrip("/").lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            urls.append(norm)
+    return urls
+
+
+def report_url_identifier_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    for url in report_urls_in_text(value):
+        try:
+            parsed = urlsplit(url)
+            pairs = parse_qsl(parsed.query, keep_blank_values=False)
+        except Exception:
+            pairs = []
+        for _key, val in pairs:
+            for token in re.findall(r"[a-z0-9][a-z0-9._%+\-]{4,}", str(val or "").lower(), flags=re.IGNORECASE):
+                cleaned = token.strip("._-+% ").lower()
+                if len(cleaned) >= 5:
+                    tokens.add(cleaned)
+    return tokens
+
+
+def clean_report_candidate_line(line: Any) -> str:
+    raw = str(line or "").strip()
+    raw = re.sub(r"^\s*[•*\-]+\s*", "", raw)
+    raw = re.sub(r"^\s*\d+[.)]\s*", "", raw)
+    raw = raw.strip(" `\t\r\n")
+    if not raw:
+        return ""
+    lowered = raw.lower().strip()
+    if lowered in {"order items", "items", "item", "stock items", "accounts", "account", "codes", "code"}:
+        return ""
+    if re.match(r"^(order\s*id|product|quantity|qty)\s*[:#\-]?", lowered, flags=re.IGNORECASE):
+        return ""
+    if re.match(r"^(mail|email|pass|password|mail\s*pass|username|login)\s*[:#\-]?", lowered, flags=re.IGNORECASE):
+        return ""
+    labeled = re.match(r"^(?:code|item|account|account\s*id|stock)\s*[:#\-]\s*(.+)$", raw, flags=re.IGNORECASE)
+    if labeled:
+        raw = labeled.group(1).strip()
+    return raw.strip(" `\t\r\n")
+
+
+def report_candidate_values(value: Any) -> list[str]:
+    raw = str(value or "")
+    emails = sorted(report_emails_in_text(raw), key=lambda x: raw.lower().find(x))
+    if emails:
+        seen: set[str] = set()
+        result: list[str] = []
+        for email in emails:
+            if email not in seen:
+                seen.add(email)
+                result.append(email)
+        return result
+
+    seen_norms: set[str] = set()
+    result: list[str] = []
+    for line in raw.splitlines():
+        cleaned = clean_report_candidate_line(line)
+        if not cleaned:
+            continue
+        if len(normalize_report_match_text(cleaned)) < 5:
+            continue
+        norm = normalize_report_match_text(cleaned)
+        if norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        result.append(cleaned)
+    return result
 
 
 def significant_report_tokens(value: Any) -> set[str]:
@@ -5949,13 +6069,47 @@ def report_submitted_item_matches(submitted: Any, delivered_item: Any) -> bool:
     delivered_emails = report_emails_in_text(delivered_norm)
     if submitted_emails and delivered_emails:
         return bool(submitted_emails.intersection(delivered_emails))
-    submitted_tokens = significant_report_tokens(submitted_norm)
+
+    submitted_values = report_candidate_values(submitted)
+    delivered_values = report_candidate_values(delivered_item)
+    delivered_value_norms = {normalize_report_match_text(v) for v in delivered_values}
+    delivered_url_set = set(report_urls_in_text(delivered_item))
+    delivered_url_tokens = report_url_identifier_tokens(delivered_item)
     delivered_tokens = significant_report_tokens(delivered_norm)
+
+    if submitted_values:
+        non_url_values: list[str] = []
+        saw_url_value = False
+        for value in submitted_values:
+            value_norm = normalize_report_match_text(value)
+            if not value_norm:
+                continue
+            value_url_set = set(report_urls_in_text(value))
+            value_url_tokens = report_url_identifier_tokens(value)
+            if value_url_set or value_url_tokens:
+                saw_url_value = True
+                if value_url_set and delivered_url_set and value_url_set.intersection(delivered_url_set):
+                    return True
+                if value_url_tokens and value_url_tokens.intersection(delivered_url_tokens.union(delivered_tokens)):
+                    return True
+                continue
+            non_url_values.append(value)
+            if value_norm == delivered_norm or value_norm in delivered_value_norms:
+                return True
+            if len(value_norm) >= 6 and value_norm in delivered_norm:
+                return True
+        if saw_url_value and not non_url_values:
+            return False
+        token_source = "\n".join(non_url_values if saw_url_value else submitted_values)
+    else:
+        token_source = submitted_norm
+
+    submitted_tokens = significant_report_tokens(token_source)
     if submitted_tokens and delivered_tokens and submitted_tokens.intersection(delivered_tokens):
         return True
-    if len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
+    if not submitted_values and len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
         return True
-    if len(delivered_norm) >= 6 and delivered_norm in submitted_norm:
+    if not submitted_values and len(delivered_norm) >= 6 and delivered_norm in submitted_norm:
         return True
     return submitted_norm == delivered_norm
 
@@ -5976,7 +6130,12 @@ def report_submitted_match_snippet(submitted: Any, delivered_item: Any) -> str:
         return email
     if submitted_emails and delivered_emails:
         return submitted_raw[:1000]
-    common_tokens = significant_report_tokens(submitted_norm).intersection(significant_report_tokens(delivered_norm))
+
+    for candidate in report_candidate_values(submitted_raw):
+        if report_submitted_item_matches(candidate, delivered_raw):
+            return candidate
+
+    common_tokens = significant_report_tokens("\n".join(report_candidate_values(submitted_raw)) or submitted_norm).intersection(significant_report_tokens(delivered_norm))
     if common_tokens:
         token = sorted(common_tokens, key=len, reverse=True)[0]
         for line in submitted_raw.splitlines():
@@ -6086,6 +6245,7 @@ def build_manual_replacement_lookup_results(db, submitted_text: str, *, limit: i
                 "user_id": int(order.get("user_id", 0) or 0),
                 "username": str(order.get("username") or ""),
                 "user_label": telegram_user_display(db, order.get("user_id"), order.get("username")),
+                "payment_method": str(order.get("payment_method") or ""),
                 "item": item_text,
                 "submitted_item": report_submitted_match_snippet(lookup, item_text),
                 "item_hash": item_hash,
@@ -6098,6 +6258,24 @@ def build_manual_replacement_lookup_results(db, submitted_text: str, *, limit: i
                 "can_add_due": can_add_due,
                 "cannot_add_reason": "" if can_add_due else ("Already added to pending replacements" if existing_due else "Original stock manager was not found"),
             })
+
+    addable_groups: dict[int, dict[str, Any]] = {}
+    for match in result.get("matches", []):
+        if not match.get("can_add_due"):
+            continue
+        user_id = int(match.get("user_id") or 0)
+        group = addable_groups.setdefault(user_id, {
+            "user_id": user_id,
+            "user_label": match.get("user_label") or str(user_id),
+            "count": 0,
+            "stock_managers": [],
+        })
+        group["count"] += 1
+        manager = str(match.get("uploaded_by") or "").strip()
+        if manager and manager not in group["stock_managers"]:
+            group["stock_managers"].append(manager)
+    result["addable_count"] = sum(int(group.get("count") or 0) for group in addable_groups.values())
+    result["addable_user_groups"] = list(addable_groups.values())
     return result
 
 
@@ -6215,6 +6393,251 @@ def create_manual_replacement_due_from_order_item(db, *, order_id: str, item_has
     except DuplicateKeyError:
         return None, "This manual replacement due was already created."
     return report_id, None
+
+
+def create_manual_replacement_due_reports_from_lookup(
+    db,
+    *,
+    submitted_text: str,
+    admin_note: str = "",
+    added_by: str = "owner",
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Create one manual replacement report per buyer from a pasted lookup.
+
+    Each report can contain many damaged items for that buyer. Stock-manager
+    replacement obligations stay item-level, so mixed-manager reports still add
+    the due count to the manager who originally uploaded each specific item.
+    """
+    clean_text = str(submitted_text or "").strip()
+    result: dict[str, Any] = {
+        "created_reports": [],
+        "created_count": 0,
+        "obligation_count": 0,
+        "skipped_count": 0,
+        "skipped_reasons": {},
+        "error": "",
+    }
+    if len(normalize_report_match_text(clean_text)) < 3:
+        result["error"] = "Paste the user's reported account/code before adding replacement due."
+        return result
+
+    def skip(reason: str) -> None:
+        result["skipped_count"] = int(result.get("skipped_count") or 0) + 1
+        reasons = result.setdefault("skipped_reasons", {})
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
+
+    try:
+        max_matches = max(1, min(int(limit or 500), 1000))
+    except Exception:
+        max_matches = 500
+
+    lookup = build_manual_replacement_lookup_results(db, clean_text, limit=max_matches)
+    groups: dict[int, dict[str, Any]] = {}
+    seen: set[tuple[int, str, str]] = set()
+    for match in lookup.get("matches", []) or []:
+        order_id = str(match.get("order_id") or "").strip().upper()
+        item_hash = str(match.get("item_hash") or "").strip()
+        if not order_id or not item_hash:
+            skip("missing_order_or_item")
+            continue
+        order = db.orders.find_one(
+            {"order_id": order_id, "status": "delivered", "items.0": {"$exists": True}},
+            {
+                "order_id": 1,
+                "product_name": 1,
+                "items": 1,
+                "user_id": 1,
+                "username": 1,
+                "created_at": 1,
+                "delivered_at": 1,
+                "payment_method": 1,
+            },
+        )
+        if not order:
+            skip("order_not_found")
+            continue
+        user_id = int(order.get("user_id", 0) or 0)
+        seen_key = (user_id, order_id, item_hash)
+        if seen_key in seen:
+            skip("duplicate_match")
+            continue
+        seen.add(seen_key)
+
+        matched_item = ""
+        for item in order.get("items", []) or []:
+            item_text = str(item or "").strip()
+            if item_text and stock_item_hash(item_text) == item_hash:
+                matched_item = item_text
+                break
+        if not matched_item:
+            skip("item_not_found")
+            continue
+        if not report_submitted_item_matches(clean_text, matched_item):
+            skip("item_no_longer_matches")
+            continue
+        existing_due = replacement_item_already_due(db, user_id=user_id, order_id=order_id, item_hash=item_hash)
+        if existing_due:
+            skip("already_pending")
+            continue
+
+        product_name = str(order.get("product_name") or "").strip()
+        if not product_name:
+            skip("missing_product")
+            continue
+        upload_info = stock_upload_info_for_item(db, product_name, matched_item)
+        stock_manager = str(upload_info.get("uploaded_by") or "").strip()
+        stock_manager_key = normalize_admin_username(stock_manager)
+        if not stock_manager or stock_manager.lower() == "unknown" or not stock_manager_key:
+            skip("stock_manager_not_found")
+            continue
+
+        submitted_item = report_submitted_match_snippet(clean_text, matched_item) if clean_text else matched_item[:1000]
+        item_doc = {
+            "order_id": order_id,
+            "product_name": product_name,
+            "payment_method": str(order.get("payment_method") or ""),
+            "submitted_item": submitted_item,
+            "delivered_item": matched_item,
+            "item_hash": item_hash,
+            "sold_at": order.get("delivered_at") or order.get("created_at"),
+            "order_created_at": order.get("created_at"),
+            "stock_added_by_username": stock_manager,
+            "stock_added_by_username_key": stock_manager_key,
+            "stock_added_by_role": str(upload_info.get("uploaded_role") or ""),
+            "stock_added_at": upload_info.get("uploaded_at"),
+            "stock_metadata_product_name": product_name,
+        }
+        group = groups.setdefault(user_id, {
+            "user_id": user_id,
+            "username": str(order.get("username") or "").strip(),
+            "items": [],
+        })
+        if not group.get("username") and order.get("username"):
+            group["username"] = str(order.get("username") or "").strip()
+        group["items"].append(item_doc)
+
+    if not groups:
+        result["error"] = "No addable matched items were found. They may already be pending, or their original stock manager could not be found."
+        return result
+
+    now = utcnow()
+    clean_note = str(admin_note or "").strip()[:1000]
+    created_reports: list[dict[str, Any]] = []
+    total_obligations = 0
+    for group in groups.values():
+        items = [item for item in group.get("items", []) if isinstance(item, dict)]
+        if not items:
+            continue
+        report_id = new_manual_replacement_report_id(db)
+        first = items[0]
+        product_names: list[str] = []
+        order_ids: list[str] = []
+        for item in items:
+            product = str(item.get("product_name") or "").strip()
+            order_id = str(item.get("order_id") or "").strip().upper()
+            if product and product not in product_names:
+                product_names.append(product)
+            if order_id and order_id not in order_ids:
+                order_ids.append(order_id)
+
+        report_doc = {
+            "report_id": report_id,
+            "user_id": int(group.get("user_id") or 0),
+            "username": str(group.get("username") or "").strip(),
+            "product_name": str(first.get("product_name") or ""),
+            "product_names": product_names,
+            "order_id": str(first.get("order_id") or ""),
+            "order_ids": order_ids,
+            "payment_method": str(first.get("payment_method") or ""),
+            "submitted_item": str(first.get("submitted_item") or ""),
+            "delivered_item": str(first.get("delivered_item") or ""),
+            "item_hash": str(first.get("item_hash") or ""),
+            "sold_at": first.get("sold_at"),
+            "order_created_at": first.get("order_created_at"),
+            "stock_added_by_username": str(first.get("stock_added_by_username") or ""),
+            "stock_added_by_role": str(first.get("stock_added_by_role") or ""),
+            "stock_added_at": first.get("stock_added_at"),
+            "stock_metadata_product_name": str(first.get("stock_metadata_product_name") or ""),
+            "items": items,
+            "item_count": len(items),
+            "status": "pending",
+            "issue_text": clean_note or "Manual report added by owner from pasted user report.",
+            "screenshot_file_id": "",
+            "created_at": now,
+            "manual_report_lookup": True,
+            "manual_report_created_by": added_by or "owner",
+            "approved_at": now,
+            "approved_by": added_by or "owner",
+            "replacement_queued_at": now,
+            "replacement_admin_note": clean_note,
+            "replacement_obligation_count": len(items),
+            "replacement_obligations_created_at": now,
+        }
+        obligation_docs: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            item_hash = str(item.get("item_hash") or "").strip()
+            obligation_docs.append({
+                "obligation_key": f"{report_id}:{index}:{item_hash or _stable_text_hash(item.get('delivered_item') or item.get('submitted_item') or index)}",
+                "report_id": report_id,
+                "report_item_index": index,
+                "product_name": str(item.get("product_name") or ""),
+                "submitted_item": str(item.get("submitted_item") or ""),
+                "delivered_item": str(item.get("delivered_item") or ""),
+                "item_hash": item_hash,
+                "stock_added_by_username": str(item.get("stock_added_by_username") or ""),
+                "stock_added_by_username_key": normalize_admin_username(item.get("stock_added_by_username")),
+                "stock_added_at": item.get("stock_added_at"),
+                "source": "manual_report_lookup",
+                "manual_report_lookup": True,
+                "source_order_id": str(item.get("order_id") or ""),
+                "source_user_id": int(group.get("user_id") or 0),
+                "source_username": str(group.get("username") or "").strip(),
+                "approved_at": now,
+                "approved_by": added_by or "owner",
+                "created_at": now,
+                "fulfilled_at": None,
+                "fulfilled_by": "",
+                "fulfilled_product_name": "",
+            })
+        try:
+            db.replacement_reports.insert_one(report_doc)
+            if obligation_docs:
+                db.stock_manager_replacement_obligations.insert_many(obligation_docs, ordered=True)
+        except DuplicateKeyError:
+            try:
+                db.replacement_reports.delete_one({"report_id": report_id})
+                db.stock_manager_replacement_obligations.delete_many({"report_id": report_id})
+            except Exception:
+                pass
+            result["skipped_count"] = int(result.get("skipped_count") or 0) + len(items)
+            reasons = result.setdefault("skipped_reasons", {})
+            reasons["duplicate_due"] = int(reasons.get("duplicate_due") or 0) + len(items)
+            continue
+        except Exception as exc:
+            try:
+                db.replacement_reports.delete_one({"report_id": report_id})
+                db.stock_manager_replacement_obligations.delete_many({"report_id": report_id})
+            except Exception:
+                pass
+            result["error"] = f"Could not create grouped manual replacement report: {exc}"
+            continue
+
+        total_obligations += len(obligation_docs)
+        created_reports.append({
+            "report_id": report_id,
+            "user_id": int(group.get("user_id") or 0),
+            "username": str(group.get("username") or "").strip(),
+            "item_count": len(items),
+            "stock_manager_count": len({normalize_admin_username(item.get("stock_added_by_username")) for item in items if item.get("stock_added_by_username")}),
+        })
+
+    result["created_reports"] = created_reports
+    result["created_count"] = len(created_reports)
+    result["obligation_count"] = total_obligations
+    if not created_reports and not result.get("error"):
+        result["error"] = "No grouped reports were created. The matched items may already be pending."
+    return result
 
 
 def normalize_admin_username(username: str | None) -> str:
