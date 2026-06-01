@@ -26,11 +26,21 @@ def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # MongoDB is the only required bot-side .env configuration. All other bot
 # secrets/settings are pulled from the database so changing them in WebAdmin is
 # the single source of truth.
 MONGO_URI: str = _required("MONGO_URI")
 DB_NAME: str = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
+# Backwards-compatible default keeps existing Railway/Atlas deployments working.
+# Set MONGO_TLS_ALLOW_INVALID_CERTIFICATES=0 after your MongoDB TLS chain is valid.
+MONGO_TLS_ALLOW_INVALID_CERTIFICATES: bool = _env_bool("MONGO_TLS_ALLOW_INVALID_CERTIFICATES", True)
 SECRET_SETTINGS_KEY = "secret_settings"
 RUNTIME_BOT_TOKEN_KEY = "telegram_bot_token"
 
@@ -76,7 +86,7 @@ def _load_secret_settings() -> dict:
         client = MongoClient(
             MONGO_URI,
             tls=True,
-            tlsAllowInvalidCertificates=True,
+            tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
         )
         db = client[DB_NAME]

@@ -128,6 +128,9 @@ ADMIN_LIVE_STATE_CACHE_TTL_SECONDS = _env_int("ADMIN_LIVE_STATE_CACHE_TTL_SECOND
 ADMIN_LIVE_STATE_REFRESH_MS = _env_int("ADMIN_LIVE_STATE_REFRESH_MS", 15000, minimum=5000, maximum=120000)
 ADMIN_LIVE_FULL_REFRESH = _env_bool("ADMIN_LIVE_FULL_REFRESH", False)
 ADMIN_AUTO_INDEXES = _env_bool("ADMIN_AUTO_INDEXES", False)
+# Backwards-compatible default keeps existing Railway/Atlas deployments working.
+# Set MONGO_TLS_ALLOW_INVALID_CERTIFICATES=0 after your MongoDB TLS chain is valid.
+MONGO_TLS_ALLOW_INVALID_CERTIFICATES = _env_bool("MONGO_TLS_ALLOW_INVALID_CERTIFICATES", True)
 
 _TTL_CACHE: dict[str, tuple[float, Any]] = {}
 
@@ -763,7 +766,20 @@ def create_app() -> Flask:
         except Exception as exc:
             app.logger.warning("Could not ensure MongoDB indexes: %s", exc)
     secret_settings = get_secret_settings(app.db)
-    app.config["SECRET_KEY"] = secret_settings.get("admin_panel_secret_key") or os.getenv("ADMIN_PANEL_SECRET_KEY") or os.getenv("PANEL_SECRET_KEY") or secrets.token_hex(32)
+    secret_key = (
+        secret_settings.get("admin_panel_secret_key")
+        or os.getenv("ADMIN_PANEL_SECRET_KEY")
+        or os.getenv("PANEL_SECRET_KEY")
+    )
+    if not secret_key:
+        secret_key = secrets.token_hex(32)
+        try:
+            secret_settings["admin_panel_secret_key"] = secret_key
+            set_secret_settings(app.db, secret_settings)
+            app.logger.warning("Generated and saved ADMIN panel secret key because none was configured.")
+        except Exception as exc:
+            app.logger.warning("Could not save generated admin panel secret key; sessions may reset after restart: %s", exc)
+    app.config["SECRET_KEY"] = secret_key
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
@@ -931,7 +947,7 @@ def _connect_db():
     client = MongoClient(
         mongo_uri,
         tls=True,
-        tlsAllowInvalidCertificates=True,
+        tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
         serverSelectionTimeoutMS=_env_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 10000, minimum=3000, maximum=60000),
         connectTimeoutMS=_env_int("MONGO_CONNECT_TIMEOUT_MS", 10000, minimum=3000, maximum=60000),
         socketTimeoutMS=_env_int("MONGO_SOCKET_TIMEOUT_MS", 20000, minimum=5000, maximum=120000),
@@ -5306,7 +5322,7 @@ def register_routes(app: Flask) -> None:
         rows, page, total_pages = recent_notification_batches(app.db, page=page)
         total = len(list(app.db.sent_notifications.distinct(
             "batch_id",
-            {"sent_at": {"$gte": utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)}, "target_kind": "customer"},
+            recent_notification_match(),
         )))
         return render_template(
             "recent_notifications.html",
@@ -9577,12 +9593,23 @@ def log_admin_action(db, action: str, details: str = "") -> None:
         pass
 
 
+def csv_safe_cell(value: Any) -> Any:
+    """Neutralize spreadsheet formulas in exported CSV cells."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return value
+    if value and (value[0] in {"=", "+", "-", "@", "\t", "\r", "\n"} or value.lstrip().startswith(("=", "+", "-", "@"))):
+        return "'" + value
+    return value
+
+
 def csv_response(filename: str, fields: list[str], rows) -> Response:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(fields)
     for row in rows:
-        writer.writerow([row.get(field, "") for field in fields])
+        writer.writerow([csv_safe_cell(row.get(field, "")) for field in fields])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
@@ -9986,9 +10013,14 @@ def record_sent_notification(
         "updated_at": utcnow(),
     }
     try:
+        set_fields = {key: value for key, value in doc.items() if key not in {"created_at", "deleted"}}
+        set_fields["updated_at"] = utcnow()
         db.sent_notifications.update_one(
             {"chat_id": cid, "message_id": int(msg_id)},
-            {"$setOnInsert": doc, "$set": {"updated_at": utcnow()}},
+            {
+                "$set": set_fields,
+                "$setOnInsert": {"created_at": doc["created_at"], "deleted": False},
+            },
             upsert=True,
         )
     except Exception:
@@ -10085,10 +10117,21 @@ def backfill_legacy_product_notifications(db) -> None:
             continue
 
 
+def recent_notification_match() -> dict:
+    cutoff = utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    return {
+        "sent_at": {"$gte": cutoff},
+        "$or": [
+            {"target_kind": "customer"},
+            {"target_kind": {"$exists": False}},
+            {"target_kind": None},
+            {"target_kind": ""},
+        ],
+    }
+
+
 def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, int]:
-    now = utcnow()
-    cutoff = now - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
-    match = {"sent_at": {"$gte": cutoff}, "target_kind": "customer"}
+    match = recent_notification_match()
     total = len(list(db.sent_notifications.distinct("batch_id", match)))
     total_pages = max(1, math.ceil(total / RECENT_NOTIFICATIONS_PAGE_SIZE)) if total else 1
     safe_page = max(1, min(int(page or 1), total_pages))
@@ -10134,7 +10177,12 @@ def delete_recent_notification_batch(db, batch_id: str, *, deleted_by: str = "")
     cutoff = now - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
     query = {
         "batch_id": str(batch_id or ""),
-        "target_kind": "customer",
+        "$or": [
+            {"target_kind": "customer"},
+            {"target_kind": {"$exists": False}},
+            {"target_kind": None},
+            {"target_kind": ""},
+        ],
         "deleted": {"$ne": True},
         "sent_at": {"$gte": cutoff},
     }

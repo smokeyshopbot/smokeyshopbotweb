@@ -23,7 +23,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
-from config import MONGO_URI, DB_NAME
+from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
@@ -410,7 +410,7 @@ def get_db():
         _client = AsyncIOMotorClient(
             MONGO_URI,
             tls=True,
-            tlsAllowInvalidCertificates=True,  # Fixes SSL handshake on Python 3.13
+            tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
         )
         _db = _client[DB_NAME]
