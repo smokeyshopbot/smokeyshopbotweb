@@ -3360,54 +3360,54 @@ def register_routes(app: Flask) -> None:
 
     def create_admin_wallet_adjustment_log(user: dict, action: str, currency: str, amount: float, balance_after: float, note: str = "") -> str:
         """Store manual admin wallet credits/removals in the same wallet history used by users and WebAdmin."""
-        now = utcnow()
-        normalized_action = "remove" if action == "remove" else "add"
-        normalized_currency = "usdt" if currency == "usdt" else "inr"
-        decimals = 2
-        amount = round(float(amount or 0), decimals)
-        user_id_value = int(user.get("user_id", 0) or 0)
-        ref_id = ""
-        for _ in range(5):
-            candidate = f"admin_wallet_{uuid.uuid4().hex[:8].upper()}"
-            if not app.db.pending_payments.find_one({"ref_id": candidate}):
-                ref_id = candidate
-                break
-        if not ref_id:
-            ref_id = f"admin_wallet_{uuid.uuid4().hex.upper()}"
-
-        doc = {
-            "ref_id": ref_id,
-            "user_id": user_id_value,
-            "username": user.get("username", ""),
-            "pay_type": "wallet",
-            "method": f"admin_{normalized_action}",
-            "currency": normalized_currency,
-            "load_amount": amount,
-            "expected_inr": amount if normalized_currency == "inr" else 0.0,
-            "expected_usdt": amount if normalized_currency == "usdt" else 0.0,
-            "unique_usdt": 0.0,
-            "status": "completed",
-            "created_at": now,
-            "completed_at": now,
-            "reviewed_at": now,
-            "admin_wallet_adjustment": True,
-            "admin_wallet_action": normalized_action,
-            "wallet_balance_after": round(float(balance_after or 0), decimals),
-            "notes": str(note or "").strip(),
-            "admin_username": current_admin_username(),
-            "admin_role": current_admin_role(),
-            **product_order_txt_instruction_fields(product),
-        }
-        doc["wallet_adjusted_at"] = now
-        if normalized_action == "add":
-            doc["wallet_credited_at"] = now
-        else:
-            doc["wallet_removed_at"] = now
         try:
+            now = utcnow()
+            normalized_action = "remove" if action == "remove" else "add"
+            normalized_currency = "usdt" if currency == "usdt" else "inr"
+            decimals = 2
+            amount = round(float(amount or 0), decimals)
+            user_id_value = int(user.get("user_id", 0) or 0)
+            ref_id = ""
+            for _ in range(5):
+                candidate = f"admin_wallet_{uuid.uuid4().hex[:8].upper()}"
+                if not app.db.pending_payments.find_one({"ref_id": candidate}):
+                    ref_id = candidate
+                    break
+            if not ref_id:
+                ref_id = f"admin_wallet_{uuid.uuid4().hex.upper()}"
+
+            doc = {
+                "ref_id": ref_id,
+                "user_id": user_id_value,
+                "username": user.get("username", ""),
+                "pay_type": "wallet",
+                "method": f"admin_{normalized_action}",
+                "currency": normalized_currency,
+                "load_amount": amount,
+                "expected_inr": amount if normalized_currency == "inr" else 0.0,
+                "expected_usdt": amount if normalized_currency == "usdt" else 0.0,
+                "unique_usdt": 0.0,
+                "status": "completed",
+                "created_at": now,
+                "completed_at": now,
+                "reviewed_at": now,
+                "admin_wallet_adjustment": True,
+                "admin_wallet_action": normalized_action,
+                "wallet_balance_after": round(float(balance_after or 0), decimals),
+                "notes": str(note or "").strip(),
+                "admin_username": current_admin_username(),
+                "admin_role": current_admin_role(),
+            }
+            doc["wallet_adjusted_at"] = now
+            if normalized_action == "add":
+                doc["wallet_credited_at"] = now
+            else:
+                doc["wallet_removed_at"] = now
             app.db.pending_payments.insert_one(doc)
             return ref_id
         except Exception as exc:
-            current_app.logger.warning("Could not save admin wallet adjustment history for user %s: %s", user_id_value, exc)
+            logger_obj = current_app.logger if has_request_context() else app.logger
+            logger_obj.warning("Could not save admin wallet adjustment history for user %s: %s", user.get("user_id", 0), exc)
             return ""
 
     @app.post("/users/<int:user_id>/balance")
