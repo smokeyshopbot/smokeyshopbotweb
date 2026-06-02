@@ -1013,6 +1013,11 @@ async def add_product(name: str, price_inr: float, price_usdt: float, shop_order
         "price_inr": price_inr,
         "price_usdt": price_usdt,
         "stock": [],
+        "description": "",
+        "description_en": "",
+        "description_es": "",
+        "order_txt_instructions_en": "",
+        "order_txt_instructions_es": "",
         "enabled": True,
         "min_order_quantity": 1,
         "max_order_quantity": 100,
@@ -1694,6 +1699,15 @@ async def clear_stock(product_name: str) -> bool:
     return res.matched_count > 0
 
 
+def product_order_txt_instruction_fields(product: dict | None) -> dict:
+    """Return the per-product TXT delivery instructions to snapshot on orders."""
+    product = product or {}
+    return {
+        "order_txt_instructions_en": str(product.get("order_txt_instructions_en") or "").strip(),
+        "order_txt_instructions_es": str(product.get("order_txt_instructions_es") or "").strip(),
+    }
+
+
 # ─────────────────────────── ORDERS ──────────────────────────
 
 async def create_order(
@@ -1715,6 +1729,13 @@ async def create_order(
     if username:
         await upsert_user(user_id, username)
 
+    database = get_db()
+    product = await database.products.find_one(
+        {"name": _name_regex(product_name)},
+        {"order_txt_instructions_en": 1, "order_txt_instructions_es": 1},
+    )
+    instruction_fields = product_order_txt_instruction_fields(product)
+
     order_doc_base = {
         "user_id": user_id,
         "username": username,
@@ -1729,9 +1750,9 @@ async def create_order(
         "preorder_created_at": datetime.now(timezone.utc) if is_preorder else None,
         "created_at": datetime.now(timezone.utc),
         "delivered_at": None,
+        **instruction_fields,
     }
 
-    database = get_db()
     for attempt in range(25):
         # Keep the familiar 8-character IDs first; fall back to a longer ID only
         # after repeated collisions.

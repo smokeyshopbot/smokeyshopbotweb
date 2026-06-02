@@ -12,6 +12,7 @@ Flow:
   After payment → delivery
 """
 
+import logging
 import uuid
 import io
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amoun
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
 from handlers.replacements import start_report_from_query
+
+logger = logging.getLogger(__name__)
 
 # Track users in shopping flow: { user_id: { step, product_name, quantity } }
 _shop_flow: dict[int, dict] = {}
@@ -626,6 +629,46 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
     return compact_blank_lines("\n".join(lines))
 
 
+
+def _localized_order_txt_instructions(order: dict, lang: str = "en") -> str:
+    """Pick the order/product TXT instructions for the user's language."""
+    if not order:
+        return ""
+    normalized = (lang or "en").strip().lower()
+    keys = []
+    if normalized.startswith("es"):
+        keys.extend(["order_txt_instructions_es", "order_txt_instructions_en"])
+    else:
+        keys.extend(["order_txt_instructions_en", "order_txt_instructions_es"])
+    keys.extend(["order_txt_instructions", "delivery_instructions"])
+    for key in keys:
+        value = str(order.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+async def _with_product_txt_instructions(order: dict) -> dict:
+    """Use saved order instructions; fall back to current product settings for old orders."""
+    if not order:
+        return order
+    if str(order.get("order_txt_instructions_en") or "").strip() or str(order.get("order_txt_instructions_es") or "").strip():
+        return order
+    product_name = str(order.get("product_name") or "").strip()
+    if not product_name:
+        return order
+    try:
+        product = await db.get_product(product_name)
+    except Exception:
+        logger.exception("Could not load product TXT instructions for order=%s", order.get("order_id"))
+        return order
+    if not product:
+        return order
+    enriched = dict(order)
+    enriched["order_txt_instructions_en"] = str(product.get("order_txt_instructions_en") or "").strip()
+    enriched["order_txt_instructions_es"] = str(product.get("order_txt_instructions_es") or "").strip()
+    return enriched
+
 def _order_items_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
     safe_order_id = "".join(ch for ch in order_id if ch.isalnum() or ch in ("-", "_")).strip() or "order"
@@ -649,9 +692,11 @@ def _order_items_txt_content(order: dict, lang: str = "en") -> str:
     lines.extend([
         f"{tr(lang, 'product')}: {product_name}",
         f"{tr(lang, 'quantity')}: {quantity}",
-        "",
-        f"{tr(lang, 'items_label')}:",
     ])
+    instructions = _localized_order_txt_instructions(order, lang)
+    if instructions:
+        lines.extend(["", f"{tr(lang, 'delivery_instructions_label')}:", instructions])
+    lines.extend(["", f"{tr(lang, 'items_label')}:"])
     for item in items:
         lines.extend([str(item).strip(), ""])
     return "\n".join(lines).rstrip() + "\n"
@@ -698,6 +743,7 @@ def _order_items_caption(order: dict, *, is_refetch: bool = False, lang: str = "
 
 async def _reply_order_items_file(update: Update, order: dict, *, is_refetch: bool = False) -> None:
     lang = await _user_lang(update.effective_user.id)
+    order = await _with_product_txt_instructions(order)
     data = _order_items_txt_content(order, lang).encode("utf-8")
     document = io.BytesIO(data)
     document.name = _order_items_txt_filename(order)

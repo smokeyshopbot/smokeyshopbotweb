@@ -443,6 +443,18 @@ item 2"></textarea>
         <textarea name="description_es" rows="6" placeholder="Write the Spanish product details, notes, delivery info, etc.">{{ product.description_es or '' }}</textarea>
       </label>
     </div>
+    <div class="field-help-block">
+      <h3>Order TXT instructions</h3>
+      <p class="muted">Optional. These instructions are added above the delivered stock/items in the TXT file, so you can tell buyers where to redeem codes or what steps to follow.</p>
+    </div>
+    <div class="bilingual-field-grid">
+      <label>English order TXT instructions
+        <textarea name="order_txt_instructions_en" rows="5" placeholder="Example: Redeem your code at https://example.com/redeem&#10;Step 1: Sign in&#10;Step 2: Enter the code below">{{ product.order_txt_instructions_en or '' }}</textarea>
+      </label>
+      <label>Spanish order TXT instructions
+        <textarea name="order_txt_instructions_es" rows="5" placeholder="Ejemplo: Canjea tu código en https://example.com/redeem&#10;Paso 1: Inicia sesión&#10;Paso 2: Ingresa el código de abajo">{{ product.order_txt_instructions_es or '' }}</textarea>
+      </label>
+    </div>
     <button class="primary" type="submit">Save product details</button>
   </form>
 </section>

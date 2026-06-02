@@ -176,6 +176,7 @@ TEXT = {
         "order_resent_admin": "🔁 Order Resent by Admin!",
         "order_items_title": "Order Items",
         "items_label": "Items",
+        "delivery_instructions_label": "Instructions",
         "item_label": "Item {n}",
         "delivered": "Delivered",
         # Status labels
@@ -485,6 +486,7 @@ TEXT = {
         "order_resent_admin": "🔁 ¡Pedido reenviado por el admin!",
         "order_items_title": "Artículos del pedido",
         "items_label": "Artículos",
+        "delivery_instructions_label": "Instrucciones",
         "item_label": "Artículo {n}",
         "delivered": "Entregado",
         "status_pending_stock": "Pagado — Esperando stock",

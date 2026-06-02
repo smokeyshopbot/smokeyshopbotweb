@@ -1325,6 +1325,46 @@ async def _send_admin_created_order_created_notice(bot, user_id: int, order: dic
     except Exception:
         logger.exception("Could not send admin-created order notice for order=%s", order.get("order_id"))
 
+
+def _localized_order_txt_instructions(order: dict, lang: str = "en") -> str:
+    """Pick the order/product TXT instructions for the user's language."""
+    if not order:
+        return ""
+    normalized = (lang or "en").strip().lower()
+    keys = []
+    if normalized.startswith("es"):
+        keys.extend(["order_txt_instructions_es", "order_txt_instructions_en"])
+    else:
+        keys.extend(["order_txt_instructions_en", "order_txt_instructions_es"])
+    keys.extend(["order_txt_instructions", "delivery_instructions"])
+    for key in keys:
+        value = str(order.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+async def _with_product_txt_instructions(order: dict) -> dict:
+    """Use saved order instructions; fall back to current product settings for old orders."""
+    if not order:
+        return order
+    if str(order.get("order_txt_instructions_en") or "").strip() or str(order.get("order_txt_instructions_es") or "").strip():
+        return order
+    product_name = str(order.get("product_name") or "").strip()
+    if not product_name:
+        return order
+    try:
+        product = await db.get_product(product_name)
+    except Exception:
+        logger.exception("Could not load product TXT instructions for order=%s", order.get("order_id"))
+        return order
+    if not product:
+        return order
+    enriched = dict(order)
+    enriched["order_txt_instructions_en"] = str(product.get("order_txt_instructions_en") or "").strip()
+    enriched["order_txt_instructions_es"] = str(product.get("order_txt_instructions_es") or "").strip()
+    return enriched
+
 def _delivery_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
     safe_order_id = "".join(ch for ch in order_id if ch.isalnum() or ch in ("-", "_")).strip() or "order"
@@ -1342,9 +1382,11 @@ def _delivery_txt_content(order: dict, items: list[str], lang: str = "en") -> st
         f"{tr(lang, 'order_id')}: {order_id}",
         f"{tr(lang, 'product')}: {product_name}",
         f"{tr(lang, 'quantity')}: {quantity}",
-        "",
-        f"{tr(lang, 'items_label')}:",
     ]
+    instructions = _localized_order_txt_instructions(order, lang)
+    if instructions:
+        lines.extend(["", f"{tr(lang, 'delivery_instructions_label')}:", instructions])
+    lines.extend(["", f"{tr(lang, 'items_label')}:"])
     for item in items:
         # Stock/content must be delivered exactly as saved; only labels above are translated.
         lines.extend([str(item).strip(), ""])
@@ -1378,6 +1420,7 @@ def _delivery_caption(order: dict, *, from_pending: bool = False, lang: str = "e
 
 async def _send_delivery_txt_file(bot, user_id: int, order: dict, items: list[str], *, from_pending: bool = False) -> None:
     lang = await _lang_for_user(user_id)
+    order = await _with_product_txt_instructions(order)
     data = _delivery_txt_content(order, items, lang=lang).encode("utf-8")
     document = io.BytesIO(data)
     document.name = _delivery_txt_filename(order)

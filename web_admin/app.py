@@ -2463,6 +2463,8 @@ def register_routes(app: Flask) -> None:
         legacy_description = str(product.get("description") or "")
         product["description_en"] = str(product.get("description_en") or legacy_description)
         product["description_es"] = str(product.get("description_es") or "")
+        product["order_txt_instructions_en"] = str(product.get("order_txt_instructions_en") or "")
+        product["order_txt_instructions_es"] = str(product.get("order_txt_instructions_es") or "")
         product["warranty_days"] = parse_positive_int(product.get("warranty_days"), 0, minimum=0)
         product["price_group_rows"] = build_price_group_rows(product)
         if product["max_order_quantity"] < product["min_order_quantity"]:
@@ -2629,6 +2631,8 @@ def register_routes(app: Flask) -> None:
             "description": "",
             "description_en": "",
             "description_es": "",
+            "order_txt_instructions_en": "",
+            "order_txt_instructions_es": "",
             "enabled": True,
             "min_order_quantity": 1,
             "max_order_quantity": 100,
@@ -2684,6 +2688,8 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("products"))
         description_en = (request.form.get("description_en", "") or request.form.get("description", "") or "").strip()
         description_es = (request.form.get("description_es", "") or "").strip()
+        order_txt_instructions_en = (request.form.get("order_txt_instructions_en", "") or "").strip()
+        order_txt_instructions_es = (request.form.get("order_txt_instructions_es", "") or "").strip()
         try:
             warranty_days = int(str(request.form.get("warranty_days", "0") or "0").strip())
         except ValueError:
@@ -2698,10 +2704,12 @@ def register_routes(app: Flask) -> None:
                 "description": description_en,  # legacy/backward-compatible English description
                 "description_en": description_en,
                 "description_es": description_es,
+                "order_txt_instructions_en": order_txt_instructions_en,
+                "order_txt_instructions_es": order_txt_instructions_es,
                 "warranty_days": warranty_days,
             }},
         )
-        log_admin_action(app.db, "product_description_saved", f"{product['name']}: en={len(description_en)} chars es={len(description_es)} chars warranty_days={warranty_days}")
+        log_admin_action(app.db, "product_description_saved", f"{product['name']}: en={len(description_en)} chars es={len(description_es)} chars txt_en={len(order_txt_instructions_en)} chars txt_es={len(order_txt_instructions_es)} chars warranty_days={warranty_days}")
         flash(f"Product details saved for {product['name']}.", "success")
         return redirect(url_for("product_manage", name=product["name"]))
 
@@ -3388,6 +3396,7 @@ def register_routes(app: Flask) -> None:
             "notes": str(note or "").strip(),
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            **product_order_txt_instruction_fields(product),
         }
         doc["wallet_adjusted_at"] = now
         if normalized_action == "add":
@@ -3492,6 +3501,7 @@ def register_routes(app: Flask) -> None:
             "admin_role": current_admin_role(),
             "effective_price_group": priced_product.get("effective_price_group"),
             "effective_price_source": priced_product.get("effective_price_source"),
+            **product_order_txt_instruction_fields(product),
         }
         for attempt in range(25):
             order_id_len = 8 if attempt < 20 else 12
@@ -3546,6 +3556,7 @@ def register_routes(app: Flask) -> None:
             "admin_created_order_note": clean_note,
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            **product_order_txt_instruction_fields(product),
         }
         for attempt in range(25):
             order_id_len = 8 if attempt < 20 else 12
@@ -3596,6 +3607,7 @@ def register_routes(app: Flask) -> None:
             "original_order_ids": [],
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            **product_order_txt_instruction_fields(product),
         }
         for attempt in range(25):
             order_id_len = 8 if attempt < 20 else 12
@@ -3647,6 +3659,8 @@ def register_routes(app: Flask) -> None:
             "delivery_transfer_note": clean_note,
             "admin_username": current_admin_username(),
             "admin_role": current_admin_role(),
+            "order_txt_instructions_en": str(original_order.get("order_txt_instructions_en") or "").strip(),
+            "order_txt_instructions_es": str(original_order.get("order_txt_instructions_es") or "").strip(),
         }
 
         if is_replacement:
@@ -5562,6 +5576,57 @@ def utcnow() -> datetime:
 
 def name_regex(name: str) -> dict[str, str]:
     return {"$regex": f"^{re.escape(name.strip())}$", "$options": "i"}
+
+
+def product_order_txt_instruction_fields(product: dict | None) -> dict:
+    """Return the per-product TXT delivery instructions to snapshot on orders."""
+    product = product or {}
+    return {
+        "order_txt_instructions_en": str(product.get("order_txt_instructions_en") or "").strip(),
+        "order_txt_instructions_es": str(product.get("order_txt_instructions_es") or "").strip(),
+    }
+
+
+def localized_order_txt_instructions(order: dict | None, lang: str = "en") -> str:
+    """Pick the saved TXT delivery instructions for the user's language."""
+    if not order:
+        return ""
+    normalized = (lang or "en").strip().lower()
+    keys = []
+    if normalized.startswith("es"):
+        keys.extend(["order_txt_instructions_es", "order_txt_instructions_en"])
+    else:
+        keys.extend(["order_txt_instructions_en", "order_txt_instructions_es"])
+    keys.extend(["order_txt_instructions", "delivery_instructions"])
+    for key in keys:
+        value = str(order.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def order_with_product_txt_instructions(db, order: dict | None) -> dict | None:
+    """Use saved order instructions; fall back to current product settings for old orders."""
+    if not order:
+        return order
+    if str(order.get("order_txt_instructions_en") or "").strip() or str(order.get("order_txt_instructions_es") or "").strip():
+        return order
+    product_name = str(order.get("product_name") or "").strip()
+    if not product_name:
+        return order
+    try:
+        product = db.products.find_one(
+            {"name": name_regex(product_name)},
+            {"order_txt_instructions_en": 1, "order_txt_instructions_es": 1},
+        )
+    except Exception:
+        current_app.logger.exception("Could not load product TXT instructions for order=%s", order.get("order_id"))
+        return order
+    if not product:
+        return order
+    enriched = dict(order)
+    enriched.update(product_order_txt_instruction_fields(product))
+    return enriched
 
 
 def split_stock(raw: str) -> list[str]:
@@ -7975,6 +8040,14 @@ def send_replacement_from_stock(db, report: dict, sent_by: str = "owner", admin_
 
     now = utcnow()
     user_id = int(report.get("user_id", 0) or 0)
+    replacement_product_names = list(popped_by_product.keys())
+    replacement_product_doc = None
+    if len(replacement_product_names) == 1:
+        replacement_product_doc = db.products.find_one(
+            {"name": name_regex(replacement_product_names[0])},
+            {"order_txt_instructions_en": 1, "order_txt_instructions_es": 1},
+        )
+
     order = {
         "order_id": _new_replacement_order_id(db),
         "user_id": user_id,
@@ -7994,6 +8067,7 @@ def send_replacement_from_stock(db, report: dict, sent_by: str = "owner", admin_
         "replacement_admin_note": str(admin_note or report.get("replacement_admin_note") or "").strip()[:1000],
         "original_order_id": str(report.get("order_id") or ""),
         "original_order_ids": [str(x) for x in (report.get("order_ids") or []) if str(x).strip()],
+        **product_order_txt_instruction_fields(replacement_product_doc),
     }
 
     lang = get_user_language_sync(db, user_id)
@@ -11067,9 +11141,11 @@ def delivery_txt_content(order: dict, items: list[str], lang: str = "en") -> str
     lines.extend([
         f"{tr(lang, 'product')}: {product_name}",
         f"{tr(lang, 'quantity')}: {quantity}",
-        "",
-        f"{tr(lang, 'items_label')}:",
     ])
+    instructions = localized_order_txt_instructions(order, lang)
+    if instructions:
+        lines.extend(["", f"{tr(lang, 'delivery_instructions_label')}:", instructions])
+    lines.extend(["", f"{tr(lang, 'items_label')}:"])
     for item in items:
         lines.extend([str(item).strip(), ""])
     return "\n".join(lines).rstrip() + "\n"
@@ -11134,6 +11210,7 @@ def send_order_items(user_id: int, order: dict, items: list[str], from_pending: 
     The TXT file contains all items, separated by a blank line.
     """
     lang = get_user_language_sync(current_app.db, user_id)
+    order = order_with_product_txt_instructions(current_app.db, order) or order
     if not items:
         if resent_by_admin:
             title = tr(lang, "order_resent_admin")
