@@ -44,8 +44,23 @@ MANUAL_USDT_BEP20_HASH_TOLERANCE = Decimal("0.01")
 MANUAL_USDT_POLYGON_HASH_TOLERANCE = Decimal("0.07")
 
 
-def _manual_usdt_hash_tolerance_for_network(network: str | None) -> Decimal:
-    return MANUAL_USDT_POLYGON_HASH_TOLERANCE if normalize_usdt_network(network) == "polygon" else MANUAL_USDT_BEP20_HASH_TOLERANCE
+def _decimal_setting(value, default: Decimal) -> Decimal:
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _manual_usdt_hash_tolerance_for_network(network: str | None, payment_settings: dict | None = None) -> Decimal:
+    network_key = normalize_usdt_network(network)
+    default = MANUAL_USDT_POLYGON_HASH_TOLERANCE if network_key == "polygon" else MANUAL_USDT_BEP20_HASH_TOLERANCE
+    method_key = "usdt_polygon" if network_key == "polygon" else "usdt_bep20"
+    if isinstance(payment_settings, dict):
+        method_settings = payment_settings.get(method_key) or {}
+        if isinstance(method_settings, dict):
+            return _decimal_setting(method_settings.get("manual_verify_tolerance_usdt"), default)
+    return default
 
 
 def _decimal_usdt(value) -> Decimal | None:
@@ -651,7 +666,12 @@ async def _try_auto_confirm_submitted_usdt_hash(
     ref_id = str(pending.get("ref_id") or "")
     user_id = int(pending.get("user_id") or update.effective_user.id)
     network = _usdt_network_for_pending(pending)
-    tolerance = _manual_usdt_hash_tolerance_for_network(network)
+    try:
+        payment_settings = await _current_payment_settings()
+    except Exception as exc:
+        logger.warning("Could not load payment settings for manual TxHash tolerance; using defaults: %s", exc)
+        payment_settings = None
+    tolerance = _manual_usdt_hash_tolerance_for_network(network, payment_settings)
     try:
         wallet = await _get_usdt_wallet_for_pending(pending)
         min_ts = db.created_at_to_timestamp(pending.get("created_at"))

@@ -26,6 +26,10 @@
           <label>BEP20 wallet address
             <input name="usdt_wallet_address" value="{{ settings.usdt_bep20.wallet_address }}" placeholder="0x...">
           </label>
+          <label>Manual TxHash auto-verification tolerance
+            <div class="price-input-wrap"><input name="usdt_bep20_manual_verify_tolerance_usdt" type="number" min="0" step="0.000001" value="{{ settings.usdt_bep20.manual_verify_tolerance_usdt or '0.01' }}"><span>USDT</span></div>
+            <small class="muted">Default 0.01. Used only when a user submits a BEP20 TxHash through Manual Verify; normal automatic verification still requires the exact unique amount.</small>
+          </label>
           <small class="muted">Used for USDT (BEP20) payments and shown to users. Adding this in .env will not enable USDT; save it here and switch USDT (BEP20) on.</small>
         </div>
       </div>
@@ -42,6 +46,10 @@
         <div class="method-details" data-payment-details>
           <label>Polygon wallet address
             <input name="usdt_polygon_wallet_address" value="{{ settings.usdt_polygon.wallet_address }}" placeholder="0x...">
+          </label>
+          <label>Manual TxHash auto-verification tolerance
+            <div class="price-input-wrap"><input name="usdt_polygon_manual_verify_tolerance_usdt" type="number" min="0" step="0.000001" value="{{ settings.usdt_polygon.manual_verify_tolerance_usdt or '0.07' }}"><span>USDT</span></div>
+            <small class="muted">Default 0.07. Used only when a user submits a Polygon TxHash through Manual Verify; normal automatic verification still requires the exact unique amount.</small>
           </label>
           <small class="muted">Used for USDT (POLYGON) payments and shown to users. This is separate from the BEP20 wallet setting.</small>
         </div>
@@ -107,7 +115,8 @@
   <h2>How this works</h2>
   <p>The bot reads these settings from the database when showing checkout and wallet top-up options. If a method is disabled, users will not see that payment option. If a method is enabled but required details are empty, it is treated as disabled.</p>
   <p>Disabled methods lock and hide their detail fields on this page. The saved values are kept so you can re-enable the method later without retyping everything.</p>
-  <p>Active payment sessions keep the exact details shown to that user, so a later update here will not make an already-created payment verify against a different wallet/payee.</p>
+  <p>Active payment sessions keep the exact wallet/payee details shown to that user, so a later update here will not make an already-created payment verify against a different wallet/payee.</p>
+  <p>Manual TxHash tolerance is read live from this page. It affects only user-submitted USDT TxHash auto-checks; automatic background USDT/Binance checks still require the exact unique amount.</p>
 </section>
 
 <script>

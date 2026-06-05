@@ -21,6 +21,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 
@@ -2204,10 +2205,12 @@ def register_routes(app: Flask) -> None:
             "usdt_bep20": {
                 "enabled": request.form.get("usdt_bep20_enabled") == "1",
                 "wallet_address": request.form.get("usdt_wallet_address", "").strip(),
+                "manual_verify_tolerance_usdt": request.form.get("usdt_bep20_manual_verify_tolerance_usdt", "0.01").strip(),
             },
             "usdt_polygon": {
                 "enabled": request.form.get("usdt_polygon_enabled") == "1",
                 "wallet_address": request.form.get("usdt_polygon_wallet_address", "").strip(),
+                "manual_verify_tolerance_usdt": request.form.get("usdt_polygon_manual_verify_tolerance_usdt", "0.07").strip(),
             },
             "upi": {
                 "enabled": request.form.get("upi_enabled") == "1",
@@ -2233,6 +2236,19 @@ def register_routes(app: Flask) -> None:
             errors.append("UPI ID is required when UPI is enabled.")
         if settings["binance"]["enabled"] and not settings["binance"]["binance_pay_id"]:
             errors.append("Binance Pay ID is required when Binance Pay is enabled.")
+        for method_key, label in [
+            ("usdt_bep20", "BEP20 manual TxHash auto-verification tolerance"),
+            ("usdt_polygon", "Polygon manual TxHash auto-verification tolerance"),
+        ]:
+            raw_tolerance = settings.get(method_key, {}).get("manual_verify_tolerance_usdt", "")
+            try:
+                tolerance = Decimal(str(raw_tolerance).strip())
+            except (InvalidOperation, TypeError, ValueError):
+                errors.append(f"{label} must be a valid USDT number.")
+                continue
+            if tolerance < 0:
+                errors.append(f"{label} cannot be negative.")
+
         wallet_limit_checks = []
         if settings["upi"].get("enabled"):
             wallet_limit_checks.append(("min_inr", "Minimum INR wallet top-up"))
@@ -8382,12 +8398,25 @@ def admin_panel_message_prefix(kind: str, lang: str | None) -> str:
 PAYMENT_SETTINGS_KEY = "payment_settings"
 
 DEFAULT_PAYMENT_SETTINGS = {
-    "usdt_bep20": {"enabled": False, "wallet_address": ""},
-    "usdt_polygon": {"enabled": False, "wallet_address": ""},
+    "usdt_bep20": {"enabled": False, "wallet_address": "", "manual_verify_tolerance_usdt": "0.01"},
+    "usdt_polygon": {"enabled": False, "wallet_address": "", "manual_verify_tolerance_usdt": "0.07"},
     "upi": {"enabled": False, "upi_id": "", "upi_name": ""},
     "binance": {"enabled": False, "binance_pay_id": "", "binance_pay_name": ""},
     "wallet_limits": {"min_inr": "50", "min_usdt": "1"},
 }
+
+
+def clean_nonnegative_decimal_text(value: Any, default_value: str) -> str:
+    try:
+        amount = Decimal(str(value if value not in (None, "") else default_value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal(str(default_value))
+    if amount < 0:
+        amount = Decimal(str(default_value))
+    text = format(amount.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def clean_payment_settings(settings: dict | None) -> dict:
@@ -8400,6 +8429,8 @@ def clean_payment_settings(settings: dict | None) -> dict:
         for key in defaults:
             if key == "enabled":
                 cleaned[method][key] = bool(incoming.get(key))
+            elif key == "manual_verify_tolerance_usdt":
+                cleaned[method][key] = clean_nonnegative_decimal_text(incoming.get(key), str(defaults.get(key, "0")))
             else:
                 value = str(incoming.get(key) or "").strip()
                 cleaned[method][key] = value if value else str(defaults.get(key, ""))

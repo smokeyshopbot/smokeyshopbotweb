@@ -2643,10 +2643,12 @@ DEFAULT_PAYMENT_SETTINGS = {
     "usdt_bep20": {
         "enabled": False,
         "wallet_address": "",
+        "manual_verify_tolerance_usdt": "0.01",
     },
     "usdt_polygon": {
         "enabled": False,
         "wallet_address": "",
+        "manual_verify_tolerance_usdt": "0.07",
     },
     "upi": {
         "enabled": False,
@@ -2663,6 +2665,19 @@ DEFAULT_PAYMENT_SETTINGS = {
         "min_usdt": "1",
     },
 }
+
+
+def _clean_nonnegative_decimal_text(value: Any, default_value: str) -> str:
+    try:
+        amount = Decimal(str(value if value not in (None, "") else default_value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal(str(default_value))
+    if amount < 0:
+        amount = Decimal(str(default_value))
+    text = format(amount.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _clean_payment_settings(settings: dict | None) -> dict:
@@ -2684,6 +2699,8 @@ def _clean_payment_settings(settings: dict | None) -> dict:
         for key in defaults:
             if key == "enabled":
                 cleaned[method][key] = bool(incoming.get(key))
+            elif key == "manual_verify_tolerance_usdt":
+                cleaned[method][key] = _clean_nonnegative_decimal_text(incoming.get(key), str(defaults.get(key, "0")))
             else:
                 value = str(incoming.get(key) or "").strip()
                 cleaned[method][key] = value if value else str(defaults.get(key, ""))
