@@ -37,7 +37,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # secrets/settings are pulled from the database so changing them in WebAdmin is
 # the single source of truth.
 MONGO_URI: str = _required("MONGO_URI")
-DB_NAME: str = (os.getenv("DB_NAME") or os.getenv("MONGO_DB_NAME") or "shopbot").strip() or "shopbot"
+DB_NAME: str = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
 # Backwards-compatible default keeps existing Railway/Atlas deployments working.
 # Set MONGO_TLS_ALLOW_INVALID_CERTIFICATES=0 after your MongoDB TLS chain is valid.
 MONGO_TLS_ALLOW_INVALID_CERTIFICATES: bool = _env_bool("MONGO_TLS_ALLOW_INVALID_CERTIFICATES", True)
@@ -138,24 +138,8 @@ def _secret_int(key: str, default: int) -> int:
 
 
 # Telegram
-# Prefer the token saved from WebAdmin Secret Settings, but allow BOT_TOKEN as a
-# deployment bootstrap fallback so the bot can run before WebAdmin is configured.
-_ENV_BOT_TOKEN = (
-    os.getenv("BOT_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TG_BOT_TOKEN")
-    or ""
-).strip()
-BOT_TOKEN: str = _secret_str("bot_token", _ENV_BOT_TOKEN)
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "Missing Telegram bot token. Set BOT_TOKEN in Railway variables, or open WebAdmin → Secret Settings, save Telegram bot token, then restart the bot."
-    )
-BOT_TOKEN_SOURCE: str = (
-    f"MongoDB WebAdmin runtime_config/key={RUNTIME_BOT_TOKEN_KEY}, fallback {DB_NAME}.settings/key={SECRET_SETTINGS_KEY}"
-    if _SECRET_SETTINGS.get("bot_token")
-    else "BOT_TOKEN environment variable"
-)
+BOT_TOKEN: str = _secret_required("bot_token", "Telegram bot token")
+BOT_TOKEN_SOURCE: str = f"MongoDB WebAdmin runtime_config/key={RUNTIME_BOT_TOKEN_KEY}, fallback {DB_NAME}.settings/key={SECRET_SETTINGS_KEY}"
 BOT_TOKEN_RUNTIME_UPDATED_AT = _SECRET_SETTINGS.get("bot_token_runtime_updated_at")
 SECRET_SETTINGS_UPDATED_AT = _SECRET_SETTINGS.get("secret_settings_updated_at")
 BOT_TOKEN_PREVIEW: str = mask_bot_token(BOT_TOKEN)

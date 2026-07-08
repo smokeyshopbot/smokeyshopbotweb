@@ -944,7 +944,7 @@ def _connect_db():
     mongo_uri = os.getenv("MONGO_URI", "").strip()
     if not mongo_uri:
         raise RuntimeError("Missing MONGO_URI in .env")
-    db_name = (os.getenv("DB_NAME") or os.getenv("MONGO_DB_NAME") or "shopbot").strip() or "shopbot"
+    db_name = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
     client = MongoClient(
         mongo_uri,
         tls=True,
@@ -1237,7 +1237,7 @@ def build_system_health(db) -> dict[str, Any]:
     checks.append({
         "name": "Bot token",
         "status": "ok" if saved_bot_token else "error",
-        "detail": f"Configured: {mask_bot_token(saved_bot_token)}. Source: runtime_config/{RUNTIME_BOT_TOKEN_KEY}. Bot service must use this same MONGO_URI and DB_NAME={(os.getenv('DB_NAME') or os.getenv('MONGO_DB_NAME') or 'shopbot').strip() or 'shopbot'}." if saved_bot_token else "Missing — save it in Secret Settings",
+        "detail": f"Configured: {mask_bot_token(saved_bot_token)}. Source: runtime_config/{RUNTIME_BOT_TOKEN_KEY}. Bot service must use this same MONGO_URI and DB_NAME={os.getenv('DB_NAME', 'shopbot').strip() or 'shopbot'}." if saved_bot_token else "Missing — save it in Secret Settings",
     })
     checks.append({
         "name": "WebAdmin secret key",

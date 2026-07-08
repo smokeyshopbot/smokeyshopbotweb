@@ -25,7 +25,7 @@ mongo_uri = os.getenv("MONGO_URI", "").strip()
 if not mongo_uri:
     raise SystemExit("Missing MONGO_URI. Put it in .env or your environment first.")
 
-db_name = (os.getenv("DB_NAME") or os.getenv("MONGO_DB_NAME") or "shopbot").strip() or "shopbot"
+db_name = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
 MONGO_TLS_ALLOW_INVALID_CERTIFICATES = _env_bool("MONGO_TLS_ALLOW_INVALID_CERTIFICATES", True)
 client = MongoClient(
     mongo_uri,
