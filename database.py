@@ -1646,6 +1646,7 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
+        "premium_emoji_id": 1,
         "low_stock_threshold": 1,
         "min_order_quantity": 1,
         "max_order_quantity": 1,

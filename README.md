@@ -379,3 +379,13 @@ The Telegram polling bot reads the token from MongoDB WebAdmin Secret Settings, 
 ```
 
 In WebAdmin → System Health, the Bot token check shows the same masked preview/fingerprint. If the bot log and WebAdmin System Health show different fingerprints, your Bot and WebAdmin services are connected to different `MONGO_URI`/`DB_NAME` values or one service was not redeployed/restarted.
+
+
+## Polls and API update
+
+See `UPDATE_GUIDE.md` at the project root for user polls, shared USDT-wallet API purchases, Telegram receipts, and verification instructions. Restart both services after deploying this update.
+
+
+### Background delivery update
+
+Stock alerts, broadcasts and WebAdmin messages/documents now use a persistent background queue. Owners can inspect **Delivery queue** for progress and retries. Restart both services after updating; the WebAdmin background sender starts automatically. See `UPDATE_GUIDE.md` for details.
