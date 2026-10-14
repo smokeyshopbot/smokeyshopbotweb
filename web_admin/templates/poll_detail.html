@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Poll results{% endblock %}
+{% block content %}
+{% if campaign.group_poll_job_id %}<p>The group links to this private survey. Its message shows the shared final totals. <a href="{{ url_for('delivery_job_detail', job_id=campaign.group_poll_job_id) }}">Group delivery status</a>.</p>{% endif %}
+<div class="page-header"><div><h1>{{ campaign.question }}</h1><p class="muted">{{ campaign.campaign_id }} · {{ campaign.status }} · {{ 'Multiple answers' if campaign.multiple else 'Single answer' }}</p></div><a href="{{ url_for('polls') }}">All polls</a></div>
+<section class="panel">
+  {% if campaign.results_unread %}<form method="post" action="{{ url_for('review_user_poll', campaign_id=campaign.campaign_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><p>New final results are ready.</p><button type="submit">Mark results reviewed</button></form>{% endif %}
+  {% if campaign.ends_at %}<p>Closing deadline: <strong>{{ campaign.deadline_text }}</strong></p>{% elif campaign.duration_seconds and campaign.status == 'draft' %}<p>Closes {{ campaign.duration_seconds // 60 }} minutes after you press Send poll.</p>{% else %}<p>Automatic closing: off</p>{% endif %}
+  <p>Audience: {{ campaign.audience.language }} languages · {{ campaign.audience.pricing_group }} groups · {{ audience_count }} currently matching active users</p>
+  <p>Sent: <strong>{{ stats.sent }}</strong> · Respondents: <strong>{{ stats.voters }}</strong> · Queued: {{ stats.queued }} · Delivery failures: {{ stats.failed }}</p>
+  {% if stats.close_failed %}<p>{{ stats.close_failed }} Telegram poll(s) could not be closed. See delivery errors below.</p>{% endif %}
+  {% if campaign.status == 'draft' %}
+  <form method="post" action="{{ url_for('send_user_poll', campaign_id=campaign.campaign_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="primary" type="submit">Send poll</button></form>
+  {% elif campaign.status not in ['closed', 'closing'] and not campaign.close_requested %}
+  <form method="post" action="{{ url_for('close_user_poll', campaign_id=campaign.campaign_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Close poll</button></form>
+  {% endif %}
+  <p class="muted">Voting is private to other users; identities below are owner-only. Final totals are frozen at closing. Delivery and message updates run while the bot is online.</p>
+  <p class="muted">Submitted votes cannot be changed. {% if campaign.multiple %}Only answers confirmed with Submit vote count; unfinished selections do not count.{% else %}A user's first selection submits their vote.{% endif %}</p>
+  {% if campaign.close_requested and campaign.status not in ['closed', 'close_failed'] %}<p>Closing requested; answers are locked.</p>{% endif %}
+  {% if campaign.group_results_error %}<p>Group result update: {{ campaign.group_results_error }}</p>{% endif %}
+</section>
+{% if campaign.status in ['draft', 'queued', 'preparing', 'active'] and not campaign.close_requested %}
+<details class="panel"><summary>Change closing timer</summary><form class="stacked-form" method="post" action="{{ url_for('schedule_user_poll', campaign_id=campaign.campaign_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% include '_poll_timer.html' %}<button type="submit">Save timer</button></form></details>
+{% endif %}
+<section class="panel"><h2>Results</h2>
+  <table><thead><tr><th>Answer</th><th>Votes</th><th>Respondents</th></tr></thead><tbody>{% for result in stats.results %}<tr><td style="white-space:pre-wrap">{{ result.text }}</td><td>{{ result.count }}</td><td>{{ result.percent }}%</td></tr>{% endfor %}</tbody></table>
+  {% if campaign.multiple %}<p class="muted">Users may select several options, so percentages can add up to more than 100%.</p>{% endif %}
+</section>
+<section class="panel"><div class="page-header"><h2>Responses and delivery</h2><a href="{{ url_for('export_poll_responses', campaign_id=campaign.campaign_id) }}">Export CSV</a></div>
+  <form method="get" class="stacked-form"><label>Show users who selected<select name="option" onchange="this.form.submit()">{% for option in campaign.options %}<option value="{{ loop.index0 }}" {{ 'selected' if selection == loop.index0|string else '' }}>{{ loop.index }}. {{ option|replace('\n', ' ') }}</option>{% endfor %}<option value="unanswered" {{ 'selected' if selection == 'unanswered' else '' }}>No response</option><option value="delivery" {{ 'selected' if selection == 'delivery' else '' }}>All delivery statuses</option></select></label><noscript><button type="submit">Show users</button></noscript></form>
+  <p>{{ total_rows }} matching user{{ '' if total_rows == 1 else 's' }}</p>
+  <div class="table-wrap"><table><thead><tr><th>User</th><th>Answers</th><th>Delivery</th><th>Error</th></tr></thead><tbody>{% for row in rows %}<tr><td>{{ row.user_id }}{% if row.username %}<br>@{{ row.username }}{% endif %}</td><td style="white-space:pre-wrap">{{ row.answers|join('\n\n') or 'No response' }}</td><td>{{ row.status }}</td><td>{{ row.error or '' }}</td></tr>{% else %}<tr><td colspan="4">No users match this selection.</td></tr>{% endfor %}</tbody></table></div>
+  <div class="pagination">{% if page > 1 %}<a href="{{ url_for('user_poll_detail', campaign_id=campaign.campaign_id, option=selection, page=page-1) }}">Previous</a>{% endif %} <span>Page {{ page }}</span> {% if page * 50 < total_rows %}<a href="{{ url_for('user_poll_detail', campaign_id=campaign.campaign_id, option=selection, page=page+1) }}">Next</a>{% endif %}</div>
+</section>
+{% include '_poll_timer_script.html' %}
+{% endblock %}

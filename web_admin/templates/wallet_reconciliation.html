@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Wallet reconciliation{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Wallet reconciliation</h1><p>Compare recorded wallet changes with current balances. This page never automatically changes a balance.</p></div></div>
+<section class="panel"><p>Last scan: {{ state.checked_at|fmt_dt if state.checked_at else 'Not yet scanned' }}. {% if state.running %}Scanning more accounts…{% endif %}</p>
+<form method="post" action="{{ url_for('wallet_reconciliation_run') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Check wallets now</button></form>
+<p class="muted">Existing balances become opening checkpoints. Historical transactions before that checkpoint are not independently certified. New wallet changes are recorded with their source and reference.</p></section>
+<section class="panel"><h2>Accounts needing review</h2>
+{% for user in users %}<article class="setting-card"><h3><a href="{{ url_for('user_detail', user_id=user.user_id) }}">{{ user.user_id }}{% if user.username %} — @{{ user.username }}{% endif %}</a></h3>
+<p>{{ user.wallet_reconciliation.issues|join('; ') }}</p><p>Checked: {{ user.wallet_reconciliation.checked_at|fmt_dt }}</p>
+<div class="table-wrap"><table><thead><tr><th>Currency</th><th>Expected</th><th>Actual</th><th>Difference</th></tr></thead><tbody>{% for currency in ['usdt', 'inr'] %}{% set row = user.wallet_reconciliation[currency] %}<tr><td>{{ currency|upper }}</td><td>{{ row.expected }}</td><td>{{ row.actual }}</td><td>{{ row.difference }}</td></tr>{% endfor %}</tbody></table></div></article>
+{% else %}<p>No accounts are currently flagged. A scan must finish before this is meaningful.</p>{% endfor %}</section>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Delivery queue{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Delivery queue</h1><p class="muted">Messages send in the background. Saving stock and submitting broadcasts do not wait for Telegram.</p></div></div>
+<section class="panel"><p>Refresh to update progress. Failed sends are retried automatically for temporary errors. “Review” means a send was interrupted and might already have arrived; check before retrying.</p>
+<div class="table-wrap"><table><thead><tr><th>Created</th><th>Job</th><th>Status / progress</th><th>Error</th><th></th></tr></thead><tbody>
+{% for job in jobs %}<tr><td>{{ fmt_dt(job.created_at) }}</td><td>{{ job.kind }}{% if job.payload.product_name %}<br>{{ job.payload.product_name }}{% endif %}{% if job.payload.chat_id %}<br>User {{ job.payload.chat_id }}{% endif %}</td><td>{% if job.kind == 'bulk' and job.status == 'expanded' %}{{ 'Sending' if job.counts.queued + job.counts.working else 'Completed' }}{% else %}{{ job.status }}{% endif %}{% if job.counts %}<br>Sent: {{ job.counts.done }} · Waiting: {{ job.counts.queued + job.counts.working }} · Failed: {{ job.counts.failed }} · Review: {{ job.counts.review }} · Skipped: {{ job.counts.cancelled }}{% endif %}</td><td>{{ job.error or '' }}</td><td><a href="{{ url_for('delivery_job_detail', job_id=job.job_id) }}">Details</a>{% if job.status in ['failed','review'] or (job.counts and (job.counts.failed or job.counts.review)) %}<form method="post" action="{{ url_for('retry_delivery_job', job_id=job.job_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry failed / reviewed</button></form>{% endif %}</td></tr>{% endfor %}
+</tbody></table></div>{% if not jobs %}<p class="muted">No queued deliveries yet.</p>{% endif %}</section>
+{% endblock %}

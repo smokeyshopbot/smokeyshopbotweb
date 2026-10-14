@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Admin Panel{% endblock %} · Telegram Shop Bot</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20260523_old_theme_restore_v1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261014_product_logos">
 </head>
 <body>
   {% if session.get('admin_logged_in') %}
@@ -28,6 +28,7 @@
         {% if current_admin_role == 'owner' and stock_upload_rejection_count %}<span class="nav-badge stock-rejection-badge stock-rejection-alert" title="{{ stock_upload_rejection_count }} rejected stock-manager upload log(s)">R{{ stock_upload_rejection_count }}</span>{% endif %}
       </a>
       {% endif %}
+      {% if current_admin_role == 'owner' %}<a href="{{ url_for('supplier_apis') }}">Vendor APIs</a>{% endif %}
       {% if can_access('users') %}<a href="{{ url_for('users') }}">Users</a>{% endif %}
       {% if can_access('orders') %}
       <a href="{{ url_for('orders', filter='status:refund_requested') if pending_refund_request_count else url_for('orders') }}" class="nav-with-badge">
@@ -67,7 +68,9 @@
       {% if can_access('ranking') %}<a href="{{ url_for('ranking') }}">Buyer Ranking</a>{% endif %}
       {% if can_access('activity_log') %}<a href="{{ url_for('activity_log') }}">Activity Log</a>{% endif %}
       {% if can_access('broadcast_form') %}<a href="{{ url_for('broadcast_form') }}">Broadcast</a>{% endif %}
+      {% if current_admin_role == 'owner' %}<a href="{{ url_for('polls') }}" class="nav-with-badge" data-poll-results-link><span>User polls</span>{% if poll_results_unread_count %}<span class="nav-badge" title="{{ poll_results_unread_count }} poll result(s) to review">{{ poll_results_unread_count }}</span>{% endif %}</a>{% endif %}
       {% if can_access('recent_notifications') %}<a href="{{ url_for('recent_notifications') }}">Recent Notifications</a>{% endif %}
+      {% if current_admin_role == 'owner' %}<a href="{{ url_for('delivery_queue') }}">Delivery queue</a><a href="{{ url_for('wallet_reconciliation') }}">Wallet reconciliation</a>{% endif %}
       {% if can_access('help_page') %}<a href="{{ url_for('help_page') }}">Admin Map</a>{% endif %}
     </nav>
     <form method="post" action="{{ url_for('logout') }}" class="logout-form">
@@ -263,8 +266,11 @@
       setNavBadge(paymentsLink, reviews);
       setNavBadge(adminsLink, payoutRequests);
       setNavBadge(replacementsLink, replacementReports);
+      const pollsLink = document.querySelector('[data-poll-results-link]');
+      const pollResults = OWNER_LIVE_NOTIFICATIONS ? Number(state.counts.poll_results_unread || 0) : 0;
+      setNavBadge(pollsLink, pollResults, '', pollResults + ' poll result(s) to review');
       const visibleImportant = OWNER_LIVE_NOTIFICATIONS ? ((productsLink ? (stockAlerts + stockUploadRejections) : 0) + (ordersLink ? refundRequests : 0) + (pendingLink ? pendingStock : 0) + (paymentsLink ? reviews : 0) + (adminsLink ? payoutRequests : 0) + (replacementsLink ? replacementReports : 0)) : 0;
-      updateTitle(visibleImportant);
+      updateTitle(visibleImportant + pollResults);
     }
 
     function setNavBadge(link, count, variantClass, title, badgeClass, prefix) {

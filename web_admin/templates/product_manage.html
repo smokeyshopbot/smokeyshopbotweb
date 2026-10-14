@@ -32,6 +32,7 @@
     {% endif %}
     <p><span class="date-pill">{{ fmt_dt(product.created_at) }}</span></p>
     {% if can_access('update_product_shop_order') %}
+    <div class="product-display-controls">
     <form method="post" action="{{ url_for('update_product_shop_order', name=product.name) }}" class="display-position-inline-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label for="product-display-position">Display position</label>
@@ -39,6 +40,14 @@
       <span class="position-total">of {{ product.total_product_positions or 1 }}</span>
       <button class="primary" type="submit">Save</button>
     </form>
+    <form method="post" action="{{ url_for('update_product_premium_emoji', name=product.name) }}" class="product-emoji-inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="product-premium-emoji-id">Premium emoji ID</label>
+      <input id="product-premium-emoji-id" name="premium_emoji_id" value="{{ product.premium_emoji_id or '' }}" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" autocomplete="off" placeholder="Optional emoji ID">
+      <button class="primary" type="submit">Save</button>
+      <small>Blank or premium emojis disabled: no service logo.</small>
+    </form>
+    </div>
     {% endif %}
   </div>
   <div class="product-manage-side">
@@ -66,7 +75,8 @@
         <strong class="stock-number stock-good">{{ stock_count }}</strong>
       {% endif %}
     </div>
-    <div><span>Total stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    <div><span>Locally held stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    {% if product.external_supplier_stock %}<div><span>Vendor stock</span><strong>{{ product.external_supplier_stock }}</strong></div>{% endif %}
     <div><span>Pending orders</span><strong>{{ product.pending_stock_quantity or 0 }}</strong></div>
     {% endif %}
   </div>
@@ -410,6 +420,60 @@ item 2"></textarea>
 </section>
 {% endif %}
 
+{% if current_admin_role == 'owner' %}
+<section class="panel">
+  <h2>API settings</h2>
+  <p class="muted">Reseller API purchases use this public product ID and the USDT price shown to the reseller.</p>
+  <form method="post" action="{{ url_for('update_product_api_settings', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Product API ID
+      <input name="api_product_id" value="{{ product.api_product_id or product.api_public_product_id }}" placeholder="chatgpt-plus-1m" pattern="[a-z0-9][a-z0-9_-]{2,80}">
+    </label>
+    <label class="choice-pill"><input type="checkbox" name="api_enabled" value="1" {% if product.api_enabled is not sameas false %}checked{% endif %}> Available through reseller API</label>
+    <p class="muted">Current API ID: <code>{{ product.api_public_product_id }}</code></p>
+    <button class="primary" type="submit">Save API settings</button>
+  </form>
+</section>
+{% endif %}
+
+{% if current_admin_role == 'owner' %}
+<section class="panel">
+  <h2>Vendor fallback</h2>
+  <p class="muted">Local stock is always used first. When local stock is low or unavailable, the bot checks these vendors in priority order.</p>
+  {% if supplier_apis %}
+  <form method="post" action="{{ url_for('update_product_supplier_fallbacks', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label class="choice-pill"><input type="checkbox" name="external_supplier_fallback_enabled" value="1" {% if product.external_supplier_fallback_enabled %}checked{% endif %}> Use vendor fallback for this product</label>
+    <div class="table-wrap">
+      <table class="compact-table">
+        <thead><tr><th>Priority</th><th>Vendor alias</th><th>Vendor product ID</th></tr></thead>
+        <tbody>
+        {% for priority in range(1, 6) %}
+          {% set row = product.supplier_fallback_map.get(priority|string) %}
+          <tr>
+            <td>{{ priority }}</td>
+            <td>
+              <select name="supplier_{{ priority }}_id">
+                <option value="">None</option>
+                {% for supplier in supplier_apis %}
+                  <option value="{{ supplier._id }}" {% if row and row.supplier_id == supplier._id|string %}selected{% endif %}>{{ supplier.alias }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td><input name="supplier_{{ priority }}_product_id" value="{{ row.supplier_product_id if row else '' }}" placeholder="vendor product_id"></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button class="primary" type="submit">Save vendor fallback</button>
+  </form>
+  {% else %}
+    <p class="muted">Add a vendor API first from Vendor APIs.</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% if can_access('update_stock_manager_rates') %}
 <section class="panel stock-manager-rates-panel">
   <h2>Stock manager settlement rates</h2>
@@ -427,7 +491,7 @@ item 2"></textarea>
 {% if can_access('update_product_description') %}
 <section class="panel">
   <h2>Product details</h2>
-  <p class="muted">These details are shown to users after they tap the product in the bot. Stock text is not changed.</p>
+  <p class="muted">Descriptions appear in a Telegram quote panel with bold text after users tap the product. Write plain text and keep any line breaks you want to show. Telegram controls the panel colors.</p>
   <form method="post" action="{{ url_for('update_product_description', name=product.name) }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="product-details-warranty-row">

@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Vendor APIs{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Vendor APIs</h1><p class="muted">Add supplier APIs used when your local stock is low or unavailable.</p></div></div>
+
+<section class="panel">
+  <h2>Add vendor API</h2>
+  <form method="post" action="{{ url_for('save_supplier_api') }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Alias<input name="alias" placeholder="Vendor Name" required></label>
+    <label>Base URL<input name="base_url" placeholder="https://example.com" required></label>
+    <label>API key<input name="api_key" placeholder="smo_..." required></label>
+    <label class="choice-pill"><input type="checkbox" name="legacy_query_auth" value="1"> Legacy query-key authentication (only for vendors that require ?key=…)</label>
+    <label class="choice-pill"><input type="checkbox" name="enabled" value="1" checked> Enabled</label>
+    <button class="primary" type="submit">Add vendor</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Saved vendors</h2>
+  {% if suppliers %}
+  <div class="table-wrap"><table class="compact-table">
+    <thead><tr><th>Alias</th><th>Base URL</th><th>Key</th><th>Status</th><th>Update</th><th>Delete</th></tr></thead>
+    <tbody>
+    {% for supplier in suppliers %}
+      <tr>
+        <td><strong>{{ supplier.alias }}</strong></td>
+        <td>{{ supplier.base_url }}</td>
+        <td><code>{{ supplier.api_key_prefix or 'saved' }}</code></td>
+        <td>{{ 'Enabled' if supplier.enabled is not sameas false else 'Disabled' }}</td>
+        <td>
+          {% if supplier.enabled is not sameas false %}<a class="small-button" href="{{ url_for('vendor_products', supplier_id=supplier._id|string) }}">Load vendor products</a>{% endif %}
+          <form method="post" action="{{ url_for('save_supplier_api') }}" class="stacked-form compact-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="supplier_id" value="{{ supplier._id }}">
+            <input name="alias" value="{{ supplier.alias }}" required>
+            <input name="base_url" value="{{ supplier.base_url }}" required>
+            <input name="api_key" value="{{ supplier.api_key }}" required>
+            <label class="choice-pill"><input type="checkbox" name="legacy_query_auth" value="1" {% if supplier.legacy_query_auth is not sameas false %}checked{% endif %}> Legacy query-key authentication</label>
+            <label class="choice-pill"><input type="checkbox" name="enabled" value="1" {% if supplier.enabled is not sameas false %}checked{% endif %}> Enabled</label>
+            <button type="submit">Save</button>
+          </form>
+        </td>
+        <td>
+          <form method="post" action="{{ url_for('delete_supplier_api', supplier_id=supplier._id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="danger" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+    <p class="muted">No vendor APIs saved yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Recent vendor logs</h2>
+  {% if recent_logs %}
+  <div class="table-wrap"><table class="compact-table">
+    <thead><tr><th>Time</th><th>Vendor</th><th>Product</th><th>Status</th><th>Details</th></tr></thead>
+    <tbody>
+    {% for log in recent_logs %}
+      <tr>
+        <td>{{ fmt_dt(log.created_at) }}</td>
+        <td>{{ log.supplier_alias or log.supplier_id }}</td>
+        <td>{{ log.product_name }}<br><small class="muted">{{ log.supplier_product_id }}</small></td>
+        <td>{{ log.status }}</td>
+        <td>{% if log.error %}{{ log.error }}{% elif log.supplier_order_code %}{{ log.supplier_order_code }}{% else %}-{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+    <p class="muted">No vendor API logs yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

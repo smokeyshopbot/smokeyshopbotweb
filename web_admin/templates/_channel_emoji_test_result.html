@@ -1,0 +1,12 @@
+{% if channel_emoji_test %}
+<div>
+  <p>Latest forwarding test: <strong>{{ channel_emoji_test.status }}</strong>. <a href="{{ url_for('delivery_job_detail', job_id=channel_emoji_test.job_id) }}">Delivery status and errors</a></p>
+  <table><thead><tr><th>Check</th><th>Telegram response</th></tr></thead><tbody>
+    <tr><td>Premium emojis in source group</td><td>{% if channel_emoji_test.source_sent %}{{ 'Retained' if channel_emoji_test.source_emojis else 'Not retained' }}{% else %}Pending ({{ channel_emoji_test.source_status }}){% endif %}</td></tr>
+    <tr><td>Premium emojis after forwarding</td><td>{% if channel_emoji_test.forward_sent %}{{ 'Retained' if channel_emoji_test.forward_emojis else 'Not retained' }}{% else %}Not forwarded yet{% endif %}</td></tr>
+    <tr><td>Buy product button after forwarding</td><td>{% if channel_emoji_test.forward_sent %}{{ 'Retained' if channel_emoji_test.button_preserved else 'Not retained' }}{% else %}Not forwarded yet{% endif %}</td></tr>
+  </tbody></table>
+  {% if channel_emoji_test.error %}<p>{{ channel_emoji_test.error }}</p>{% endif %}
+  {% if channel_emoji_test.forward_sent %}<p class="muted">Open the channel to confirm the emoji appearance and try the Buy button. This test does not place an order or deduct any balance.</p>{% else %}<p class="muted">Refresh this section after the background worker finishes.</p>{% endif %}
+</div>
+{% endif %}

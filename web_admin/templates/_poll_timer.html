@@ -1,0 +1,10 @@
+<label>Automatic closing
+  <select name="closing_mode" class="poll-closing-mode">
+    <option value="duration">After a duration</option><option value="at">At a date and time</option><option value="manual">Close manually</option>
+  </select>
+</label>
+<div class="poll-duration"><label>Duration<input type="number" name="duration_value" value="24" min="1" max="525600"></label>
+  <label>Unit<select name="duration_unit"><option value="hours">Hours</option><option value="minutes">Minutes</option><option value="days">Days</option></select></label></div>
+<div class="poll-date" hidden><label>Closing date and time<input type="datetime-local" name="close_at"></label>
+  <label>Timezone<input name="poll_timezone" value="Asia/Kolkata" placeholder="Asia/Kolkata"></label></div>
+<small class="muted">Draft durations start when you press Send poll. Updating an active duration starts it now. Voting stops at the deadline; final messages are updated while the bot is online.</small>

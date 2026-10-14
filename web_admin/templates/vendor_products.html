@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Vendor products{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Products from {{ supplier.alias }}</h1><p>Choose products and set your selling prices in USDT. Import creates local products and vendor mappings. Stock stays with the vendor.</p></div><a href="{{ url_for('vendor_products', supplier_id=supplier._id|string, refresh=1) }}">Refresh catalogue</a></div>
+<p>Existing imports, product names and mappings are skipped. Their prices and stock remain intact. This preview expires after 15 minutes.</p>
+{% if snapshot.rows %}
+<form method="post" action="{{ url_for('import_vendor_products', supplier_id=supplier._id|string) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ snapshot.revision }}">
+<label>Search catalogue <input id="vendor-search" type="search" placeholder="Product name or ID"></label>
+<div class="table-wrap"><table><thead><tr><th>Select</th><th>Product</th><th>Vendor product ID</th><th>Vendor price (USDT)</th><th>Available</th><th>Your selling price (USDT)</th></tr></thead><tbody>
+{% for row in snapshot.rows %}<tr class="catalog-row"><td><input type="checkbox" name="selected" value="{{ loop.index0 }}" {% if not row.supported %}disabled{% endif %}></td><td>{{ row.name }}{% if not row.supported %}<br><small>Unsupported currency or purchase requirements</small>{% endif %}</td><td><code>{{ row.product_id }}</code></td><td>{{ row.price }}</td><td>{{ row.stock }}</td><td><input type="number" name="price_{{ loop.index0 }}" value="{{ row.selling_price or row.price }}" step="0.01" min="0.01" max="1000000" {% if not row.supported %}disabled{% endif %}></td></tr>{% endfor %}
+</tbody></table></div><button class="primary" type="submit">Import selected products</button> <a href="{{ url_for('supplier_apis') }}">Back to vendors</a></form>
+<script>document.getElementById('vendor-search').addEventListener('input',function(){const q=this.value.toLocaleLowerCase();document.querySelectorAll('.catalog-row').forEach(row=>{row.hidden=!row.textContent.toLocaleLowerCase().includes(q);});});</script>
+{% else %}<p>The vendor returned no available API products. Check product visibility and API access in the vendor's admin panel.</p>{% endif %}
+{% endblock %}

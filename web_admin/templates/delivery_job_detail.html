@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Delivery details{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Delivery details</h1><p class="muted">{{ job.kind }} · {{ job.status }}{% if job.payload.product_name %} · {{ job.payload.product_name }}{% endif %}</p></div><a href="{{ url_for('delivery_queue') }}">All deliveries</a></div>
+{% if job.payload.group_recipient %}<section class="panel"><p>Announcement group: {{ job.payload.chat_id }} · Delivery: {{ job.status }}</p></section>{% endif %}
+<section class="panel"><p>Review interrupted sends before retrying: the message may already have arrived. A completed delivery is never selected for retry.</p>
+<div class="table-wrap"><table><thead><tr><th>Recipient / action</th><th>Status</th><th>Attempts</th><th>Error</th><th></th></tr></thead><tbody>{% for row in rows %}<tr><td>{{ row.payload.chat_id or row.payload.product_name or row.kind }}{% if row.payload.filename %}<br>{{ row.payload.filename }}{% endif %}</td><td>{{ row.status }}</td><td>{{ row.attempts }}</td><td>{{ row.error or '' }}</td><td>{% if row.status in ['failed','review'] %}<form method="post" action="{{ url_for('retry_delivery_job', job_id=row.job_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry this delivery</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div>
+<p>{% if page > 1 %}<a href="{{ url_for('delivery_job_detail', job_id=job.job_id, page=page-1) }}">Previous</a>{% endif %} Page {{ page }} {% if page * 50 < total %}<a href="{{ url_for('delivery_job_detail', job_id=job.job_id, page=page+1) }}">Next</a>{% endif %}</p>
+</section>
+{% endblock %}

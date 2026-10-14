@@ -1,0 +1,13 @@
+<script>
+document.querySelectorAll('.poll-closing-mode').forEach(select => {
+  const form = select.closest('form');
+  const update = () => {
+    form.querySelector('.poll-duration').hidden = select.value !== 'duration';
+    form.querySelector('.poll-date').hidden = select.value !== 'at';
+    form.querySelector('[name="close_at"]').required = select.value === 'at';
+    form.querySelectorAll('.poll-duration input, .poll-duration select').forEach(input => input.disabled = select.value !== 'duration');
+    form.querySelectorAll('.poll-date input').forEach(input => input.disabled = select.value !== 'at');
+  };
+  select.addEventListener('change', update); update();
+});
+</script>

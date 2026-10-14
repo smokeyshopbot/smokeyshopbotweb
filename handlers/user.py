@@ -13,6 +13,7 @@ Flow:
 """
 
 import logging
+import html
 import uuid
 import io
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 import database as db
+from utils.product_emojis import label as product_emoji_label, prefix as product_emoji_prefix, normal_prefix, product_heading
 from config import SUPPORT_USERNAMES
 from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
@@ -207,7 +209,7 @@ def _product_description_block(product: dict, lang: str = "en") -> str:
         description = str(product.get("description_en") or product.get("description") or "").strip()
     if not description:
         return ""
-    return tr(selected_lang, "product_description_block", description=description)
+    return tr(selected_lang, "product_description_block", description=html.escape(description, quote=False))
 
 
 def _product_warranty_block(product: dict, lang: str = "en") -> str:
@@ -246,7 +248,7 @@ def _fit_product_button(prefix: str, name: str, stock_part: str, price_part: str
     shown after the user opens the product.
     """
     name = str(name or "Product").strip()
-    return f"{prefix} {name} | {stock_part} | {price_part}"
+    return f"{normal_prefix(prefix + chr(32))}{name} | {stock_part} | {price_part}"
 
 
 def _product_callback(prefix: str, product: dict) -> str:
@@ -351,7 +353,7 @@ def _product_button_label(product: dict, payment_settings: dict | None = None, l
     else:
         prefix = "✅"
         stock_part = tr(lang, "stock_count", count=stock_count)
-    return _fit_product_button(prefix, product['name'], stock_part, _price_label(product, payment_settings, lang=lang))
+    return product_emoji_prefix(product) + _fit_product_button(prefix, product['name'], stock_part, _price_label(product, payment_settings, lang=lang))
 
 
 def _main_menu_keyboard(user_id: int, lang: str = "en") -> InlineKeyboardMarkup:
@@ -411,7 +413,7 @@ def _favorite_button_label(product: dict, payment_settings: dict | None = None, 
         stock_part = tr(lang, "stock_preorder_open", remaining=capacity) if capacity > 0 else tr(lang, "stock_preorder_full")
     else:
         stock_part = tr(lang, "stock_sold_out") if stock_count <= 0 else tr(lang, "stock_count", count=stock_count)
-    return _fit_product_button(star, product['name'], stock_part, _price_label(product, payment_settings or {}, lang=lang))
+    return product_emoji_prefix(product) + _fit_product_button(star, product['name'], stock_part, _price_label(product, payment_settings or {}, lang=lang))
 
 
 def _favorite_name_set(favorite_names: list[str] | None) -> set[str]:
@@ -1412,27 +1414,27 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     if is_preorder:
         _shop_flow[user_id] = {"step": "quantity", "product": product, "is_preorder": True}
         await query.edit_message_text(
-            compact_blank_lines(tr(
+            compact_blank_lines(product_heading(tr(
                 lang,
                 "preorder_quantity_prompt",
-                product=product['name'],
+                product=html.escape(product_emoji_label(product), quote=False),
                 description=_product_details_block(product, lang),
-                price=_price_label(product, payment_settings, lang=lang),
+                price=html.escape(_price_label(product, payment_settings, lang=lang), quote=False),
                 remaining=preorder_capacity,
                 user_remaining=user_remaining,
                 user_limit=user_limit,
                 active=user_active_qty,
                 max_qty=preorder_max_qty,
-            )),
-            parse_mode="Markdown",
+            ))),
+            parse_mode="HTML",
             reply_markup=back_keyboard
         )
         return
 
     _shop_flow[user_id] = {"step": "quantity", "product": product}
     await query.edit_message_text(
-        compact_blank_lines(tr(lang, "quantity_prompt", product=product['name'], description=_product_details_block(product, lang), price=_price_label(product, payment_settings, lang=lang), stock=stock_count)),
-        parse_mode="Markdown",
+        compact_blank_lines(product_heading(tr(lang, "quantity_prompt", product=html.escape(product_emoji_label(product), quote=False), description=_product_details_block(product, lang), price=html.escape(_price_label(product, payment_settings, lang=lang), quote=False), stock=stock_count))),
+        parse_mode="HTML",
         reply_markup=back_keyboard
     )
 
@@ -1582,7 +1584,7 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     summary_key = "preorder_order_summary" if is_preorder else "order_summary"
     await update.message.reply_text(
-        tr(lang, summary_key, product=product['name'], quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
+        tr(lang, summary_key, product=product_emoji_label(product), quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )

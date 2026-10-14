@@ -64,6 +64,32 @@
   </section>
 </div>
 
+{% if current_admin_role == 'owner' %}
+<section class="panel">
+  <h2>Reseller API</h2>
+  {% if user.api_key %}
+    <p><strong>API key</strong><br><code>{{ user.api_key }}</code></p>
+  {% elif user.api_key_prefix %}
+    <p><strong>API key</strong><br><code>{{ user.api_key_prefix }}</code></p>
+    <p class="muted">This key was created before full-key display was enabled. Regenerate it to show the full key.</p>
+  {% else %}
+    <p class="muted">No API key generated yet.</p>
+  {% endif %}
+  <p class="muted">Status: <b>{{ 'Enabled' if user.api_enabled and user.api_key_hash else 'Disabled' }}</b>{% if user.api_last_used_at %} · Last used {{ fmt_dt(user.api_last_used_at) }}{% endif %}{% if user.api_request_count %} · {{ user.api_request_count }} request(s){% endif %}</p>
+  <form method="post" action="{{ url_for('update_user_api', user_id=user.user_id) }}" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="primary" name="api_action" value="generate" type="submit">{{ 'Regenerate key' if user.api_key_hash else 'Generate key' }}</button>
+    {% if user.api_key_hash %}
+      {% if user.api_enabled %}
+        <button class="danger" name="api_action" value="disable" type="submit">Disable API</button>
+      {% else %}
+        <button class="success" name="api_action" value="enable" type="submit">Enable API</button>
+      {% endif %}
+    {% endif %}
+  </form>
+</section>
+{% endif %}
+
 
 {% if current_admin_role == 'owner' %}
 <section class="panel user-pricing-panel">

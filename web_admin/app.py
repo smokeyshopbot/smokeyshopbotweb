@@ -9,6 +9,10 @@ The panel uses the same MongoDB collections as the Telegram bot and is now the o
 from __future__ import annotations
 
 import csv
+import sys
+from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
+from web_admin.polls import register_poll_routes, ensure_poll_indexes
+from web_admin.delivery_queue import enqueue_job, enqueue_bulk, bulk_count, ensure_delivery_indexes, register_delivery_routes, start_delivery_worker
 import functools
 import html
 import hmac
@@ -19,6 +23,8 @@ import os
 import re
 import secrets
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
@@ -26,13 +32,20 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 
 import requests
+from utils.premium_emojis import DEFAULTS as EMOJI_DEFAULTS, EMOJI_CHOICES, mapping as premium_mapping, form_settings as premium_form_settings, transform_payload, emoji_rejected, plain_product_payload, multipart_data, file_positions, rewind_files
+from bson import ObjectId
 from dotenv import load_dotenv
+from web_admin.vendor_catalog import register_vendor_catalog_routes
+from web_admin.group_announcements import DEFAULTS as GROUP_DEFAULTS, BOOL_KEYS as GROUP_BOOL_KEYS, validate as validate_group_announcements, enqueue_notice
+from utils.group_notifications import settings as group_notification_settings
+from utils.product_emojis import label as product_emoji_label
 from flask import (
     Flask,
     Response,
     jsonify,
     abort,
     current_app,
+    g,
     flash,
     has_request_context,
     redirect,
@@ -45,7 +58,11 @@ from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
-from utils.bscscan import public_usdt_error_text, extract_usdt_received_amount_from_error
+from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amount_from_error
+from utils.channel_gate_settings import validate_channel_settings
+from utils.data_guard import GuardedDatabase, work_guard
+from utils.wallet_audit import change_wallet, event_id
+from web_admin.operations import DEFAULTS as OPERATIONS_DEFAULTS, BOOL_KEYS as OPERATIONS_BOOL_KEYS, validate_settings as validate_operations_settings, register_operations_routes, start_operations_worker
 
 load_dotenv()
 
@@ -64,6 +81,7 @@ LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCK_SECONDS = 15 * 60
 SENSITIVE_SECRET_SETTING_KEYS = {
+    "backup_encryption_key",
     "bot_token",
     "bscscan_api_key",
     "polygonscan_api_key",
@@ -101,7 +119,10 @@ ROLE_HOME_ENDPOINTS = {
     ADMIN_ROLE_PAYMENT_MANAGER: "payments",
     ADMIN_ROLE_ORDERS_MANAGER: "orders",
 }
-COMMON_ADMIN_ENDPOINTS = {"static", "login_form", "login_submit", "logout", "live_state"}
+COMMON_ADMIN_ENDPOINTS = {
+    "static", "login_form", "login_submit", "logout", "live_state",
+    "buyer_api_products", "buyer_api_balance", "buyer_api_purchase",
+}
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -298,9 +319,15 @@ SECRET_SETTINGS_KEY = "secret_settings"
 RUNTIME_BOT_TOKEN_KEY = "telegram_bot_token"
 
 SECRET_DEFAULTS: dict[str, Any] = {
+    **EMOJI_DEFAULTS,
+    **OPERATIONS_DEFAULTS,
+    **GROUP_DEFAULTS,
     "bot_token": "",
     "support_usernames": "",
     "admin_ids": "",
+    "required_channel_enabled": "0",
+    "required_channel_id": "",
+    "required_channel_join_url": "",
     "bscscan_api_key": "",
     "polygonscan_api_key": "",
     "etherscan_api_key": "",
@@ -605,6 +632,7 @@ def clean_secret_settings(settings: dict | None) -> dict:
             else:
                 cleaned[key] = str(settings.get(key) or "").strip()
     cleaned["admin_accounts"] = clean_admin_accounts(cleaned.get("admin_accounts"))
+    cleaned.update(group_notification_settings(settings))
     return cleaned
 
 
@@ -760,7 +788,11 @@ def stock_manager_payout_paid_by_label(db, record: dict | None) -> str:
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.db = _connect_db()  # type: ignore[attr-defined]
+    app.db = GuardedDatabase(_connect_db())  # type: ignore[attr-defined]
+    app.db.wallet_ledger.create_index([("user_id", 1), ("currency", 1)])
+    ensure_api_indexes(app.db)
+    ensure_poll_indexes(app.db)
+    ensure_delivery_indexes(app.db)
     if ADMIN_AUTO_INDEXES:
         try:
             ensure_admin_indexes(app.db)
@@ -796,6 +828,24 @@ def create_app() -> Flask:
     app._login_attempts = {}  # type: ignore[attr-defined]
 
     @app.before_request
+    def coordinate_database_work():
+        if request.endpoint == "static": return None
+        if request.method == "GET" and request.endpoint in {"secret_settings_form", "wallet_reconciliation"}:
+            g.read_only_backup_status = True
+            return None
+        guard = work_guard(app.db, wait=False)
+        try:
+            guard.__enter__()
+        except RuntimeError:
+            return jsonify({"success": False, "message": "Scheduled backup is exporting. Please try again shortly."}), 503, {"Retry-After": "30"}
+        g.database_work_guard = guard
+
+    @app.teardown_request
+    def finish_database_work(error=None):
+        guard = g.pop("database_work_guard", None)
+        if guard: guard.__exit__(None, None, None)
+
+    @app.before_request
     def clear_cached_counts_before_mutations():
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             clear_admin_cache()
@@ -804,7 +854,7 @@ def create_app() -> Flask:
     @app.before_request
     def enforce_webadmin_role_access():
         endpoint = request.endpoint or ""
-        if endpoint in {"static", "login_form", "login_submit"}:
+        if endpoint in {"static", "login_form", "login_submit"} or endpoint.startswith("buyer_api_"):
             return None
         if not _is_logged_in():
             return None
@@ -816,6 +866,7 @@ def create_app() -> Flask:
 
     @app.before_request
     def expire_stale_unpaid_request_cleanup():
+        if g.get("read_only_backup_status"): return
         if not session.get("admin_logged_in"):
             return
         now = time.time()
@@ -854,6 +905,7 @@ def create_app() -> Flask:
                 "pending_replacement_report_count": count_pending_replacement_reports(app.db),
                 "product_stock_alert": get_product_stock_alert_summary(app.db),
                 "stock_upload_rejection_count": count_stock_upload_rejections(app.db),
+                "poll_results_unread_count": app.db.user_polls.count_documents({'results_unread': True}),
                 "active_payment_currencies": get_active_payment_currencies(app.db),
                 "admin_ids": get_admin_ids(app.db),
                 "bot_token_configured": bool(get_bot_token(app.db)),
@@ -931,12 +983,21 @@ def create_app() -> Flask:
             "pending_replacement_report_count": int(sidebar_state.get("pending_replacement_report_count") or 0),
             "product_stock_alert": sidebar_state.get("product_stock_alert") or {"count": 0, "low_stock": 0, "out_of_stock": 0, "severity": ""},
             "stock_upload_rejection_count": int(sidebar_state.get("stock_upload_rejection_count") or 0),
+            "poll_results_unread_count": int(sidebar_state.get("poll_results_unread_count") or 0),
             "active_payment_currencies": sidebar_state.get("active_payment_currencies") or set(),
             "live_state_refresh_ms": ADMIN_LIVE_STATE_REFRESH_MS,
             "live_full_refresh_enabled": ADMIN_LIVE_FULL_REFRESH,
         }
 
     register_routes(app)
+    register_buyer_api_routes(app, sys.modules[__name__])
+    register_poll_routes(app, login_required, owner_required, csrf_required, log_admin_action, shop=sys.modules[__name__])
+    register_delivery_routes(app, sys.modules[__name__])
+    register_operations_routes(app, sys.modules[__name__])
+    register_vendor_catalog_routes(app, sys.modules[__name__])
+    if _env_bool("ADMIN_BACKGROUND_WORKER", True):
+        start_delivery_worker(app, sys.modules[__name__])
+        start_operations_worker(app, sys.modules[__name__])
     return app
 
 
@@ -966,14 +1027,16 @@ def ensure_admin_indexes(db) -> None:
     db.settings.create_index([("key", 1)], unique=True)
     db.runtime_config.create_index([("key", 1)], unique=True)
 
-    db.users.create_index([("user_id", 1)])
+    db.users.create_index([("user_id", 1)], unique=True)
     db.users.create_index([("username", 1)])
     db.users.create_index([("joined_at", -1)])
     db.users.create_index([("blocked", 1), ("joined_at", -1)])
+    db.users.create_index([("api_key_hash", 1)], unique=True, sparse=True)
     db.user_product_prices.create_index([("user_id", 1), ("product_key", 1)], unique=True)
     db.user_product_prices.create_index([("product_key", 1)])
 
     db.products.create_index([("name", 1)])
+    db.products.create_index([("api_product_id", 1)], unique=True, sparse=True)
     db.products.create_index([("enabled", 1), ("shop_order", 1), ("created_at", -1)])
 
     db.orders.create_index([("order_id", 1)])
@@ -982,6 +1045,11 @@ def ensure_admin_indexes(db) -> None:
     db.orders.create_index([("user_id", 1), ("created_at", -1)])
     db.orders.create_index([("product_name", 1), ("status", 1), ("created_at", 1)])
     db.orders.create_index([("delivered_at", -1)])
+    db.orders.create_index(
+        [("api_buyer_user_id", 1), ("api_client_order_id", 1)],
+        unique=True,
+        partialFilterExpression={"api_client_order_id": {"$type": "string"}},
+    )
 
     db.pending_payments.create_index([("ref_id", 1)])
     db.pending_payments.create_index([("status", 1), ("created_at", -1)])
@@ -1010,6 +1078,9 @@ def ensure_admin_indexes(db) -> None:
     db.stock_manager_replacement_obligations.create_index([("username_key", 1), ("status", 1)])
     db.stock_manager_replacement_obligations.create_index([("stock_added_by_username_key", 1), ("product_name", 1), ("fulfilled_at", 1)])
     db.stock_manager_replacement_obligations.create_index([("source_order_id", 1), ("item_hash", 1)])
+    db.supplier_apis.create_index([("alias", 1)])
+    db.supplier_api_logs.create_index([("created_at", -1)])
+    db.supplier_stock_cache.create_index([("key", 1)], unique=True)
 
 
 def _login_rate_key(username: str) -> str:
@@ -1353,7 +1424,427 @@ def build_system_health(db) -> dict[str, Any]:
     return {"checks": checks, "counters": counters, "generated_at": utcnow()}
 
 
+BUYER_API_KEY_PREFIX = "smo_"
+BUYER_API_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,80}$")
+
+
+def generate_buyer_api_key() -> str:
+    return f"{BUYER_API_KEY_PREFIX}{secrets.token_hex(24)}"
+
+
+def buyer_api_key_hash(api_key: str) -> str:
+    return hashlib.sha256(str(api_key or "").strip().encode("utf-8")).hexdigest()
+
+
+def buyer_api_key_prefix(api_key: str) -> str:
+    clean = str(api_key or "").strip()
+    return clean[:12] + "..." if len(clean) > 12 else clean
+
+
+def normalize_api_product_id(value: Any) -> str:
+    clean = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower())
+    clean = re.sub(r"-{2,}", "-", clean).strip("-_")
+    return clean[:80]
+
+
+def public_api_product_id(product: dict | None) -> str:
+    product = product or {}
+    saved = normalize_api_product_id(product.get("api_product_id"))
+    return saved or str(product.get("_id") or "")
+
+
+def find_product_by_public_api_id(db, product_id: str) -> dict | None:
+    raw = str(product_id or "").strip()
+    clean = normalize_api_product_id(raw)
+    if clean:
+        product = db.products.find_one({"api_product_id": clean})
+        if product:
+            return product
+    if ObjectId.is_valid(raw):
+        product = db.products.find_one({"_id": ObjectId(raw)})
+        if product:
+            return product
+    return db.products.find_one({"name": name_regex(raw)})
+
+
+def ensure_user_api_key_sync(db, user_id: int, username: str = "") -> str:
+    now = utcnow()
+    username = str(username or "").strip().lstrip("@")
+    for _attempt in range(8):
+        api_key = generate_buyer_api_key()
+        api_hash = buyer_api_key_hash(api_key)
+        if db.users.find_one({"api_key_hash": api_hash}, {"_id": 1}):
+            continue
+        set_fields: dict[str, Any] = {
+            "api_enabled": True,
+            "api_key": api_key,
+            "api_key_hash": api_hash,
+            "api_key_prefix": buyer_api_key_prefix(api_key),
+            "api_last_rotated_at": now,
+        }
+        if username:
+            set_fields["username"] = username
+        db.users.update_one(
+            {"user_id": int(user_id)},
+            {
+                "$set": set_fields,
+                "$setOnInsert": {
+                    "user_id": int(user_id),
+                    **({} if username else {"username": ""}),
+                    "blocked": False,
+                    "blocked_manually": False,
+                    "blocked_by_delivery": False,
+                    "wallet_inr": 0.0,
+                    "wallet_usdt": 0.0,
+                    "pricing_group": DEFAULT_PRICE_GROUP,
+                    "joined_at": now,
+                    "language": None,
+                    "language_selected": False,
+                    "api_created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        return api_key
+    raise RuntimeError("Could not generate a unique API key.")
+
+
+def authenticate_buyer_api_key(db, api_key: str) -> tuple[dict | None, str]:
+    clean = str(api_key or "").strip()
+    if not clean or not clean.startswith((BUYER_API_KEY_PREFIX, "tgb_")):
+        return None, "Invalid API key"
+    user = db.users.find_one({
+        "api_key_hash": buyer_api_key_hash(clean),
+        "api_enabled": {"$ne": False},
+        "blocked": {"$ne": True},
+    })
+    if not user:
+        return None, "Invalid API key"
+    db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"api_last_used_at": utcnow()}, "$inc": {"api_request_count": 1}},
+    )
+    return user, ""
+
+
+def buyer_api_error(message: str, status: int = 400, lang: str = "en"):
+    return jsonify({"success": False, "lang": normalize_lang(lang), "message": message}), status
+
+
+def api_money_usdt(value: Any) -> str:
+    return f"{safe_float(value, 0.0):.2f} USDT"
+
+
+def parse_delivered_api_item(item: str, product_item_id: str | None = None) -> dict[str, Any]:
+    text = str(item or "").strip()
+    row: dict[str, Any] = {
+        "productItemId": product_item_id or stock_item_hash(text),
+        "raw": text,
+        "deliveredAt": utcnow().isoformat(),
+    }
+    labels = {
+        "mail": "user",
+        "email": "user",
+        "user": "user",
+        "username": "user",
+        "login": "user",
+        "pass": "password",
+        "password": "password",
+        "mail pass": "verifyEmail",
+        "verify": "verifyEmail",
+        "verify email": "verifyEmail",
+        "recovery": "verifyEmail",
+    }
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        mapped = labels.get(re.sub(r"\s+", " ", key.strip().lower()))
+        if mapped and str(value).strip():
+            row.setdefault(mapped, str(value).strip(" -"))
+    parts = [line.strip() for line in text.splitlines() if line.strip()]
+    if "user" not in row and parts:
+        row["user"] = parts[0]
+    if "password" not in row and len(parts) > 1:
+        row["password"] = parts[1]
+    return row
+
+
+def build_buyer_purchase_response(db, order: dict, user: dict, product: dict, items: list[str]) -> dict[str, Any]:
+    lang = lang_from_user(user)
+    amount = round(safe_float(order.get("amount_usdt"), 0.0), 6)
+    balance = round(safe_float(user.get("wallet_usdt"), 0.0), 6)
+    delivered = [
+        parse_delivered_api_item(item, f"{str(order.get('order_id') or '')}-{idx}")
+        for idx, item in enumerate(items, start=1)
+    ]
+    return {
+        "success": True,
+        "lang": lang,
+        "botSource": "primary",
+        "walletCurrency": "USDT",
+        "orderCode": str(order.get("order_id") or ""),
+        "product_id": public_api_product_id(product),
+        "productType": str(product.get("name") or order.get("product_name") or ""),
+        "productTypeRaw": str(product.get("name") or order.get("product_name") or ""),
+        "quantity": int(order.get("quantity") or len(items) or 1),
+        "bonusQuantity": 0,
+        "finalQuantity": len(items),
+        "originalAmount": amount,
+        "originalAmountText": api_money_usdt(amount),
+        "discountPercent": 0,
+        "discountAmount": 0,
+        "discountAmountText": api_money_usdt(0),
+        "amount": amount,
+        "amountUsd": amount,
+        "amountText": api_money_usdt(amount),
+        "balance": balance,
+        "balanceUsd": balance,
+        "balanceText": api_money_usdt(balance),
+        "deliveredAccounts": delivered,
+        "referralReward": None,
+    }
+
+
+def log_supplier_api_event(db, event: dict) -> None:
+    try:
+        db.supplier_api_logs.insert_one(event)
+    except Exception:
+        current_app.logger.warning("Could not save supplier API log", exc_info=True)
+
+
+def supplier_purchase_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/api/telegram-buyer"):
+        return f"{base}/purchase"
+    if base.endswith("/api"):
+        return f"{base}/telegram-buyer/purchase"
+    return f"{base}/api/telegram-buyer/purchase"
+
+
+def supplier_products_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/api/telegram-buyer"):
+        return f"{base}/products"
+    if base.endswith("/api"):
+        return f"{base}/telegram-buyer/products"
+    return f"{base}/api/telegram-buyer/products"
+
+
+def normalize_supplier_fallbacks(product: dict | None) -> list[dict]:
+    if not product or not product.get("external_supplier_fallback_enabled"):
+        return []
+    rows = product.get("supplier_fallbacks") or []
+    if not isinstance(rows, list):
+        return []
+    clean_rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("enabled") is False:
+            continue
+        supplier_id = str(row.get("supplier_id") or "").strip()
+        supplier_product_id = str(row.get("supplier_product_id") or "").strip()
+        if supplier_id and supplier_product_id:
+            clean_rows.append({"supplier_id": supplier_id, "supplier_product_id": supplier_product_id, "priority": int(row.get("priority") or index + 1)})
+    return sorted(clean_rows, key=lambda row: int(row.get("priority") or 999))
+
+
+def supplier_item_text(row: Any) -> str:
+    if isinstance(row, str):
+        return row.strip()
+    if not isinstance(row, dict):
+        return str(row or "").strip()
+    raw = str(row.get("raw") or row.get("item") or row.get("code") or "").strip()
+    if raw:
+        return raw
+    parts = []
+    if row.get("user"):
+        parts.append(f"User: {row.get('user')}")
+    if row.get("password"):
+        parts.append(f"Pass: {row.get('password')}")
+    if row.get("verifyEmail"):
+        parts.append(f"Verify Email: {row.get('verifyEmail')}")
+    return "\n".join(parts).strip()
+
+
+def supplier_response_items(payload: dict) -> list[str]:
+    candidates = payload.get("deliveredAccounts") or payload.get("items") or payload.get("accounts") or []
+    if not isinstance(candidates, list):
+        return []
+    return [text for text in (supplier_item_text(row) for row in candidates) if text]
+
+
+_SUPPLIER_HTTP_POOL = ThreadPoolExecutor(max_workers=4)
+_SUPPLIER_HTTP_LOCK = threading.Lock()
+_SUPPLIER_HTTP_CACHE = {}
+
+
+def _supplier_stock_future(supplier):
+    key = (str(supplier['_id']), str(supplier.get('base_url')), buyer_api_key_hash(supplier.get('api_key', '')))
+    with _SUPPLIER_HTTP_LOCK:
+        entry = _SUPPLIER_HTTP_CACHE.get(key)
+        if entry and (not entry[1].done() or time.monotonic() - entry[0] < 30):
+            return entry[1]
+        if len(_SUPPLIER_HTTP_CACHE) > 1024:
+            for old_key, old in list(_SUPPLIER_HTTP_CACHE.items()):
+                if old[1].done() and time.monotonic() - old[0] > 30:
+                    _SUPPLIER_HTTP_CACHE.pop(old_key, None)
+        def fetch():
+            try:
+                api_key = str(supplier.get('api_key') or '').strip()
+                response = requests.get(supplier_products_url(supplier.get('base_url', '')),
+                    headers={'Authorization': 'Bearer ' + api_key},
+                    params={'key': api_key} if supplier.get('legacy_query_auth', True) else {}, timeout=(2, 3))
+                if getattr(response, 'status_code', 200) != 200:
+                    return {}
+                data = response.json()
+                if not isinstance(data, dict) or data.get('success') is False:
+                    return {}
+                return {str(row.get('product_id') or row.get('_id') or ''): max(0, int((row.get('stats') or {}).get('available') or 0))
+                        for row in data.get('products', []) if isinstance(row, dict)}
+            except Exception:
+                return {}
+        future = _SUPPLIER_HTTP_POOL.submit(fetch)
+        _SUPPLIER_HTTP_CACHE[key] = (time.monotonic(), future)
+        return future
+
+
+def get_external_supplier_available_stock(db, product_or_name: Any, *, cache_seconds: int = 30, _suppliers=None, _deadline=None) -> int:
+    product = product_or_name if isinstance(product_or_name, dict) else db.products.find_one({'name': name_regex(str(product_or_name or ''))})
+    fallbacks = normalize_supplier_fallbacks(product)
+    if not fallbacks:
+        return 0
+    requests_pending = []
+    for row in fallbacks:
+        if not ObjectId.is_valid(row['supplier_id']):
+            continue
+        supplier = (_suppliers.get(row['supplier_id']) if _suppliers is not None else
+                    db.supplier_apis.find_one({'_id': ObjectId(row['supplier_id']), 'enabled': {'$ne': False}}))
+        if supplier:
+            requests_pending.append((row['supplier_product_id'], _supplier_stock_future(supplier)))
+    deadline = _deadline if _deadline is not None else time.monotonic() + 3.5
+    best = 0
+    for product_id, future in requests_pending:
+        try:
+            counts = future.result(timeout=max(0, deadline - time.monotonic()))
+            best = max(best, int(counts.get(product_id, 0)))
+        except Exception:
+            pass
+    return best
+
+
+def purchase_from_supplier_fallbacks(db, product_name: str, quantity: int, *, order_id: str = "") -> dict:
+    product = db.products.find_one({"name": name_regex(product_name)})
+    for row in normalize_supplier_fallbacks(product):
+        supplier = db.supplier_apis.find_one({"_id": ObjectId(row["supplier_id"]), "enabled": {"$ne": False}}) if ObjectId.is_valid(row["supplier_id"]) else None
+        if not supplier:
+            continue
+        log_doc = {
+            "supplier_id": row["supplier_id"],
+            "supplier_alias": supplier.get("alias") or supplier.get("name") or "",
+            "product_name": product_name,
+            "supplier_product_id": row["supplier_product_id"],
+            "order_id": order_id,
+            "quantity": quantity,
+            "status": "failed",
+            "created_at": utcnow(),
+        }
+        try:
+            resp = requests.post(
+                supplier_purchase_url(supplier.get("base_url", "")),
+                json={
+                    "key": str(supplier.get("api_key") or "").strip(),
+                    "product_id": row["supplier_product_id"],
+                    "quantity": int(quantity or 1),
+                    "client_order_id": f"{order_id or uuid.uuid4().hex}-{row['supplier_id']}"[:120],
+                },
+                timeout=35,
+            )
+            data = resp.json()
+            items = supplier_response_items(data if isinstance(data, dict) else {})
+            if resp.status_code == 200 and isinstance(data, dict) and data.get("success") and len(items) >= quantity:
+                log_doc.update({"status": "success", "supplier_order_code": data.get("orderCode"), "item_count": len(items)})
+                log_supplier_api_event(db, log_doc)
+                with _SUPPLIER_HTTP_LOCK:
+                    _SUPPLIER_HTTP_CACHE.pop((str(supplier['_id']), str(supplier.get('base_url')), buyer_api_key_hash(supplier.get('api_key', ''))), None)
+                return {
+                    "items": items[:quantity],
+                    "source": "supplier",
+                    "supplier_id": row["supplier_id"],
+                    "supplier_alias": log_doc["supplier_alias"],
+                    "supplier_product_id": row["supplier_product_id"],
+                    "supplier_order_code": data.get("orderCode"),
+                }
+            if items or (isinstance(data, dict) and data.get("success")):
+                log_doc.update(status="uncertain", error="Supplier reported an incomplete delivery", item_count=len(items))
+                log_supplier_api_event(db, log_doc)
+                return {"items": [], "source": "supplier", "uncertain": True, "supplier_id": row["supplier_id"],
+                        "supplier_partial_items": items, "error": "Supplier reported an incomplete delivery"}
+            log_doc.update({"error": str(data.get("message") if isinstance(data, dict) else "") or f"Supplier HTTP {resp.status_code}", "http_status": resp.status_code})
+        except Exception as exc:
+            log_doc.update({"error": str(exc).replace(str(supplier.get("api_key") or ""), "<redacted>")[:500], "status": "uncertain"})
+            log_supplier_api_event(db, log_doc)
+            return {"items": [], "source": "supplier", "uncertain": True, "supplier_id": row["supplier_id"],
+                    "client_order_id": f"{order_id}-{row['supplier_id']}"[:120]}
+        log_supplier_api_event(db, log_doc)
+    return {"items": [], "source": "supplier", "error": "No supplier had enough stock"}
+
+
+def fulfill_product_items(db, product_name: str, quantity: int, *, order_id: str = "", reserve_pending: bool = False) -> dict:
+    order_query = {"order_id": str(order_id).strip().upper()}
+    saved = (db.orders.find_one(order_query) or {}).get("fulfillment_reservation", {}) if order_id else {}
+    if saved.get("phase") == "ready":
+        return saved["result"]
+    if saved.get("phase") in {"requesting", "uncertain"}:
+        return {"items": [], "source": "supplier", "uncertain": True, "error": "Supplier purchase needs owner review"}
+    local = pop_available_stock_for_admin_send(db, product_name, quantity, reserve_pending=reserve_pending, partial=True)
+    if len(local) == quantity:
+        return {"items": local, "local_items": local, "source": "local_stock"}
+    if order_id:
+        db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
+            "phase": "requesting", "local_items": local, "supplier_quantity": quantity - len(local)}}})
+    try:
+        result = purchase_from_supplier_fallbacks(db, product_name, quantity - len(local), order_id=order_id)
+    except Exception:
+        if local:
+            restore_popped_stock_items(db, product_name, local)
+        raise
+    if len(result.get("items") or []) == quantity - len(local):
+        result.update(items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
+        if order_id:
+            db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {"phase": "ready", "result": result}}})
+        return result
+    if local:
+        restore_popped_stock_items(db, product_name, local)
+    if order_id:
+        db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
+            "phase": "uncertain" if result.get("uncertain") else "failed", "error": result.get("error", "Supplier rejected purchase"),
+            "supplier_partial_items": result.get("supplier_partial_items", [])},
+            "supplier_outcome_uncertain": bool(result.get("uncertain"))}})
+    return result
+
+
+def attach_order_supplier_info(db, order_id: str, fulfillment: dict) -> None:
+    if not fulfillment or fulfillment.get("source") != "supplier":
+        return
+    db.orders.update_one(
+        {"order_id": str(order_id or "").strip().upper()},
+        {"$set": {
+            "external_supplier_delivery": True,
+            "supplier_id": fulfillment.get("supplier_id"),
+            "supplier_alias": fulfillment.get("supplier_alias"),
+            "supplier_product_id": fulfillment.get("supplier_product_id"),
+            "supplier_order_code": fulfillment.get("supplier_order_code"),
+            "local_delivered_quantity": fulfillment.get("local_quantity", 0),
+            "supplier_delivered_quantity": fulfillment.get("supplier_quantity"),
+            "supplier_delivered_at": utcnow(),
+        }},
+    )
+
+
 def register_routes(app: Flask) -> None:
+
+
+
     @app.get("/login")
     def login_form():
         if _is_logged_in():
@@ -1541,8 +2032,8 @@ def register_routes(app: Flask) -> None:
             set_setting(app.db, "maintenance_mode", False)
             flushed = flush_maintenance_notifications(app.db)
             flash(
-                f"Maintenance mode is now OFF. Delivered {flushed['processed']} queued product/stock/price notification event(s) "
-                f"({flushed['sent']} message(s) sent).",
+                f"Maintenance mode is now OFF. Queued {flushed['processed']} queued product/stock/price notification event(s) "
+                f"({flushed['sent']} message(s) queued).",
                 "success",
             )
         else:
@@ -1559,6 +2050,9 @@ def register_routes(app: Flask) -> None:
             "secret_settings.html",
             settings=settings,
             language_settings=language_settings,
+            backup_state=app.db.operational_control.find_one({"_id": "backup"}) or {},
+            emoji_choices=EMOJI_CHOICES,
+            premium_mapping=premium_mapping(settings),
         )
 
     @app.post("/secret-settings")
@@ -1580,6 +2074,17 @@ def register_routes(app: Flask) -> None:
         ]
         for key in plain_secret_form_keys:
             settings[key] = request.form.get(key, "").strip()
+        for key in GROUP_DEFAULTS:
+            if key in GROUP_BOOL_KEYS:
+                settings[key] = '1' if request.form.get(key) == '1' else '0'
+            else:
+                settings[key] = request.form.get(key, str(existing.get(key, GROUP_DEFAULTS[key]))).strip()
+        settings["required_channel_enabled"] = "1" if request.form.get("required_channel_enabled") == "1" else "0"
+        settings["required_channel_id"] = request.form.get("required_channel_id", "").strip()
+        settings["required_channel_join_url"] = request.form.get("required_channel_join_url", "").strip()
+        for key in OPERATIONS_DEFAULTS:
+            if key == "backup_encryption_key": continue
+            settings[key] = ("1" if request.form.get(key) == "1" else "0") if key in OPERATIONS_BOOL_KEYS else request.form.get(key, str(existing.get(key, OPERATIONS_DEFAULTS[key]))).strip()
         for key in SENSITIVE_SECRET_SETTING_KEYS:
             incoming = request.form.get(key, "").strip()
             # Blank means keep the existing saved secret. This prevents accidental
@@ -1589,6 +2094,24 @@ def register_routes(app: Flask) -> None:
         if new_password.strip():
             settings["admin_panel_password_hash"] = generate_password_hash(new_password.strip())
         validation_errors = []
+        try:
+            settings.update(premium_form_settings(request.form, existing))
+        except ValueError as error:
+            validation_errors.append(str(error))
+        try:
+            settings.update(validate_group_announcements(settings))
+        except ValueError as error:
+            validation_errors.append(str(error))
+        try:
+            settings.update(validate_operations_settings(settings))
+        except ValueError as error:
+            validation_errors.append(str(error))
+        try:
+            settings.update(validate_channel_settings(
+                settings["required_channel_enabled"], settings["required_channel_id"], settings["required_channel_join_url"],
+            ))
+        except ValueError as error:
+            validation_errors.append(str(error))
         for int_key, label, minimum in [
             ("payment_timeout_minutes", "Payment timeout minutes", 1),
             ("payment_reminder_minutes", "Payment reminder minutes", 1),
@@ -1618,10 +2141,12 @@ def register_routes(app: Flask) -> None:
         if validation_errors:
             for error in validation_errors:
                 flash(error, "error")
-            return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages}), 400
+            return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings)), 400
         if not settings.get("bot_token"):
             flash("Telegram bot token is required before the bot can start.", "error")
-            return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages}), 400
+            return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings)), 400
         if not settings.get("admin_panel_username") and not os.getenv("ADMIN_PANEL_USERNAME"):
             settings["admin_panel_username"] = "admin"
         set_secret_settings(app.db, settings)
@@ -2378,6 +2903,66 @@ def register_routes(app: Flask) -> None:
         flash(f"Payment request submitted for {money_usdt(due)}.", "success")
         return redirect(url_for("stock_manager_dashboard"))
 
+    @app.get("/supplier-apis")
+    @login_required
+    @owner_required
+    def supplier_apis():
+        rows = list(app.db.supplier_apis.find({}).sort("alias", 1))
+        recent_logs = list(app.db.supplier_api_logs.find({}).sort("created_at", -1).limit(30))
+        return render_template("supplier_apis.html", suppliers=rows, recent_logs=recent_logs)
+
+    @app.post("/supplier-apis/save")
+    @login_required
+    @owner_required
+    @csrf_required
+    def save_supplier_api():
+        supplier_id = str(request.form.get("supplier_id") or "").strip()
+        alias = str(request.form.get("alias") or "").strip()
+        base_url = str(request.form.get("base_url") or "").strip().rstrip("/")
+        api_key = str(request.form.get("api_key") or "").strip()
+        enabled = request.form.get("enabled") == "1"
+        if not alias or not base_url or not api_key:
+            flash("Alias, base URL, and API key are required.", "error")
+            return redirect(url_for("supplier_apis"))
+        fields = {
+            "alias": alias,
+            "legacy_query_auth": request.form.get('legacy_query_auth') == '1',
+            "name": alias,
+            "base_url": base_url,
+            "api_key": api_key,
+            "api_key_prefix": buyer_api_key_prefix(api_key),
+            "enabled": enabled,
+            "updated_at": utcnow(),
+        }
+        if supplier_id and ObjectId.is_valid(supplier_id):
+            app.db.vendor_catalog_snapshots.delete_one({"_id": supplier_id})
+            app.db.supplier_apis.update_one({"_id": ObjectId(supplier_id)}, {"$set": fields})
+            flash(f"Vendor API {alias} updated.", "success")
+        else:
+            fields["created_at"] = utcnow()
+            app.db.supplier_apis.insert_one(fields)
+            flash(f"Vendor API {alias} added.", "success")
+        log_admin_action(app.db, "supplier_api_saved", f"alias={alias} enabled={enabled}")
+        return redirect(url_for("supplier_apis"))
+
+    @app.post("/supplier-apis/<supplier_id>/delete")
+    @login_required
+    @owner_required
+    @csrf_required
+    def delete_supplier_api(supplier_id: str):
+        if not ObjectId.is_valid(supplier_id):
+            flash("Invalid vendor ID.", "error")
+            return redirect(url_for("supplier_apis"))
+        supplier = app.db.supplier_apis.find_one({"_id": ObjectId(supplier_id)})
+        if not supplier:
+            flash("Vendor API not found.", "error")
+            return redirect(url_for("supplier_apis"))
+        app.db.supplier_apis.delete_one({"_id": supplier["_id"]})
+        app.db.products.update_many({}, {"$pull": {"supplier_fallbacks": {"supplier_id": supplier_id}}})
+        log_admin_action(app.db, "supplier_api_deleted", f"alias={supplier.get('alias')}")
+        flash(f"Vendor API {supplier.get('alias')} deleted.", "success")
+        return redirect(url_for("supplier_apis"))
+
     @app.get("/products")
     @login_required
     def products():
@@ -2457,6 +3042,8 @@ def register_routes(app: Flask) -> None:
         product["total_stock"] = get_stock_count(app.db, product["name"])
         product["available_stock"] = get_available_stock_count(app.db, product["name"])
         product["pending_stock_quantity"] = get_pending_stock_quantity(app.db, product["name"])
+        product['external_supplier_stock'] = get_external_supplier_available_stock(app.db, product) if normalize_supplier_fallbacks(product) and not is_stock_manager_role() else 0
+        product['available_stock'] = max(0, product['total_stock'] + product['external_supplier_stock'] - product['pending_stock_quantity'])
         product["min_order_quantity"] = parse_positive_int(product.get("min_order_quantity"), 1, minimum=1)
         product["max_order_quantity"] = parse_positive_int(product.get("max_order_quantity"), 100, minimum=1)
         product["low_stock_threshold"] = parse_positive_int(product.get("low_stock_threshold"), get_runtime_int(app.db, "low_stock_alert_threshold", LOW_STOCK_ALERT_THRESHOLD), minimum=1)
@@ -2481,6 +3068,12 @@ def register_routes(app: Flask) -> None:
         product["description_es"] = str(product.get("description_es") or "")
         product["order_txt_instructions_en"] = str(product.get("order_txt_instructions_en") or "")
         product["order_txt_instructions_es"] = str(product.get("order_txt_instructions_es") or "")
+        product["api_product_id"] = normalize_api_product_id(product.get("api_product_id"))
+        product["api_public_product_id"] = public_api_product_id(product)
+        product["api_enabled"] = product.get("api_enabled", True)
+        product["external_supplier_fallback_enabled"] = bool(product.get("external_supplier_fallback_enabled"))
+        product["supplier_fallbacks"] = normalize_supplier_fallbacks(product)
+        product["supplier_fallback_map"] = {str(row.get("priority")): row for row in product["supplier_fallbacks"]}
         product["warranty_days"] = parse_positive_int(product.get("warranty_days"), 0, minimum=0)
         product["price_group_rows"] = build_price_group_rows(product)
         if product["max_order_quantity"] < product["min_order_quantity"]:
@@ -2511,6 +3104,7 @@ def register_routes(app: Flask) -> None:
             recent_rejected_stock_uploads=recent_rejected_stock_uploads,
             payment_currencies=get_active_payment_currencies(app.db),
             price_groups=PRICE_GROUPS,
+            supplier_apis=list(app.db.supplier_apis.find({}).sort("alias", 1)),
         )
 
     @app.post("/products/<path:name>/approved-stock")
@@ -2666,7 +3260,7 @@ def register_routes(app: Flask) -> None:
         inserted_product = app.db.products.find_one({"name": name_regex(name)}) or {"name": name, "price_inr": price_inr, "price_usdt": price_usdt, "enabled": True}
         notified = notify_users_new_product(app.db, inserted_product)
         log_admin_action(app.db, "product_added", f"{name} notified={notified}")
-        flash(f"Product {name} added. Notified {notified} user(s).", "success")
+        flash(f"Product {name} added. Notifications queued for {notified} user(s).", "success")
         return redirect(url_for("products"))
 
     @app.post("/products/<path:name>/rename")
@@ -2727,6 +3321,78 @@ def register_routes(app: Flask) -> None:
         )
         log_admin_action(app.db, "product_description_saved", f"{product['name']}: en={len(description_en)} chars es={len(description_es)} chars txt_en={len(order_txt_instructions_en)} chars txt_es={len(order_txt_instructions_es)} chars warranty_days={warranty_days}")
         flash(f"Product details saved for {product['name']}.", "success")
+        return redirect(url_for("product_manage", name=product["name"]))
+
+    @app.post("/products/<path:name>/api-settings")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_product_api_settings(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+        api_product_id = normalize_api_product_id(request.form.get("api_product_id"))
+        if not api_product_id:
+            api_product_id = normalize_api_product_id(product.get("name"))
+        if not BUYER_API_ID_RE.match(api_product_id):
+            flash("API product ID must be 3-80 characters and use only lowercase letters, numbers, hyphen, or underscore.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        duplicate = app.db.products.find_one({"api_product_id": api_product_id, "_id": {"$ne": product["_id"]}}, {"_id": 1, "name": 1})
+        if duplicate:
+            flash(f"API product ID is already used by {duplicate.get('name')}.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        api_enabled = request.form.get("api_enabled") == "1"
+        app.db.products.update_one(
+            {"_id": product["_id"]},
+            {"$set": {
+                "api_product_id": api_product_id,
+                "api_enabled": api_enabled,
+                "api_settings_updated_at": utcnow(),
+            }},
+        )
+        log_admin_action(app.db, "product_api_settings_updated", f"{product['name']}: id={api_product_id} enabled={api_enabled}")
+        flash(f"API settings saved for {product['name']}.", "success")
+        return redirect(url_for("product_manage", name=product["name"]))
+
+    @app.post("/products/<path:name>/supplier-fallbacks")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_product_supplier_fallbacks(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+        enabled = request.form.get("external_supplier_fallback_enabled") == "1"
+        fallbacks = []
+        for priority in range(1, 6):
+            supplier_id = str(request.form.get(f"supplier_{priority}_id") or "").strip()
+            supplier_product_id = str(request.form.get(f"supplier_{priority}_product_id") or "").strip()
+            if not supplier_id and not supplier_product_id:
+                continue
+            if not ObjectId.is_valid(supplier_id) or not app.db.supplier_apis.find_one({"_id": ObjectId(supplier_id)}, {"_id": 1}):
+                flash(f"Vendor {priority} is invalid.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+            if not supplier_product_id:
+                flash(f"Vendor {priority} product ID is required.", "error")
+                return redirect(url_for("product_manage", name=product["name"]))
+            fallbacks.append({
+                "priority": priority,
+                "supplier_id": supplier_id,
+                "supplier_product_id": supplier_product_id,
+                "enabled": True,
+            })
+        app.db.products.update_one(
+            {"_id": product["_id"]},
+            {"$set": {
+                "external_supplier_fallback_enabled": enabled and bool(fallbacks),
+                "supplier_fallbacks": fallbacks,
+                "supplier_fallbacks_updated_at": utcnow(),
+            }},
+        )
+        log_admin_action(app.db, "product_supplier_fallbacks_updated", f"{product['name']}: enabled={enabled} vendors={len(fallbacks)}")
+        flash(f"Supplier fallback settings saved for {product['name']}.", "success")
         return redirect(url_for("product_manage", name=product["name"]))
 
     @app.post("/products/<path:name>/limits")
@@ -2840,6 +3506,25 @@ def register_routes(app: Flask) -> None:
         )
         return redirect(url_for("product_manage", name=product["name"]))
 
+
+    @app.post("/products/<path:name>/premium-emoji")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_product_premium_emoji(name: str):
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if not product:
+            flash("Product not found.", "error")
+            return redirect(url_for("products"))
+        value = str(request.form.get("premium_emoji_id") or "").strip()
+        if value and not re.fullmatch(r"[1-9][0-9]{0,19}", value):
+            flash("Enter a numeric Telegram premium emoji ID, or leave blank for no logo.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        app.db.products.update_one({"_id": product["_id"]}, {"$set": {"premium_emoji_id": value, "updated_at": utcnow()}})
+        clear_admin_cache()
+        log_admin_action(app.db, "product_premium_emoji_saved", f"{product['name']}: {value or 'no logo'}")
+        flash("Product premium emoji saved.", "success")
+        return redirect(url_for("product_manage", name=product["name"]))
 
     @app.post("/products/<path:name>/stock-manager-rates")
     @login_required
@@ -2986,7 +3671,7 @@ def register_routes(app: Flask) -> None:
             f"{product['name']}: available={available} notified={notified}",
         )
         flash(
-            f"Fresh stock notification resent for {product['name']} to {notified} user(s). Available stock: {available}.",
+            f"Fresh stock notification queued for {product['name']} to {notified} user(s). Available stock: {available}.",
             "success",
         )
         return redirect(url_for("product_manage", name=product["name"]))
@@ -3088,43 +3773,14 @@ def register_routes(app: Flask) -> None:
                 product["name"],
                 len(fresh_blocks),
             )
-        replacement_summary = process_pending_replacement_reports(app.db, product["name"])
-        summary = process_pending_stock_orders(app.db, product["name"])
-        total = get_stock_count(app.db, product["name"])
-        available = get_available_stock_count(app.db, product["name"])
-        skipped = len(duplicate_blocks)
-        rejected_by_pool = len(approved_pool_rejected_blocks)
-        skipped_text = f" Skipped {skipped} duplicate item(s)." if skipped else ""
-        rejected_text = f" Rejected {rejected_by_pool} item(s) not in owner-approved stock pool." if rejected_by_pool else ""
-        should_notify_restock = (
-            not is_replacement_upload
-            and claim_restock_notification_slot(
-                app.db,
-                product["name"],
-                previous_available,
-                available,
-                cooldown_minutes=get_runtime_int(app.db, "restock_notification_cooldown_minutes", RESTOCK_NOTIFICATION_COOLDOWN_MINUTES),
-                back_in_stock_cooldown_minutes=get_runtime_int(app.db, "restock_back_in_stock_cooldown_minutes", RESTOCK_BACK_IN_STOCK_COOLDOWN_MINUTES),
-                long_cooldown_minutes=get_runtime_int(app.db, "restock_long_notification_cooldown_minutes", RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES),
-                big_restock_quantity=get_runtime_int(app.db, "restock_big_addition_threshold", get_runtime_int(app.db, "restock_high_stock_threshold", RESTOCK_BIG_ADDITION_THRESHOLD)),
-                added_stock_count=len(fresh_blocks),
-            )
-        )
-        notified = notify_users_new_stock(app.db, product["name"], available) if should_notify_restock else 0
-        pending_orders_sent = int(summary.get("orders_delivered", 0) or 0)
-        pending_units_sent = int(summary.get("items_delivered", 0) or 0)
-        log_action_name = "replacement_stock_added" if is_replacement_upload else "stock_added"
-        log_admin_action(
-            app.db,
-            log_action_name,
-            f"{product['name']}: added={len(fresh_blocks)} skipped={skipped} rejected_by_pool={rejected_by_pool} "
-            f"notified={notified} replacement_sent={replacement_summary['replacements_sent']} "
-            f"pending_orders_sent={pending_orders_sent} pending_units_sent={pending_units_sent}",
-        )
-        flash(
-            f"Added {len(fresh_blocks)} {'replacement ' if is_replacement_upload else ''}fresh stock item(s).{skipped_text}{rejected_text}",
-            "success",
-        )
+        enqueue_job(app.db, "stock_work", {
+            "product_name": product["name"], "replacements": True, "pending_orders": True,
+            "restock": not is_replacement_upload, "previous_available": previous_available,
+            "added_count": len(fresh_blocks),
+        }, priority=0)
+        log_admin_action(app.db, "replacement_stock_added" if is_replacement_upload else "stock_added",
+            f"{product['name']}: added={len(fresh_blocks)} duplicates={len(duplicate_blocks)} rejected={len(approved_pool_rejected_blocks)} delivery_queued=True")
+        flash(f"Added {len(fresh_blocks)} fresh stock item(s). Pending deliveries and notifications are queued in the background.", "success")
         return redirect(url_for("product_manage", name=product["name"]))
 
     @app.post("/products/<path:name>/stock/remove")
@@ -3302,6 +3958,36 @@ def register_routes(app: Flask) -> None:
         )
 
 
+    @app.post("/users/<int:user_id>/api")
+    @login_required
+    @owner_required
+    @csrf_required
+    def update_user_api(user_id: int):
+        user = app.db.users.find_one({"user_id": user_id})
+        if not user:
+            flash("User not found.", "error")
+            return redirect(url_for("users"))
+        action = str(request.form.get("api_action") or "").strip().lower()
+        user_label = telegram_user_display(app.db, user_id, user.get("username"))
+        if action == "disable":
+            app.db.users.update_one({"_id": user["_id"]}, {"$set": {"api_enabled": False, "api_disabled_at": utcnow()}})
+            log_admin_action(app.db, "user_api_disabled", f"user={user_label}")
+            flash(f"API access disabled for {user_label}.", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+        if action == "enable":
+            app.db.users.update_one({"_id": user["_id"]}, {"$set": {"api_enabled": True, "api_enabled_at": utcnow()}})
+            log_admin_action(app.db, "user_api_enabled", f"user={user_label}")
+            flash(f"API access enabled for {user_label}.", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+        if action in {"generate", "regenerate"}:
+            api_key = ensure_user_api_key_sync(app.db, user_id, user.get("username") or "")
+            log_admin_action(app.db, "user_api_key_regenerated", f"user={user_label}")
+            flash(f"API key for {user_label}: {api_key}", "success")
+            return redirect(url_for("user_detail", user_id=user_id))
+        flash("Choose a valid API action.", "error")
+        return redirect(url_for("user_detail", user_id=user_id))
+
+
 
     @app.post("/users/<int:user_id>/pricing")
     @login_required
@@ -3374,7 +4060,7 @@ def register_routes(app: Flask) -> None:
         flash("Unknown pricing action.", "error")
         return redirect(url_for("user_detail", user_id=user_id))
 
-    def create_admin_wallet_adjustment_log(user: dict, action: str, currency: str, amount: float, balance_after: float, note: str = "") -> str:
+    def create_admin_wallet_adjustment_log(user: dict, action: str, currency: str, amount: float, balance_after: float, note: str = "", wallet_reference: str = "") -> str:
         """Store manual admin wallet credits/removals in the same wallet history used by users and WebAdmin."""
         try:
             now = utcnow()
@@ -3413,6 +4099,7 @@ def register_routes(app: Flask) -> None:
                 "notes": str(note or "").strip(),
                 "admin_username": current_admin_username(),
                 "admin_role": current_admin_role(),
+                **({"wallet_event_id": event_id(user_id_value, normalized_currency, wallet_reference), "wallet_event_delta": amount if normalized_action == "add" else -amount} if wallet_reference else {}),
             }
             doc["wallet_adjusted_at"] = now
             if normalized_action == "add":
@@ -3455,18 +4142,19 @@ def register_routes(app: Flask) -> None:
             flash("Choose whether to add or remove wallet balance.", "error")
             return redirect(url_for("user_detail", user_id=user_id))
         delta = amount if action == "add" else -amount
-        updated = app.db.users.find_one_and_update(
-            {"user_id": user_id},
-            {"$inc": {field: delta}},
-            return_document=ReturnDocument.AFTER,
-        ) or {}
+        wallet_reference = "admin-" + uuid.uuid4().hex
+        updated = change_wallet(app.db, user_id, currency, delta, reference=wallet_reference,
+            source="admin_adjustment", conditions={field: {"$gte": amount}} if action == "remove" else None)
+        if not updated:
+            flash("Wallet changed during this request. Please try again.", "error")
+            return redirect(url_for("user_detail", user_id=user_id))
         new_balance = float(updated.get(field, 0) or 0)
         label = "INR" if currency == "inr" else "USDT"
         amount_text = money_inr(amount) if currency == "inr" else money_usdt(amount)
         balance_text = money_inr(new_balance) if currency == "inr" else money_usdt(new_balance)
         verb = "added to" if action == "add" else "removed from"
         user_label = telegram_user_display(app.db, user_id, updated.get("username") or user.get("username"))
-        wallet_log_ref = create_admin_wallet_adjustment_log(updated or user, action, currency, amount, new_balance, note)
+        wallet_log_ref = create_admin_wallet_adjustment_log(updated or user, action, currency, amount, new_balance, note, wallet_reference)
         log_details = f"user={user_label} {label} {action} {amount_text} balance_after={balance_text}"
         if wallet_log_ref:
             log_details += f" ref={wallet_log_ref}"
@@ -4110,7 +4798,7 @@ def register_routes(app: Flask) -> None:
             )
         app.db.orders.update_one(
             {"order_id": order["order_id"]},
-            {"$set": {"admin_stock_sent_at": utcnow(), "admin_stock_telegram_sent": bool(sent)}},
+            {"$set": {"admin_stock_sent_at": utcnow(), "admin_stock_telegram_sent": False, "telegram_delivery_status": "queued" if sent else "failed"}},
         )
         log_admin_action(
             app.db,
@@ -4118,7 +4806,7 @@ def register_routes(app: Flask) -> None:
             f"user={user_label} order={order['order_id']} product={product.get('name')} quantity={len(items)} source={order_source} sent={bool(sent)}",
         )
         if sent:
-            flash(f"Sent {len(items)} item(s) of {product.get('name')} to {user_label}. Order {order['order_id']} was added to their history.", "success")
+            flash(f"Queued {len(items)} item(s) of {product.get('name')} for {user_label}. Order {order['order_id']} was added to their history.", "success")
         else:
             flash(f"Order {order['order_id']} was added to {user_label}'s history, but Telegram delivery failed. Check bot token/user chat and use Resend from the order page.", "warning")
         return redirect(url_for("user_detail", user_id=user_id))
@@ -4332,7 +5020,7 @@ def register_routes(app: Flask) -> None:
             )
         app.db.orders.update_one(
             {"order_id": order["order_id"]},
-            {"$set": {"manual_replacement_sent_at": utcnow(), "manual_replacement_telegram_sent": bool(sent)}},
+            {"$set": {"manual_replacement_sent_at": utcnow(), "manual_replacement_telegram_sent": False, "telegram_delivery_status": "queued" if sent else "failed"}},
         )
         log_admin_action(
             app.db,
@@ -4381,7 +5069,7 @@ def register_routes(app: Flask) -> None:
         elif status.get("blocked"):
             mark_user_delivery_failure(app.db, user_id, source="direct_message", error=str(status.get("error") or ""))
         user_label = telegram_user_display(app.db, user_id, user.get("username"))
-        flash(f"Message sent to {user_label}." if ok else f"Message could not be sent to {user_label}. Check Secret Settings → Bot token and whether the user has started the bot.", "success" if ok else "error")
+        flash(f"Message queued for {user_label}." if ok else f"Message could not be sent to {user_label}. Check Secret Settings → Bot token and whether the user has started the bot.", "success" if ok else "error")
         return redirect(url_for("user_detail", user_id=user_id))
 
 
@@ -4645,7 +5333,7 @@ def register_routes(app: Flask) -> None:
         if not (next_url.startswith("/") and not next_url.startswith("//")):
             next_url = url_for("order_detail", order_id=order.get("order_id", order_id))
         if order.get("delivery_revoked"):
-            flash("This delivery was revoked. It cannot be resent to the user.", "error")
+            flash("This delivery was revoked. It cannot be queued for resending to the user.", "error")
             return redirect(next_url)
         if order.get("status") != "delivered" or not items:
             flash("Only delivered orders with saved items can be resent.", "error")
@@ -4654,7 +5342,7 @@ def register_routes(app: Flask) -> None:
         action_name = "replacement_resent" if order.get("is_replacement") else "order_resent"
         log_admin_action(app.db, action_name, f"{order.get('order_id')} to {order.get('user_id')}")
         label = "Replacement" if order.get("is_replacement") else "Order"
-        flash(f"{label} {order.get('order_id', order_id)} resent to the user.", "success")
+        flash(f"{label} {order.get('order_id', order_id)} queued for resending to the user.", "success")
         return redirect(next_url)
 
     @app.post("/orders/<order_id>/revoke-telegram")
@@ -5281,68 +5969,25 @@ def register_routes(app: Flask) -> None:
         if not message_en and not message_es:
             flash("Enter an English message, a Spanish message, or both.", "error")
             return redirect(url_for("broadcast_form"))
-
-        maintenance_on = get_setting(app.db, "maintenance_mode", False)
-        if maintenance_on:
-            users = get_admin_recipient_users(app.db)
-        else:
-            users = list(app.db.users.find({"blocked": {"$ne": True}}))
-
-        sent = 0
-        failed = 0
-        skipped = 0
-        sent_by_language = {"en": 0, "es": 0}
-        skipped_by_language = {"en": 0, "es": 0}
-        batch_id = new_notification_batch_id("broadcast")
-        seen: set[int] = set()
-        for user in users:
-            try:
-                user_id = int(user.get("user_id", 0) or 0)
-            except Exception:
-                user_id = 0
-            if not user_id or user_id in seen:
-                continue
-            seen.add(user_id)
-            lang = lang_from_user(user)
-            normalized_lang = normalize_lang(lang)
+        maintenance = get_setting(app.db, "maintenance_mode", False)
+        admins = get_admin_ids(app.db)
+        payload = {"texts": {}, "parse_mode": "Markdown", "admin_ids": admins, "maintenance_policy": "skip",
+            "notification": {"notification_type": "broadcast", "notification_batch_id": new_notification_batch_id("broadcast"),
+                "notification_title": "Broadcast", "notification_source": "web_admin_broadcast"}}
+        for lang in ("en", "es"):
             message = choose_admin_text_for_language(message_en, message_es, lang)
-            if not message:
-                skipped += 1
-                skipped_by_language[normalized_lang] = skipped_by_language.get(normalized_lang, 0) + 1
-                continue
-            prefix = admin_panel_message_prefix("broadcast", lang)
-            final_text = f"{prefix}\n\n{message}"
-            status = send_telegram_message_status(
-                user_id,
-                final_text,
-                parse_mode="Markdown",
-                notification_type="broadcast",
-                notification_batch_id=batch_id,
-                notification_title="Broadcast",
-                notification_source="web_admin_broadcast",
-            )
-            if status.get("ok"):
-                sent += 1
-                sent_by_language[normalized_lang] = sent_by_language.get(normalized_lang, 0) + 1
-            else:
-                failed += 1
-
-        if maintenance_on:
-            log_admin_action(
-                app.db,
-                "broadcast_sent_admins_maintenance",
-                f"sent={sent} failed={failed} skipped={skipped}; normal users not queued",
-            )
-            flash(f"Maintenance mode is ON. Broadcast sent only to admin/tester IDs and not queued for normal users. Sent: {sent}, failed: {failed}, skipped: {skipped}.", "info")
-            return redirect(url_for("broadcast_form"))
-
-        log_admin_action(
-            app.db,
-            "broadcast_sent",
-            f"sent={sent} failed={failed} skipped={skipped} en={sent_by_language.get('en', 0)} es={sent_by_language.get('es', 0)} skipped_en={skipped_by_language.get('en', 0)} skipped_es={skipped_by_language.get('es', 0)}",
-        )
-        flash(f"Broadcast complete. Sent: {sent}, failed: {failed}, skipped: {skipped}.", "success")
+            payload["texts"][lang] = f"{admin_panel_message_prefix('broadcast', lang)}\n\n{message}" if message else ""
+        if maintenance:
+            payload["recipient_ids"] = admins
+        count = bulk_count(app.db, payload)
+        enqueue_bulk(app.db, payload)
+        if not maintenance:
+            enqueue_notice(app.db, sys.modules[__name__], payload, 'broadcast')
+        log_admin_action(app.db, "broadcast_queued", f"audience={count} maintenance={maintenance}")
+        flash(f"Broadcast queued for {count} recipient(s). Check Delivery queue for progress." +
+              (" Maintenance is on: only admin/tester IDs are targeted." if maintenance else ""), "success")
         return redirect(url_for("broadcast_form"))
+
 
     @app.get("/recent-notifications")
     @login_required
@@ -5373,7 +6018,9 @@ def register_routes(app: Flask) -> None:
             "recent_notification_deleted",
             f"batch={batch_id} attempted={info.get('attempted', 0)} deleted={info.get('deleted', 0)} failed={info.get('failed', 0)} expired={info.get('expired', 0)}",
         )
-        if info.get("deleted"):
+        if info.get("queued"):
+            flash(f"Queued deletion of {info['queued']} Telegram message(s). Check Delivery queue for progress.", "success")
+        elif info.get("deleted"):
             flash(
                 f"Deleted {info.get('deleted', 0)} Telegram message(s). Failed: {info.get('failed', 0)}, expired: {info.get('expired', 0)}.",
                 "success" if not info.get("failed") and not info.get("expired") else "info",
@@ -5525,6 +6172,7 @@ def get_live_admin_state(db) -> dict:
         "products_out_of_stock": int(stock_alert.get("out_of_stock", 0) or 0),
         "product_stock_alerts": int(stock_alert.get("count", 0) or 0),
         "stock_upload_rejections": count_stock_upload_rejections(db),
+        "poll_results_unread": _count_safe(db, 'user_polls', {'results_unread': True}),
     }
     latest = {
         "order_created": _dt_or_number_signature(latest_order_created),
@@ -8093,6 +8741,7 @@ def send_replacement_from_stock(db, report: dict, sent_by: str = "owner", admin_
         filename,
         delivery_txt_content(order, replacement_items, lang=lang),
         caption=_replacement_delivery_caption(order, report, admin_note),
+        order_id=order["order_id"], sent_by="webadmin_replacement_report",
     )
     if not sent:
         _restore_replacement_stock(db, popped_by_product)
@@ -8155,7 +8804,17 @@ def send_replacement_from_stock(db, report: dict, sent_by: str = "owner", admin_
     return {"status": "sent", "items": replacement_items, "order_id": order["order_id"]}
 
 
-def process_pending_replacement_reports(db, product_name: str) -> dict[str, int]:
+def process_pending_stock_orders(db, product_name: str, **kwargs) -> dict:
+    enqueue_job(db, "stock_work", {"product_name": product_name, "replacements": False, "pending_orders": True}, priority=0)
+    return {"orders_delivered": 0, "items_delivered": 0, "locked_orders": 0, "blocked_by_stock": 0, "restored_items": 0, "queued": True}
+
+
+def process_pending_replacement_reports(db, product_name: str) -> dict:
+    enqueue_job(db, "stock_work", {"product_name": product_name, "replacements": True, "pending_orders": False}, priority=0)
+    return {"replacements_sent": 0, "queued": True}
+
+
+def _process_pending_replacement_reports_now(db, product_name: str) -> dict[str, int]:
     reports = list(db.replacement_reports.find({
         "$or": [{"product_name": name_regex(product_name)}, {"items.product_name": name_regex(product_name)}],
         "approved_at": {"$exists": True, "$ne": None},
@@ -9063,12 +9722,15 @@ def _active_preorder_backorder_quantity_map(db) -> dict[str, int]:
 def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_items: bool = False) -> list[dict]:
     project: dict[str, Any] = {
         "name": 1,
+        "api_enabled": 1,
+        "api_product_id": 1,
         "price_inr": 1,
         "price_usdt": 1,
         "price_group_prices": 1,
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
+        "premium_emoji_id": 1,
         "low_stock_threshold": 1,
         "min_order_quantity": 1,
         "max_order_quantity": 1,
@@ -9079,6 +9741,8 @@ def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_item
         "preorder_enabled": 1,
         "preorder_max_quantity": 1,
         "preorder_total_limit": 1,
+        "external_supplier_fallback_enabled": 1,
+        "supplier_fallbacks": 1,
         "stock_manager_earning_rate_usdt": 1,
         "stock_manager_owner_rate_usdt": 1,
         "actual_stock": _product_stock_count_expr(),
@@ -9158,6 +9822,13 @@ def get_products_with_availability(
     products = sort_products_for_shop(_products_with_stock_counts(db, query, include_stock_items=include_stock_items))
     pending_by_product = _pending_stock_quantity_map(db)
     active_backorder_by_product = _active_preorder_backorder_quantity_map(db)
+    vendor_ids = {row['supplier_id'] for product in products
+                  for row in normalize_supplier_fallbacks(product) if ObjectId.is_valid(row['supplier_id'])}
+    vendors = {str(row['_id']): row for row in db.supplier_apis.find(
+        {'_id': {'$in': [ObjectId(value) for value in vendor_ids]}, 'enabled': {'$ne': False}})} if vendor_ids else {}
+    for vendor in vendors.values():
+        _supplier_stock_future(vendor)
+    vendor_deadline = time.monotonic() + 3.5
     default_threshold = max(1, get_runtime_int(db, "low_stock_alert_threshold", LOW_STOCK_ALERT_THRESHOLD))
     for product in products:
         key = product_name_key(product.get("name"))
@@ -9173,7 +9844,14 @@ def get_products_with_availability(
         product["preorder_total_limit"] = get_product_preorder_total_limit(product)
         product["active_preorder_quantity"] = active_preorders
         product["preorder_capacity_remaining"] = get_preorder_capacity_remaining(product, active_preorders)
-        product["available_stock"] = max(0, actual - pending)
+        local_available = max(0, actual - pending)
+        product["available_stock"] = local_available
+        product["external_supplier_available"] = bool(normalize_supplier_fallbacks(product))
+        product["external_supplier_stock"] = 0
+        if product["external_supplier_available"]:
+            supplier_available = get_external_supplier_available_stock(db, product, _suppliers=vendors, _deadline=vendor_deadline)
+            product["external_supplier_stock"] = supplier_available
+            product["available_stock"] = max(0, actual + supplier_available - pending)
     return products
 
 
@@ -9248,7 +9926,7 @@ def pop_stock(db, product_name: str, quantity: int) -> list[str]:
     return items
 
 
-def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, reserve_pending: bool = True) -> list[str]:
+def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, reserve_pending: bool = True, partial: bool = False) -> list[str]:
     """Remove stock for an admin-to-user delivery.
 
     By default, paid pending-stock orders reserve the oldest stock items. User
@@ -9268,18 +9946,21 @@ def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, 
             return []
 
         stock = list(product.get("stock", []) or [])
-        required_size = pending_qty + quantity
+        take = min(quantity, max(0, len(stock) - pending_qty)) if partial else quantity
+        if take == 0:
+            return []
+        required_size = pending_qty + take
         if len(stock) < required_size:
             return []
 
         raw_items = stock[pending_qty:required_size]
         items = [str(item).strip() for item in raw_items if str(item).strip()]
-        if len(items) != quantity:
+        if len(items) != take:
             return []
         new_stock = stock[:pending_qty] + stock[required_size:]
         removed_hashes = [stock_item_hash(item) for item in items]
         update: dict[str, Any] = {"$set": {"stock": new_stock}}
-        if removed_hashes:
+        if removed_hashes and not partial:
             update["$pull"] = {"stock_added_by": {"item_hash": {"$in": removed_hashes}}}
 
         try:
@@ -9294,7 +9975,10 @@ def pop_available_stock_for_admin_send(db, product_name: str, quantity: int, *, 
             return []
 
         if result.modified_count:
-            record_stock_ledger_status(db, product_name, items, "popped", source="webadmin", note="Removed from live stock for admin send")
+            try:
+                record_stock_ledger_status(db, product_name, items, "popped", source="webadmin", note="Removed from live stock for admin send")
+            except Exception:
+                current_app.logger.exception("Stock popped; ledger entry needs review")
             return items
 
         # Stock changed between read and write. Retry with a fresh view.
@@ -9787,7 +10471,8 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
         send_pending_stock_notice(user_id, order, queued=True)
         send_admin_message(f"⏳ Paid order queued behind older pending stock orders.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}")
         return
-    items = pop_stock(db, product_name, quantity)
+    fulfillment = fulfill_product_items(db, product_name, quantity, order_id=ref_id)
+    items = fulfillment.get("items") or []
     if not items:
         mark_order_pending_stock(db, ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
@@ -9800,18 +10485,20 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
     was_pending_stock = order.get("status") == "pending_stock"
     updated = update_order_status(db, ref_id, "delivered", items, delivery_token=delivery_token)
     if not updated:
-        restore_popped_stock_items(
-            db,
-            product_name,
-            items,
-            source="webadmin",
-            note=f"Restored because paid order {ref_id} could not be finalized",
-        )
+        if fulfillment.get("source") == "local_stock":
+            restore_popped_stock_items(
+                db,
+                product_name,
+                items,
+                source="webadmin",
+                note=f"Restored because paid order {ref_id} could not be finalized",
+            )
         clear_order_delivery_lock(db, ref_id, delivery_token=delivery_token)
         send_admin_message(
             f"🚨 Stock delivery finalization failed after stock was removed, so the stock was restored.\nProduct: {product_name}\nQuantity: {quantity}\nUser: {user_id}\nRef: {ref_id}\nPlease retry delivery after checking this order."
         )
         return
+    attach_order_supplier_info(db, ref_id, fulfillment)
     if is_admin_created_order(order) and not was_pending_stock:
         send_admin_created_order_created_notice(user_id, order)
     send_order_items(user_id, order, items, from_pending=was_pending_stock)
@@ -9823,7 +10510,7 @@ def complete_order(db, user_id: int, ref_id: str) -> None:
         current_app.logger.exception("Could not drain pending-stock queue after delivering %s", ref_id)
 
 
-def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict[str, int]:
+def _process_pending_stock_orders_now(db, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict[str, int]:
     """Deliver paid pending-stock orders oldest-first and retry the queue safely."""
     delivered_orders = 0
     delivered_items = 0
@@ -9847,7 +10534,9 @@ def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max
         for order in pending_orders:
             order_id = order.get("order_id")
             qty = int(order.get("quantity", 1) or 1)
-            if get_stock_count(db, product_name) < qty:
+            local_stock = get_stock_count(db, product_name)
+            supplier_stock = get_external_supplier_available_stock(db, product_name) if local_stock < qty else 0
+            if local_stock + supplier_stock < qty:
                 blocked_by_stock += 1
                 stop_pass = True
                 break
@@ -9861,7 +10550,8 @@ def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max
                 break
             delivery_token = claimed.get("delivery_lock_token")
 
-            items = pop_stock(db, product_name, qty)
+            fulfillment = fulfill_product_items(db, product_name, qty, order_id=order_id)
+            items = fulfillment.get("items") or []
             if not items:
                 mark_order_pending_stock(db, order_id, delivery_token=delivery_token)
                 blocked_by_stock += 1
@@ -9870,13 +10560,14 @@ def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max
 
             updated = update_order_status(db, order_id, "delivered", items, delivery_token=delivery_token)
             if not updated:
-                restored_items += restore_popped_stock_items(
-                    db,
-                    product_name,
-                    items,
-                    source="webadmin",
-                    note=f"Restored because pending-stock order {order_id} could not be finalized",
-                )
+                if fulfillment.get("source") == "local_stock":
+                    restored_items += restore_popped_stock_items(
+                        db,
+                        product_name,
+                        items,
+                        source="webadmin",
+                        note=f"Restored because pending-stock order {order_id} could not be finalized",
+                    )
                 clear_order_delivery_lock(db, order_id, delivery_token=delivery_token)
                 send_admin_message(
                     f"🚨 Pending-stock finalization failed after stock was removed, so the stock was restored.\n"
@@ -9884,6 +10575,7 @@ def process_pending_stock_orders(db, product_name: str, *, limit: int = 100, max
                 )
                 stop_pass = True
                 break
+            attach_order_supplier_info(db, order_id, fulfillment)
 
             delivered_orders += 1
             pass_delivered += 1
@@ -9909,7 +10601,9 @@ def complete_wallet_load(db, user_id: int, pending: dict) -> None:
     ref_id = pending.get("ref_id", "")
     credited = db.pending_payments.find_one_and_update(
         {"ref_id": ref_id, "pay_type": "wallet", "$or": [{"wallet_credited_at": None}, {"wallet_credited_at": {"$exists": False}}]},
-        {"$set": {"wallet_credited_at": utcnow(), "status": "completed"}},
+        {"$set": {"wallet_credited_at": utcnow(), "status": "completed",
+            "wallet_event_id": event_id(user_id, pending.get("currency", "inr"), "topup-" + ref_id),
+            "wallet_event_delta": round(float(pending.get("load_amount", 0) or 0), 2)}},
         return_document=ReturnDocument.AFTER,
     )
     if not credited:
@@ -9919,10 +10613,7 @@ def complete_wallet_load(db, user_id: int, pending: dict) -> None:
         return
     currency = credited.get("currency", "inr")
     amount = float(credited.get("load_amount", 0.0) or 0.0)
-    if currency == "inr":
-        db.users.update_one({"user_id": user_id}, {"$inc": {"wallet_inr": round(amount, 2)}})
-    else:
-        db.users.update_one({"user_id": user_id}, {"$inc": {"wallet_usdt": round(amount, 2)}})
+    change_wallet(db, user_id, currency, round(amount, 2), reference="topup-" + ref_id, source="topup")
     delete_payment_message(db, ref_id)
     send_wallet_load_status(db, user_id, credited, already=False)
 
@@ -10136,25 +10827,12 @@ def record_sent_notification(
 
 
 def delete_telegram_message_status(chat_id: int, message_id: int) -> dict:
-    bot_token = get_bot_token()
-    if not bot_token or not chat_id or not message_id:
-        return {"ok": False, "error": "Missing bot token, chat ID, or message ID"}
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/deleteMessage",
-            json={"chat_id": int(chat_id), "message_id": int(message_id)},
-            timeout=10,
-        )
-        payload = resp.json() if resp.content else {}
-        if resp.ok and payload.get("ok"):
-            return {"ok": True}
-        return {
-            "ok": False,
-            "error": str(payload.get("description") or resp.text or "Telegram delete failed"),
-            "status_code": resp.status_code,
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+    if not chat_id or not message_id:
+        return {"ok": False, "error": "Missing chat ID or message ID", "status_code": 400}
+    result = _telegram_http_result("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
+    if not result.get("ok") and "message to delete not found" in str(result.get("error", "")).lower():
+        return {"ok": True}
+    return result
 
 
 
@@ -10278,45 +10956,17 @@ def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, 
 
 
 def delete_recent_notification_batch(db, batch_id: str, *, deleted_by: str = "") -> dict[str, int]:
-    now = utcnow()
-    cutoff = now - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
-    query = {
-        "batch_id": str(batch_id or ""),
-        "$or": [
-            {"target_kind": "customer"},
-            {"target_kind": {"$exists": False}},
-            {"target_kind": None},
-            {"target_kind": ""},
-        ],
-        "deleted": {"$ne": True},
-        "sent_at": {"$gte": cutoff},
-    }
-    rows = list(db.sent_notifications.find(query, {"chat_id": 1, "message_id": 1, "expires_at": 1}))
-    result = {"attempted": 0, "deleted": 0, "failed": 0, "expired": 0}
-    for row in rows:
-        result["attempted"] += 1
-        expires_at = _parse_utc_dt(row.get("expires_at"))
-        if expires_at and expires_at <= now:
-            result["expired"] += 1
-            db.sent_notifications.update_one(
-                {"_id": row.get("_id")},
-                {"$set": {"deletion_error": "Expired outside Telegram's 48-hour deletion window", "delete_attempted_at": now, "updated_at": now}},
-            )
-            continue
-        status = delete_telegram_message_status(int(row.get("chat_id") or 0), int(row.get("message_id") or 0))
-        if status.get("ok"):
-            result["deleted"] += 1
-            db.sent_notifications.update_one(
-                {"_id": row.get("_id")},
-                {"$set": {"deleted": True, "deleted_at": utcnow(), "deleted_by": str(deleted_by or "").strip(), "deletion_error": "", "updated_at": utcnow()}},
-            )
-        else:
-            result["failed"] += 1
-            db.sent_notifications.update_one(
-                {"_id": row.get("_id")},
-                {"$set": {"delete_attempted_at": utcnow(), "deletion_error": str(status.get("error") or "Telegram delete failed")[:500], "updated_at": utcnow()}},
-            )
-    return result
+    cutoff = utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    query = {"batch_id": str(batch_id), "deleted": {"$ne": True}, "sent_at": {"$gte": cutoff},
+             "$or": [{"target_kind": "customer"}, {"target_kind": {"$exists": False}}, {"target_kind": None}, {"target_kind": ""}]}
+    queued = 0
+    for row in db.sent_notifications.find(query, {"chat_id": 1, "message_id": 1}):
+        enqueue_job(db, "delete", {"chat_id": row["chat_id"], "message_id": row["message_id"],
+                    "notification_record_id": row["_id"], "deleted_by": deleted_by},
+                    job_id=f"delete:{row['_id']}", priority=25)
+        db.sent_notifications.update_one({"_id": row["_id"]}, {"$set": {"deletion_pending": True}})
+        queued += 1
+    return {"attempted": queued, "queued": queued, "deleted": 0, "failed": 0, "expired": 0}
 
 
 def notify_low_stock_if_needed(db, product_name: str) -> None:
@@ -10389,6 +11039,8 @@ def flush_maintenance_notifications(db) -> dict[str, int]:
 
 
 def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") -> None:
+    if has_request_context():
+        return
     """Mark a user reachable after a successful Telegram send.
 
     Only auto delivery blocks are cleared; explicit admin blocks remain blocked.
@@ -10548,76 +11200,38 @@ def _save_product_notification(db, user_id: int, product_name: str, message_id: 
 
 
 def notify_active_users(
-    db,
-    text,
-    *,
-    product_name: str,
-    parse_mode: str = "HTML",
-    admin_only: bool = False,
-    include_admins: bool = True,
-    cleanup_previous_stock_notification: bool = False,
-    notification_type: str = "message",
-    notification_title: str = "",
+    db, text, *, product_name: str, parse_mode: str = "HTML", admin_only: bool = False,
+    include_admins: bool = True, cleanup_previous_stock_notification: bool = False,
+    notification_type: str = "message", notification_title: str = "",
 ) -> int:
-    sent = 0
-    admin_ids = set(get_admin_ids(db))
-    product = db.products.find_one({"name": name_regex(product_name)}, {"_id": 1, "name": 1})
-    product_id = product.get("_id") if product else None
-    clean_product_name = str((product or {}).get("name") or product_name or "").strip()
-    notification_batch_id = new_notification_batch_id(notification_type)
+    product = db.products.find_one({"name": name_regex(product_name)}, {"_id": 1, "name": 1}) or {}
+    clean_name = str(product.get("name") or product_name)
+    admin_ids = get_admin_ids(db)
+    payload = {
+        "texts": {lang: text(lang) if callable(text) else str(text) for lang in ("en", "es")},
+        "markups": {lang: product_notify_markup(clean_name, lang, product.get("_id")) for lang in ("en", "es")},
+        "parse_mode": parse_mode, "product_name": clean_name,
+        "cleanup_previous_stock": cleanup_previous_stock_notification,
+        "maintenance_policy": "continue" if admin_only else "pause", "admin_ids": admin_ids,
+        "notification": {"notification_type": notification_type,
+            "notification_batch_id": new_notification_batch_id(notification_type),
+            "notification_title": notification_title or notification_type_label(notification_type),
+            "notification_source": "web_admin_product_notice", "notification_product_name": clean_name,
+            "notification_target_kind": "customer"},
+    }
     if admin_only:
-        users = get_admin_recipient_users(db)
-    else:
-        users = db.users.find({"blocked": {"$ne": True}}, {"user_id": 1, "language": 1, "language_code": 1})
-    seen: set[int] = set()
-    for user in users:
-        try:
-            user_id = int(user.get("user_id", 0) or 0)
-        except Exception:
-            user_id = 0
-        if not user_id or user_id in seen:
-            continue
-        seen.add(user_id)
-        is_admin_target = user_id in admin_ids
-        if admin_only and not is_admin_target:
-            continue
-        if not include_admins and is_admin_target:
-            continue
-        lang = lang_from_user(user)
-        body = text(lang) if callable(text) else str(text)
-        markup = product_notify_markup(clean_product_name or product_name, lang, product_id)
-        previous_message_id = None
-        if cleanup_previous_stock_notification:
-            try:
-                previous = _last_product_notification(db, user_id, clean_product_name or product_name, "new_stock")
-                previous_message_id = int((previous or {}).get("message_id") or 0) or None
-            except Exception:
-                previous_message_id = None
-        status = send_telegram_message_status(
-            user_id,
-            body,
-            parse_mode=parse_mode,
-            reply_markup=markup,
-            notification_type=notification_type,
-            notification_batch_id=notification_batch_id,
-            notification_title=notification_title or notification_type_label(notification_type),
-            notification_source="web_admin_product_notice",
-            notification_product_name=clean_product_name or product_name,
-            notification_target_kind="customer",
-        )
-        result = status.get("result") if status.get("ok") else False
-        new_message_id = _telegram_result_message_id(result)
-        if result:
-            sent += 1
-            mark_user_delivery_success(db, user_id, source="stock_notification")
-            if cleanup_previous_stock_notification:
-                if previous_message_id and previous_message_id != new_message_id:
-                    delete_telegram_message(user_id, previous_message_id)
-                if new_message_id:
-                    _save_product_notification(db, user_id, clean_product_name or product_name, new_message_id, "new_stock")
-        elif status.get("blocked"):
-            mark_user_delivery_failure(db, user_id, source="stock_notification", error=str(status.get("error") or ""))
-    return sent
+        payload["recipient_ids"] = admin_ids
+    elif not include_admins:
+        payload["exclude_ids"] = admin_ids
+    count = bulk_count(db, payload)
+    if not admin_only:
+        category = {'new_stock': 'stock', 'new_product': 'products', 'price_drop': 'prices'}.get(notification_type)
+        if category:
+            enqueue_notice(db, sys.modules[__name__], payload, category)
+    if count:
+        enqueue_bulk(db, payload)
+    return count
+
 
 
 def notify_users_new_product(db, product: dict, *, include_admins: bool = True) -> int:
@@ -10639,7 +11253,7 @@ def notify_users_new_product(db, product: dict, *, include_admins: bool = True) 
     escaped_lines = "\n".join(html.escape(line, quote=False) for line in lines)
 
     def text_for(lang: str) -> str:
-        return tr(lang, "new_product_added", product=html.escape(product_name, quote=False), lines=escaped_lines)
+        return tr(lang, "new_product_added", product=html.escape(product_emoji_label(product, product_name), quote=False), lines=escaped_lines)
 
     if get_setting(db, "maintenance_mode", False):
         queue_maintenance_notification(
@@ -10665,7 +11279,7 @@ def notify_users_new_stock(db, product_name: str, available_stock: int | None = 
     clean_name = str(product.get("name") or product_name)
 
     def text_for(lang: str) -> str:
-        return tr(lang, "fresh_stock_added", product=html.escape(clean_name, quote=False), stock=available_stock)
+        return tr(lang, "fresh_stock_added", product=html.escape(product_emoji_label(product, clean_name), quote=False), stock=available_stock)
 
     if get_setting(db, "maintenance_mode", False):
         queue_maintenance_notification(db, "new_stock", clean_name, {"available_stock": available_stock})
@@ -10694,7 +11308,7 @@ def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, ol
     escaped_lines = "\n".join(f"💰 {html.escape(line, quote=False)}" for line in lines)
 
     def text_for(lang: str) -> str:
-        return tr(lang, "price_dropped", product=html.escape(product_name, quote=False), lines=escaped_lines)
+        return tr(lang, "price_dropped", product=html.escape(product_emoji_label(product, product_name), quote=False), lines=escaped_lines)
 
     if get_setting(db, "maintenance_mode", False):
         queue_maintenance_notification(
@@ -10707,59 +11321,61 @@ def notify_users_price_drop(db, product: dict, *, old_inr=None, new_inr=None, ol
     return notify_active_users(db, text_for, product_name=product_name, include_admins=include_admins, notification_type="price_drop", notification_title=f"Price drop: {product_name}")
 
 def send_telegram_message_status(
-    chat_id: int,
-    text: str,
-    parse_mode: str | None = None,
-    reply_markup: dict | None = None,
-    *,
-    notification_type: str | None = "message",
-    notification_batch_id: str | None = None,
-    notification_title: str = "",
-    notification_source: str = "web_admin",
-    notification_product_name: str = "",
-    notification_target_kind: str = "customer",
+    chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None, *,
+    notification_type: str | None = "message", notification_batch_id: str | None = None,
+    notification_title: str = "", notification_source: str = "web_admin",
+    notification_product_name: str = "", notification_target_kind: str = "customer",
 ) -> dict:
-    bot_token = get_bot_token()
-    if not bot_token or not chat_id:
-        return {"ok": False, "blocked": False, "error": "Missing bot token or chat ID"}
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    if not chat_id:
+        return {"ok": False, "blocked": False, "error": "Missing chat ID"}
+    payload = {"chat_id": int(chat_id), "text": text, "parse_mode": parse_mode, "reply_markup": reply_markup,
+        "notification": {"notification_type": notification_type,
+            "notification_batch_id": notification_batch_id or new_notification_batch_id(notification_type or "message"),
+            "notification_title": notification_title, "notification_source": notification_source,
+            "notification_product_name": notification_product_name, "notification_target_kind": notification_target_kind}}
+    ack = enqueue_job(current_app.db, "text", payload)
+    return {"ok": True, "queued": True, "result": ack, "blocked": False}
+
+
+def _send_telegram_message_now(chat_id, text, parse_mode=None, reply_markup=None, **notification):
+    token = get_bot_token()
+    if not token:
+        return {"ok": False, "error": "Bot token is not configured"}
+    payload = {"chat_id": chat_id if str(chat_id).startswith('@') else int(chat_id), "text": text}
+    if parse_mode: payload["parse_mode"] = parse_mode
+    if reply_markup: payload["reply_markup"] = reply_markup
+    return _telegram_http_result("sendMessage", payload)
+
+
+def _telegram_http_result(method, payload, files=None):
+    token = get_bot_token()
+    if not token:
+        return {"ok": False, "error": "Bot token is not configured"}
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=15)
-        payload_resp = resp.json() if resp.content else {}
-        if resp.ok and payload_resp.get("ok"):
-            result = payload_resp.get("result") or {"ok": True}
-            try:
-                db_conn = current_app.db if has_request_context() else None
-                if db_conn is not None and notification_type:
-                    record_sent_notification(
-                        db_conn,
-                        chat_id=chat_id,
-                        result=result,
-                        text=text,
-                        notification_type=notification_type or "message",
-                        batch_id=notification_batch_id,
-                        title=notification_title or notification_type_label(notification_type),
-                        source=notification_source,
-                        product_name=notification_product_name,
-                        parse_mode=parse_mode,
-                        target_kind=notification_target_kind,
-                    )
-            except Exception:
-                pass
-            return {"ok": True, "result": result, "blocked": False}
-        description = str(payload_resp.get("description") or resp.text or "Telegram delivery failed")
-        return {
-            "ok": False,
-            "blocked": _is_telegram_delivery_block_response(resp.status_code, description),
-            "error": description,
-            "status_code": resp.status_code,
-        }
+        rendered, changed = transform_payload(method, payload, get_secret_settings())
+        positions = file_positions(files)
+        if files and positions is None:
+            rendered, changed = plain_product_payload(method, payload), False
+        def request_args(data):
+            if not files:
+                return {'json': data}
+            return {'data': multipart_data(data), 'files': files}
+        kwargs = request_args(rendered)
+        response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **kwargs)
+        body = response.json() if response.content else {}
+        if changed and response.status_code == 400 and emoji_rejected(body.get('description', '')):
+            rewind_files(positions or [])
+            response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **request_args(plain_product_payload(method, payload)))
+            body = response.json() if response.content else {}
+        if response.ok and body.get("ok"):
+            return {"ok": True, "result": body.get("result") or {}, "blocked": False}
+        error = str(body.get("description") or "Telegram rejected the request")
+        return {"ok": False, "error": error, "status_code": response.status_code,
+                "retry_after_seconds": (body.get("parameters") or {}).get("retry_after"),
+                "blocked": _is_telegram_delivery_block_response(response.status_code, error)}
     except Exception as exc:
-        return {"ok": False, "blocked": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc).replace(token, "<redacted>")[:500], "error_type": type(exc).__name__}
+
 
 
 def send_telegram_message_result(chat_id: int, text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict | bool:
@@ -10771,54 +11387,25 @@ def send_telegram_message(chat_id: int, text: str, parse_mode: str | None = None
     return bool(send_telegram_message_result(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup))
 
 
-def delete_telegram_message(chat_id: int, message_id: int) -> bool:
-    bot_token = get_bot_token()
-    if not bot_token or not chat_id or not message_id:
-        return False
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/deleteMessage",
-            json={"chat_id": int(chat_id), "message_id": int(message_id)},
-            timeout=10,
-        )
-        return bool(resp.ok and (resp.json() if resp.content else {}).get("ok"))
-    except Exception:
-        return False
 
 
-def send_telegram_document(chat_id: int, filename: str, content: str, caption: str | None = None) -> dict | bool:
-    bot_token = get_bot_token()
-    if not bot_token or not chat_id:
+def send_telegram_document(chat_id: int, filename: str, content: str, caption: str | None = None,
+                           *, order_id: str = "", sent_by: str = "webadmin", resent: bool = False) -> dict | bool:
+    if not chat_id:
         return False
-    data: dict[str, Any] = {"chat_id": chat_id}
-    if caption:
-        data["caption"] = caption
+    payload = {"chat_id": int(chat_id), "filename": filename, "content": content, "caption": caption}
+    if order_id:
+        payload["delivery_meta"] = {"order_id": order_id, "sent_by": sent_by, "resent": resent}
+        current_app.db.orders.update_one({"order_id": order_id}, {"$set": {"telegram_delivery_status": "queued"}})
+    return enqueue_job(current_app.db, "document", payload)
+
+
+def _send_telegram_document_now(chat_id, filename, content, caption=None):
+    data = {"chat_id": int(chat_id)}
+    if caption: data["caption"] = caption
     files = {"document": (filename, content.encode("utf-8"), "text/plain")}
-    try:
-        resp = requests.post(f"https://api.telegram.org/bot{bot_token}/sendDocument", data=data, files=files, timeout=30)
-        payload = resp.json() if resp.content else {}
-        if resp.ok and payload.get("ok"):
-            result = payload.get("result") or {"ok": True}
-            try:
-                db_conn = current_app.db if has_request_context() else None
-                if db_conn is not None:
-                    record_sent_notification(
-                        db_conn,
-                        chat_id=chat_id,
-                        result=result,
-                        text=caption or filename,
-                        notification_type="document",
-                        title=f"Document: {filename}",
-                        source="web_admin_document",
-                    )
-            except Exception:
-                pass
-            return result
-        current_app.logger.warning("Telegram sendDocument failed for chat=%s filename=%s: %s", chat_id, filename, payload or resp.text)
-        return False
-    except Exception:
-        current_app.logger.exception("Telegram sendDocument exception for chat=%s filename=%s", chat_id, filename)
-        return False
+    return _telegram_http_result("sendDocument", data, files=files)
+
 
 
 def _telegram_result_message_id(result: Any) -> int | None:
@@ -10842,6 +11429,16 @@ def record_order_delivery_message(
 ) -> None:
     """Save Telegram delivery message IDs so the panel can later revoke/delete them."""
     clean_order_id = str(order_id or "").strip().upper()
+    if isinstance(message_result, dict) and message_result.get("queued") and message_result.get("job_id"):
+        db.delivery_jobs.update_one({"job_id": message_result["job_id"]}, {"$set": {
+            "payload.delivery_meta": {"order_id": clean_order_id, "sent_by": sent_by, "resent": bool(resent)},
+        }})
+        job = db.delivery_jobs.find_one({"job_id": message_result["job_id"]}) or {}
+        if job.get("acknowledged_at"):
+            message_result = job.get("telegram_result") or {}
+        else:
+            db.orders.update_one({"order_id": clean_order_id}, {"$set": {"telegram_delivery_status": "queued"}})
+            return
     message_id = _telegram_result_message_id(message_result)
     if not clean_order_id or not message_id:
         return
@@ -10933,19 +11530,11 @@ def send_admin_message(text: str, parse_mode: str | None = None) -> None:
 
 
 def delete_payment_message(db, ref_id: str) -> None:
-    pending = db.pending_payments.find_one({"ref_id": ref_id})
-    bot_token = get_bot_token(db)
-    if not pending or not bot_token:
-        return
-    chat_id = pending.get("payment_chat_id")
-    msg_id = pending.get("payment_msg_id")
-    if not chat_id or not msg_id:
-        return
-    try:
-        requests.post(f"https://api.telegram.org/bot{bot_token}/deleteMessage", json={"chat_id": chat_id, "message_id": msg_id}, timeout=10)
-    except Exception:
-        pass
-    db.pending_payments.update_one({"ref_id": ref_id}, {"$unset": {"payment_chat_id": "", "payment_msg_id": ""}})
+    pending = db.pending_payments.find_one({"ref_id": ref_id}) or {}
+    if pending.get("payment_chat_id") and pending.get("payment_msg_id"):
+        enqueue_job(db, "delete", {"chat_id": pending["payment_chat_id"], "message_id": pending["payment_msg_id"]}, priority=25)
+        db.pending_payments.update_one({"ref_id": ref_id}, {"$unset": {"payment_chat_id": "", "payment_msg_id": ""}})
+
 
 
 def support_markup(lang: str = "en") -> dict | None:
@@ -11047,56 +11636,31 @@ def paid_user_order_refund_eligible(order: dict | None) -> bool:
 
 
 def send_cancelled_order_refund_choice(user_id: int, order: dict, note: str = "") -> bool:
+    lang = get_user_language_sync(current_app.db, user_id)
     order_id = str(order.get("order_id") or "").strip().upper()
-    amount_text = order_refund_amount_text(order)
-    product = str(order.get("product_name") or "Product")
-    quantity = int(order.get("quantity", 0) or 0)
     buttons = []
     if order.get("refund_wallet_enabled"):
-        buttons.append([{"text": "💰 Add to wallet", "callback_data": f"refund_wallet:{order_id}"}])
+        buttons.append([{"text": tr(lang, "refund_add_to_wallet"), "callback_data": f"refund_wallet:{order_id}"}])
     if order.get("refund_external_enabled"):
-        buttons.append([{"text": "🔁 Request refund", "callback_data": f"refund_request:{order_id}"}])
-    if not buttons:
-        return send_cancelled_order_notice(user_id, order, note)
-    text = (
-        "❌ Your paid order was cancelled by admin.\n\n"
-        f"🧾 Order ID: {order_id}\n"
-        f"📦 Product: {product} x{quantity}\n"
-        f"💰 Amount: {amount_text}\n\n"
-    )
-    clean_note = str(note or "").strip()
-    if clean_note:
-        text += f"📝 Admin note: {clean_note[:500]}\n\n"
-    text += "Choose one of the available options below:"
-    reply_markup = {"inline_keyboard": buttons}
-    return send_telegram_message(int(user_id), text, reply_markup=reply_markup)
+        buttons.append([{"text": tr(lang, "refund_request_external"), "callback_data": f"refund_request:{order_id}"}])
+    if not buttons: return send_cancelled_order_notice(user_id, order, note)
+    text = tr(lang, "admin_cancelled_paid", order_id=order_id, product=order.get("product_name", "—"), quantity=int(order.get("quantity", 0) or 0), amount=order_refund_amount_text(order))
+    if note.strip(): text += "\n\n" + tr(lang, "admin_note_notice", note=note.strip()[:500])
+    text += "\n\n" + tr(lang, "choose_refund_option")
+    return send_telegram_message(int(user_id), text, reply_markup={"inline_keyboard": buttons})
+
 
 def send_cancelled_order_notice(user_id: int, order: dict, note: str = "") -> bool:
-    order_id = str(order.get("order_id") or "").strip().upper()
-    product = str(order.get("product_name") or "Product")
-    quantity = int(order.get("quantity", 0) or 0)
-    text = (
-        "❌ Your pending-stock order was cancelled by admin.\n\n"
-        f"🧾 Order ID: {order_id}\n"
-        f"📦 Product: {product} x{quantity}"
-    )
-    clean_note = str(note or "").strip()
-    if clean_note:
-        text += f"\n\n📝 Admin note: {clean_note[:500]}"
-    text += "\n\nContact support if you need help."
-    return send_telegram_message(int(user_id), text)
+    lang = get_user_language_sync(current_app.db, user_id)
+    text = tr(lang, "admin_cancelled_pending", order_id=order.get("order_id", "—"), product=order.get("product_name", "—"), quantity=int(order.get("quantity", 0) or 0))
+    if note.strip(): text += "\n\n" + tr(lang, "admin_note_notice", note=note.strip()[:500])
+    return send_telegram_message(int(user_id), text + "\n\n" + tr(lang, "contact_support_notice"))
 
 
 def send_refund_paid_notice(user_id: int, order: dict, note: str = "") -> bool:
-    order_id = str(order.get("order_id") or "").strip().upper()
-    text = (
-        "✅ Your refund was marked as paid by admin.\n\n"
-        f"🧾 Order ID: {order_id}\n"
-        f"💰 Amount: {order_refund_amount_text(order)}"
-    )
-    clean_note = str(note or "").strip()
-    if clean_note:
-        text += f"\n\n📝 Note: {clean_note[:500]}"
+    lang = get_user_language_sync(current_app.db, user_id)
+    text = tr(lang, "refund_paid_notice", order_id=order.get("order_id", "—"), amount=order_refund_amount_text(order))
+    if note.strip(): text += "\n\n" + tr(lang, "admin_note_notice", note=note.strip()[:500])
     return send_telegram_message(int(user_id), text)
 
 
@@ -11264,6 +11828,7 @@ def send_order_items(user_id: int, order: dict, items: list[str], from_pending: 
         filename,
         delivery_txt_content(order, items, lang=lang),
         caption=delivery_caption(order, from_pending=from_pending, resent_by_admin=resent_by_admin, lang=lang),
+        order_id=order["order_id"], sent_by="webadmin_resend" if resent_by_admin else "webadmin_delivery", resent=resent_by_admin,
     )
     if sent:
         record_order_delivery_message(
