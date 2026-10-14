@@ -64,7 +64,10 @@ async def stop_background_services(application):
     stop_lookups = getattr(db, 'stop_supplier_lookups', None)
     if stop_lookups:
         await stop_lookups()
-    tasks = [application.bot_data.get(key) for key in ("api_receipt_task", "poll_task")]
+    stop_runtime = getattr(db, 'stop_runtime_cache_refresh', None)
+    if stop_runtime:
+        await stop_runtime()
+    tasks = [application.bot_data.get(key) for key in ("api_receipt_task", "poll_task", "channel_membership_refresh_task")]
     for task in tasks:
         if task:
             task.cancel()
