@@ -119,3 +119,39 @@ EXTRA_TEXT['es']['stock_checkout_active'] = 'Ya tienes un pago pendiente para es
 
 EXTRA_TEXT['en']['api_failed_attempt_hint'] = 'An <code>insufficient_balance</code> response is a final failed attempt. It includes <code>orderCode</code> for later lookup. After topping up, use a NEW <code>client_order_id</code>. Repeating the old ID returns its saved failure; it never places the order automatically.'
 EXTRA_TEXT['es']['api_failed_attempt_hint'] = 'Una respuesta <code>insufficient_balance</code> es un intento fallido definitivo e incluye <code>orderCode</code> para consultarlo después. Tras recargar, usa un <code>client_order_id</code> NUEVO. Repetir el ID anterior devuelve el fallo guardado y nunca realiza el pedido automáticamente.'
+
+EXTRA_TEXT['en'].update({
+    "api_docs_button": "View API Documentation",
+    "api_docs_back": "🔙 Back to API",
+    "api_docs_title": "📋 <b>Developer API Documentation</b>",
+    "api_docs_intro": "Sell our products through your own website or bot. You set your selling price on your side. The product price shown in our API catalog is deducted from your main USDT wallet.",
+    "api_docs_endpoint_placeholder": "Replace YOUR_SHOP_DOMAIN with the shop endpoint URL. Contact support if it has not been configured yet.",
+    "api_docs_auth_title": "🔑 <b>Authentication</b>",
+    "api_docs_auth_help": "Use your API key as a Bearer token. Keep it private. Regenerating a key disables the previous key.",
+    "api_docs_products_title": "📦 <b>Products Catalog</b>",
+    "api_docs_balance_title": "💰 <b>Wallet Balance</b>",
+    "api_docs_order_title": "🛒 <b>Create Order</b>",
+    "api_docs_json_title": "<b>Order JSON</b> · Content-Type: application/json",
+    "api_docs_order_note": "Use the catalog’s <code>product_id</code> and a positive whole-number quantity within the product limits. <code>client_order_id</code> must be unique for each new purchase (up to 120 characters). Retrying the same purchase with the same ID returns its existing result without charging again.",
+    "api_docs_lookup_title": "🔎 <b>Check Order</b>",
+    "api_docs_lookup_note": "Replace ORDER_ID with the <code>orderCode</code> returned by your purchase request.",
+    "api_docs_uncertain_note": "If a request times out or returns processing/review, check the order or retry with the SAME <code>client_order_id</code>. Do not use a new ID while the outcome is uncertain. For HTTP 429, wait for the Retry-After interval."
+})
+
+EXTRA_TEXT['es'].update({
+    "api_docs_button": "Ver documentación de la API",
+    "api_docs_back": "🔙 Volver a la API",
+    "api_docs_title": "📋 <b>Documentación de la API para desarrolladores</b>",
+    "api_docs_intro": "Vende nuestros productos desde tu propio sitio web o bot. Tú estableces el precio de venta. El precio del producto mostrado en nuestro catálogo API se descuenta de tu billetera USDT principal.",
+    "api_docs_endpoint_placeholder": "Sustituye YOUR_SHOP_DOMAIN por la URL del endpoint de la tienda. Contacta con soporte si aún no está configurada.",
+    "api_docs_auth_title": "🔑 <b>Autenticación</b>",
+    "api_docs_auth_help": "Usa tu clave API como token Bearer. Mantenla privada. Regenerar la clave desactiva la anterior.",
+    "api_docs_products_title": "📦 <b>Catálogo de productos</b>",
+    "api_docs_balance_title": "💰 <b>Saldo de la billetera</b>",
+    "api_docs_order_title": "🛒 <b>Crear pedido</b>",
+    "api_docs_json_title": "<b>JSON del pedido</b> · Content-Type: application/json",
+    "api_docs_order_note": "Usa el <code>product_id</code> del catálogo y una cantidad entera positiva dentro de los límites del producto. <code>client_order_id</code> debe ser único para cada compra nueva (hasta 120 caracteres). Reintentar la misma compra con el mismo ID devuelve su resultado existente sin cobrar de nuevo.",
+    "api_docs_lookup_title": "🔎 <b>Consultar pedido</b>",
+    "api_docs_lookup_note": "Sustituye ORDER_ID por el <code>orderCode</code> devuelto al comprar.",
+    "api_docs_uncertain_note": "Si la solicitud agota el tiempo de espera o indica procesamiento/revisión, consulta el pedido o reintenta con el MISMO <code>client_order_id</code>. No uses un ID nuevo mientras el resultado sea incierto. Para HTTP 429, espera el intervalo Retry-After."
+})
