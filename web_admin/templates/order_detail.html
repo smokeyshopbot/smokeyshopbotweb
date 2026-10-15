@@ -23,37 +23,6 @@
   </div>
   {% endif %}
 </div>
-{% if order.telegram_delivery_status %}
-<section class="panel"><h2>Telegram delivery</h2><p>Status: <strong>{{ order.telegram_delivery_status }}</strong>. Check Delivery queue for progress or errors.</p>{% if order.telegram_delivery_error %}<p>{{ order.telegram_delivery_error }}</p>{% endif %}</section>
-{% endif %}
-{% if order.stock_reservation_enabled %}
-<section class="panel"><h2>Stock reservation</h2>
-  {% if order.stock_reservation_released_at %}<p>Reservation finished: {{ fmt_dt(order.stock_reservation_released_at) }}.</p>
-  {% else %}<p>Reserved local units: <strong>{{ order.stock_reserved_quantity or 0 }}</strong>.</p>
-    {% if order.stock_reservation_protected %}<p>Payment processing / paid reservation. An expired clock alone will not release it. If processing was interrupted, check the wallet and payment records before resolving the order.</p>
-    {% else %}<p>Unpaid checkout deadline: {{ fmt_dt(order.stock_reservation_expires_at) }}. Submitted payment proof stays reserved for admin review.</p>{% endif %}
-  {% endif %}
-</section>
-{% endif %}
-{% if order.api_purchase %}
-<section class="panel">
-  <h2>API purchase</h2>
-  <p>Uses the customer's main USDT wallet. Processing stage: {{ order.api_stage or 'complete' }}.</p>
-  {% if order.api_client_order_id %}<p>Client order ID: <code>{{ order.api_client_order_id }}</code></p>{% endif %}
-  {% if order.api_error_code %}
-  <p><strong>Failure reason:</strong> {{ order.api_error_message }} (<code>{{ order.api_error_code }}</code>).</p>
-  {% if order.failed_at %}<p>Failed at: {{ fmt_dt(order.failed_at) }}</p>{% endif %}
-  {% if order.api_error_code == 'insufficient_balance' %}<p>No funds were deducted and no products were delivered. Available at rejection: {{ order.api_error_response.balance }} USDT; required: {{ order.api_error_response.requiredBalance }} USDT; shortfall: {{ order.api_error_response.shortfall }} USDT. This is a final failed attempt. After topping up, submit a new client_order_id.</p>{% endif %}
-  {% endif %}
-  <p>Telegram receipt: <strong>{{ order.api_receipt_status or 'Not queued' }}</strong></p>
-  {% if order.api_receipt_error %}<p class="muted">{{ order.api_receipt_error }}</p>{% endif %}
-  {% if order.supplier_outcome_uncertain %}<p>Supplier response was uncertain. Check Vendor APIs logs and the supplier order before placing another purchase.</p>{% endif %}
-  {% if order.status == 'api_processing' %}<p>This interrupted API order requires review. Check its wallet debit marker and supplier logs before refunding or delivering it.</p>{% endif %}
-  {% if current_admin_role == 'owner' and order.status == 'delivered' and order.api_receipt_status == 'failed' %}
-  <form method="post" action="{{ url_for('retry_api_receipt', order_id=order.order_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry Telegram receipt</button></form>
-  {% endif %}
-</section>
-{% endif %}
 {% if delivery_revoked %}
 <section class="panel revoked-delivery-panel">
   <h2>Delivery revoked</h2>

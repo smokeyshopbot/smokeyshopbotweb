@@ -88,17 +88,7 @@ def aggregate_amount_text(amount_inr: float = 0.0, amount_usdt: float = 0.0) -> 
 
 
 def commands_text(lang: str = "en") -> str:
-    if str(lang or "").lower().startswith("es"):
-        api_section = (
-            "\n\nAPI *API reseller*\n"
-            "Usa /api para ver o regenerar tu clave API. Tu propio bot puede listar productos, revisar tu billetera USDT y comprar stock automaticamente con saldo de billetera."
-        )
-    else:
-        api_section = (
-            "\n\nAPI *Reseller API*\n"
-            "Use /api to view or regenerate your API key. Your own bot can list products, check your USDT wallet, and buy stock automatically with wallet balance."
-        )
-    return compact_blank_lines(tr(lang, "commands_text") + tr(lang, "search_help") + api_section)
+    return compact_blank_lines(tr(lang, "commands_text"))
 
 
 def admin_commands_text() -> str:

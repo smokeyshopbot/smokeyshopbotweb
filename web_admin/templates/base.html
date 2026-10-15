@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Admin Panel{% endblock %} · Telegram Shop Bot</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261015_admin_security">
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20260523_old_theme_restore_v1">
 </head>
 <body>
   {% if session.get('admin_logged_in') %}
@@ -21,6 +21,7 @@
     <nav id="admin-sidebar-nav">
       {% if can_access('dashboard') %}<a href="{{ url_for('dashboard') }}">Dashboard</a>{% endif %}
       {% if current_admin_role == 'stock_manager' and can_access('stock_manager_dashboard') %}<a href="{{ url_for('stock_manager_dashboard') }}">My Stock Dashboard</a>{% endif %}
+      {% if current_admin_role == 'owner' %}<a href="{{ url_for('supplier_apis') }}">Vendor APIs</a>{% endif %}
       {% if can_access('products') %}
       <a href="{{ url_for('products') }}" class="nav-with-badge" data-stock-alert-link>
         <span>Products & Stock</span>
@@ -28,7 +29,6 @@
         {% if current_admin_role == 'owner' and stock_upload_rejection_count %}<span class="nav-badge stock-rejection-badge stock-rejection-alert" title="{{ stock_upload_rejection_count }} rejected stock-manager upload log(s)">R{{ stock_upload_rejection_count }}</span>{% endif %}
       </a>
       {% endif %}
-      {% if current_admin_role == 'owner' %}<a href="{{ url_for('supplier_apis') }}">Vendor APIs</a>{% endif %}
       {% if can_access('users') %}<a href="{{ url_for('users') }}">Users</a>{% endif %}
       {% if can_access('orders') %}
       <a href="{{ url_for('orders', filter='status:refund_requested') if pending_refund_request_count else url_for('orders') }}" class="nav-with-badge">
@@ -68,12 +68,9 @@
       {% if can_access('ranking') %}<a href="{{ url_for('ranking') }}">Buyer Ranking</a>{% endif %}
       {% if can_access('activity_log') %}<a href="{{ url_for('activity_log') }}">Activity Log</a>{% endif %}
       {% if can_access('broadcast_form') %}<a href="{{ url_for('broadcast_form') }}">Broadcast</a>{% endif %}
-      {% if current_admin_role == 'owner' %}<a href="{{ url_for('polls') }}" class="nav-with-badge" data-poll-results-link><span>User polls</span>{% if poll_results_unread_count %}<span class="nav-badge" title="{{ poll_results_unread_count }} poll result(s) to review">{{ poll_results_unread_count }}</span>{% endif %}</a>{% endif %}
       {% if can_access('recent_notifications') %}<a href="{{ url_for('recent_notifications') }}">Recent Notifications</a>{% endif %}
-      {% if current_admin_role == 'owner' %}<a href="{{ url_for('delivery_queue') }}">Delivery queue</a><a href="{{ url_for('wallet_reconciliation') }}">Wallet reconciliation</a>{% endif %}
       {% if can_access('help_page') %}<a href="{{ url_for('help_page') }}">Admin Map</a>{% endif %}
     </nav>
-    <a class="account-security-link" href="{{ url_for('admin_security') }}">Login security</a>
     <form method="post" action="{{ url_for('logout') }}" class="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="link-button">Logout</button>
@@ -121,7 +118,7 @@
   {% if session.get('admin_logged_in') %}
   <script>
   (function () {
-    const LIVE_PATHS = new Set({{ [url_for('dashboard'), url_for('dashboard').rstrip('/'), url_for('products'), url_for('orders'), url_for('replacement_orders'), url_for('pending_orders'), url_for('payments'), url_for('admins_panel'), url_for('replacements'), url_for('ranking')]|tojson }});
+    const LIVE_PATHS = new Set(['/', '/products', '/orders', '/replacement-orders', '/pending-orders', '/payments', '/admins', '/replacements', '/ranking']);
     const STATE_URL = '{{ url_for("live_state") }}';
     const STATE_REFRESH_MS = {{ live_state_refresh_ms or 15000 }};
     const PAGE_REFRESH_DEBOUNCE_MS = 1500;
@@ -267,11 +264,8 @@
       setNavBadge(paymentsLink, reviews);
       setNavBadge(adminsLink, payoutRequests);
       setNavBadge(replacementsLink, replacementReports);
-      const pollsLink = document.querySelector('[data-poll-results-link]');
-      const pollResults = OWNER_LIVE_NOTIFICATIONS ? Number(state.counts.poll_results_unread || 0) : 0;
-      setNavBadge(pollsLink, pollResults, '', pollResults + ' poll result(s) to review');
       const visibleImportant = OWNER_LIVE_NOTIFICATIONS ? ((productsLink ? (stockAlerts + stockUploadRejections) : 0) + (ordersLink ? refundRequests : 0) + (pendingLink ? pendingStock : 0) + (paymentsLink ? reviews : 0) + (adminsLink ? payoutRequests : 0) + (replacementsLink ? replacementReports : 0)) : 0;
-      updateTitle(visibleImportant + pollResults);
+      updateTitle(visibleImportant);
     }
 
     function setNavBadge(link, count, variantClass, title, badgeClass, prefix) {
