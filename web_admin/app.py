@@ -12,6 +12,7 @@ import csv
 import sys
 from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
+from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
 from web_admin.delivery_queue import enqueue_job, enqueue_bulk, bulk_count, ensure_delivery_indexes, register_delivery_routes, start_delivery_worker
 from utils.stock_subscriptions import ensure_indexes as ensure_stock_subscription_indexes
@@ -322,6 +323,7 @@ SECRET_DEFAULTS: dict[str, Any] = {
     **EMOJI_DEFAULTS,
     **OPERATIONS_DEFAULTS,
     **GROUP_DEFAULTS,
+    **DOMAIN_DEFAULTS,
     "bot_token": "",
     "support_usernames": "",
     "admin_ids": "",
@@ -557,7 +559,7 @@ def replace_assigned_product_name_references(db, old_name: str, new_name: str) -
             changed += 1
     if changed:
         settings["admin_accounts"] = accounts
-        set_secret_settings(db, settings)
+        set_secret_settings(db, settings, preserve_routing=True)
     return changed
 
 
@@ -666,12 +668,15 @@ def get_secret_settings(db=None) -> dict:
     return cleaned
 
 
-def set_secret_settings(db, settings: dict) -> dict:
+def set_secret_settings(db, settings: dict, *, preserve_routing=False) -> dict:
     cleaned = clean_secret_settings(settings)
     now = utcnow()
+    # Dotted updates preserve protected routing fields during concurrent saves.
+    fields = {"value." + key: value for key, value in cleaned.items()
+              if not (preserve_routing and key in ROUTING_KEYS)}
     db.settings.update_one(
         {"key": SECRET_SETTINGS_KEY},
-        {"$set": {"key": SECRET_SETTINGS_KEY, "value": cleaned, "updated_at": now}},
+        {"$set": {"key": SECRET_SETTINGS_KEY, **fields, "updated_at": now}},
         upsert=True,
     )
     token = str(cleaned.get("bot_token") or "").strip()
@@ -810,7 +815,7 @@ def create_app() -> Flask:
         secret_key = secrets.token_hex(32)
         try:
             secret_settings["admin_panel_secret_key"] = secret_key
-            set_secret_settings(app.db, secret_settings)
+            set_secret_settings(app.db, secret_settings, preserve_routing=True)
             app.logger.warning("Generated and saved ADMIN panel secret key because none was configured.")
         except Exception as exc:
             app.logger.warning("Could not save generated admin panel secret key; sessions may reset after restart: %s", exc)
@@ -1981,6 +1986,10 @@ def register_routes(app: Flask) -> None:
     @csrf_required
     def secret_settings_submit():
         existing = get_secret_settings(app.db)
+        if any(key in request.form and request.form[key].strip() != str(existing.get(key, ""))
+               for key in ROUTING_KEYS):
+            flash("Use Save domain settings or Save admin path with owner verification to change routing.", "error")
+            return redirect(url_for("secret_settings_form") + "#secret-security")
         settings = dict(existing)
         enabled_languages = ["en"]
         if request.form.get("spanish_enabled") == "1":
@@ -2004,7 +2013,7 @@ def register_routes(app: Flask) -> None:
         settings["required_channel_id"] = request.form.get("required_channel_id", "").strip()
         settings["required_channel_join_url"] = request.form.get("required_channel_join_url", "").strip()
         for key in OPERATIONS_DEFAULTS:
-            if key == "backup_encryption_key": continue
+            if key == "backup_encryption_key" or key in ROUTING_KEYS: continue
             settings[key] = ("1" if request.form.get(key) == "1" else "0") if key in OPERATIONS_BOOL_KEYS else request.form.get(key, str(existing.get(key, OPERATIONS_DEFAULTS[key]))).strip()
         for key in SENSITIVE_SECRET_SETTING_KEYS:
             incoming = request.form.get(key, "").strip()
@@ -2074,7 +2083,7 @@ def register_routes(app: Flask) -> None:
                                    emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings)), 400
         if not settings.get("admin_panel_username") and not os.getenv("ADMIN_PANEL_USERNAME"):
             settings["admin_panel_username"] = "admin"
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         set_language_settings(app.db, enabled_languages)
         saved_token_preview = mask_bot_token(settings.get("bot_token"))
         flash(f"Secret settings saved. Bot token now saved as {saved_token_preview}. Restart the bot after changing bot token/timing settings.", "success")
@@ -2165,7 +2174,7 @@ def register_routes(app: Flask) -> None:
 
         account["assigned_products"] = assigned
         settings["admin_accounts"] = accounts
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         log_admin_action(app.db, "stock_manager_products_assigned", f"{account.get('username')}: {len(assigned)} product(s)")
         flash(f"Assigned {len(assigned)} product(s) to {account.get('username')}.", "success")
         return redirect(url_for("admin_account_detail", account_id=account_id))
@@ -2215,7 +2224,7 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("admin_account_detail", account_id=account_id))
 
         settings["admin_accounts"] = accounts
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         log_admin_action(app.db, "webadmin_account_credentials_updated", f"{old_username} -> {new_username}: {', '.join(changed_parts)}")
         flash(f"Updated {', '.join(changed_parts)} for {new_username}.", "success")
         return redirect(url_for("admin_account_detail", account_id=account_id))
@@ -2363,7 +2372,7 @@ def register_routes(app: Flask) -> None:
             "assigned_products": [],
         })
         settings["admin_accounts"] = accounts
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         log_admin_action(app.db, "webadmin_account_added", f"{username} role={role}")
         flash(f"Added {ADMIN_ROLE_LABELS.get(role, role)} account {username}.", "success")
         return redirect(url_for("admins_panel"))
@@ -2381,7 +2390,7 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("admins_panel"))
         removed = next((a for a in accounts if str(a.get("id") or "") == str(account_id or "")), {})
         settings["admin_accounts"] = kept
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         log_admin_action(app.db, "webadmin_account_deleted", f"{removed.get('username')} role={removed.get('role')}")
         flash("Admin account removed.", "success")
         return redirect(url_for("admins_panel"))
@@ -2785,7 +2794,7 @@ def register_routes(app: Flask) -> None:
             flash("Could not find your stock manager account. Please ask the owner to recreate it.", "error")
             return redirect(url_for("stock_manager_dashboard"))
         settings["admin_accounts"] = accounts
-        set_secret_settings(app.db, settings)
+        set_secret_settings(app.db, settings, preserve_routing=True)
         log_admin_action(app.db, "stock_manager_payment_details_saved", f"{username}: method={payment_method}")
         flash("Payment details saved.", "success")
         return redirect(url_for("stock_manager_dashboard"))

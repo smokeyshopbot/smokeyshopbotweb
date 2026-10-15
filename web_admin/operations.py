@@ -360,7 +360,7 @@ def register_operations_routes(app, shop):
         settings = shop.get_secret_settings(app.db)
         if not settings.get("backup_encryption_key"):
             settings["backup_encryption_key"] = base64.urlsafe_b64encode(os.urandom(32)).decode()
-            shop.set_secret_settings(app.db, settings)
+            shop.set_secret_settings(app.db, settings, preserve_routing=True)
         return Response(settings["backup_encryption_key"] + "\n", mimetype="text/plain",
             headers={"Content-Disposition": "attachment; filename=shop-backup-encryption-key.txt", "Cache-Control": "no-store"})
 

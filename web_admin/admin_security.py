@@ -17,6 +17,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from flask import abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash
 from werkzeug.wrappers import Response
+from web_admin.domain_routing import (RECOVERY_ENV, hostname, origin_hostname,
+                                      routing_settings, validate_settings as validate_domains)
 
 DEFAULT_PATH = "/admin"
 PUBLIC_API = "/api/telegram-buyer"
@@ -35,12 +37,13 @@ def normalize_path(value, *, allow_root=False):
     return "/" + value
 
 
-def active_path(db):
+def active_path(db, settings=None):
     override = os.getenv("ADMIN_PANEL_PATH")
     if override is not None and override.strip():
         return normalize_path(override, allow_root=True)
-    doc = db.settings.find_one({"key": "secret_settings"}, {"value.admin_panel_path": 1}) or {}
-    return normalize_path((doc.get("value") or {}).get("admin_panel_path") or DEFAULT_PATH)
+    if settings is None:
+        settings = routing_settings(db)
+    return normalize_path(settings.get("admin_panel_path") or DEFAULT_PATH)
 
 
 class AdminPathMiddleware:
@@ -49,11 +52,29 @@ class AdminPathMiddleware:
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
+        # Unbranded process-liveness probe for Railway's internal healthcheck host.
+        if path == "/healthz" and environ.get("REQUEST_METHOD") in {"GET", "HEAD"}:
+            return Response("OK", content_type="text/plain", headers={"Cache-Control": "no-store"})(environ, start_response)
+        is_api = path == PUBLIC_API or path.startswith(PUBLIC_API + "/")
+        try:
+            settings = routing_settings(self.db)
+            if os.getenv(RECOVERY_ENV, "").strip() != "1" and settings.get("domain_separation_enabled", "0") != "0":
+                domains = validate_domains(settings)
+                actual_host = hostname(environ.get("HTTP_HOST"))
+                expected_host = origin_hostname(domains["buyer_api_endpoint_url" if is_api else "admin_panel_url"])
+                if actual_host != expected_host:
+                    return Response("Not found", status=404, content_type="text/plain",
+                                    headers={"Cache-Control": "no-store"})(environ, start_response)
+        except ValueError:
+            return Response("Not found", status=404, content_type="text/plain",
+                            headers={"Cache-Control": "no-store"})(environ, start_response)
+        except Exception:
+            return Response("Service temporarily unavailable", status=503)(environ, start_response)
         # Only the reseller namespace stays public. /api/live-state is admin-only.
-        if path == PUBLIC_API or path.startswith(PUBLIC_API + "/"):
+        if is_api:
             return self.application(environ, start_response)
         try:
-            prefix = active_path(self.db)
+            prefix = active_path(self.db, settings)
         except Exception:
             return Response("Service temporarily unavailable", status=503)(environ, start_response)
         if prefix and path != prefix and not path.startswith(prefix + "/"):
@@ -227,7 +248,8 @@ def install(app, shop):
     def security_context():
         return {"admin_mount_path": request.environ.get("webadmin.mount", ""),
                 "admin_base_path": request.environ.get("webadmin.base", ""),
-                "admin_path_override": bool(os.getenv("ADMIN_PANEL_PATH", "").strip())}
+                "admin_path_override": bool(os.getenv("ADMIN_PANEL_PATH", "").strip()),
+                "admin_domain_override": os.getenv(RECOVERY_ENV, "").strip() == "1"}
 
     @app.get("/login")
     def login_form():
@@ -438,6 +460,34 @@ def install(app, shop):
                 flash("New recovery codes created. All previous recovery codes are invalid.", "success")
                 return render_security(identity, recovery_codes=codes)
         return redirect(url_for("admin_security"))
+
+    @app.post("/admin-security/domains")
+    @shop.login_required
+    @shop.owner_required
+    @shop.csrf_required
+    def admin_domains_submit():
+        target = url_for("secret_settings_form") + "#secret-security"
+        try:
+            domains = validate_domains({
+                "admin_panel_url": request.form.get("admin_panel_url", ""),
+                "buyer_api_endpoint_url": request.form.get("buyer_api_endpoint_url", ""),
+                "domain_separation_enabled": request.form.get("domain_separation_enabled", "0"),
+            })
+            if (domains["domain_separation_enabled"] == "1"
+                    and origin_hostname(domains["admin_panel_url"]) != hostname(request.environ.get("HTTP_HOST"))):
+                raise ValueError("Open this panel on the configured admin domain before enabling separation. Connect its DNS and verify HTTPS first. To change an active admin domain, disable separation, open the new domain, then enable it again.")
+        except ValueError as error:
+            flash(str(error), "error")
+            return redirect(target)
+        if not reauthenticate(current_identity()):
+            return redirect(target)
+        # One atomic update; general settings saves cannot overwrite these fields.
+        app.db.settings.update_one({"key": "secret_settings"}, {"$set": {
+            **{"value." + key: value for key, value in domains.items()}, "updated_at": now()}}, upsert=True)
+        flash("Domain settings saved. Separate admin/API domains are "
+              + ("enabled." if domains["domain_separation_enabled"] == "1" else "disabled.")
+              + " The bot updates its advertised API URL shortly; DNS is configured separately in Railway.", "success")
+        return redirect(target)
 
     @app.post("/admin-security/path")
     @shop.login_required
