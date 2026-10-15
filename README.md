@@ -69,15 +69,6 @@ For Render/Railway, use this start command:
 gunicorn admin_panel:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
 ```
 
-Open `/admin/login` after starting WebAdmin. Change the admin path in **Secret Settings → API and admin security**. Set up Google Authenticator and save recovery codes under **Login security**. Reseller API URLs remain `/api/telegram-buyer/...`. See the top-level `UPDATE_GUIDE.md` for path recovery and encryption-key details.
-
-For different admin and reseller API domains, connect both domains to this same
-WebAdmin service, verify DNS/HTTPS, then open the intended admin domain and use
-**Secret Settings → API and admin security → Admin and API domains**. Save both
-root URLs and enable separation with owner verification. Keep it off for local
-testing. Railway healthchecks use `/healthz`; the top-level `UPDATE_GUIDE.md`
-includes migration and domain recovery instructions.
-
 The WebAdmin UI is tuned for free hosts by default: sidebar/live checks are cached for a few seconds and full-page auto refresh is disabled unless you set `ADMIN_LIVE_FULL_REFRESH=1`.
 
 Run the Telegram polling bot only from `Bot/sellingbot-main` with `python bot.py`. Do not run `WebAdmin/sellingbot-main/bot.py`.
@@ -388,13 +379,3 @@ The Telegram polling bot reads the token from MongoDB WebAdmin Secret Settings, 
 ```
 
 In WebAdmin → System Health, the Bot token check shows the same masked preview/fingerprint. If the bot log and WebAdmin System Health show different fingerprints, your Bot and WebAdmin services are connected to different `MONGO_URI`/`DB_NAME` values or one service was not redeployed/restarted.
-
-
-## Polls and API update
-
-See `UPDATE_GUIDE.md` at the project root for user polls, shared USDT-wallet API purchases, Telegram receipts, and verification instructions. Restart both services after deploying this update.
-
-
-### Background delivery update
-
-Stock alerts, broadcasts and WebAdmin messages/documents now use a persistent background queue. Owners can inspect **Delivery queue** for progress and retries. Restart both services after updating; the WebAdmin background sender starts automatically. See `UPDATE_GUIDE.md` for details.

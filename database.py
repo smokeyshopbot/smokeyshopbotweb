@@ -1061,7 +1061,7 @@ async def set_product_shop_order(name: str, shop_order: int | None) -> bool:
 
 async def remove_product(name: str) -> bool:
     res = await get_db().products.delete_one(
-        {"name": _name_regex(name), "$or": [{"stock_reservations": {"$exists": False}}, {"stock_reservations": {}}]}
+        {"name": _name_regex(name)}
     )
     return res.deleted_count > 0
 
@@ -1177,8 +1177,6 @@ async def add_stock(
         for item in (product.get("stock", []) or [])
         if normalize_approved_stock_item(item)
     }
-    for hold in (product.get("stock_reservations") or {}).values():
-        existing.update(normalize_approved_stock_item(item) for item in (hold.get("items") or []) if normalize_approved_stock_item(item))
     cursor = get_db().orders.find(
         {"product_name": _name_regex(product_name), "items.0": {"$exists": True}},
         {
@@ -1648,7 +1646,6 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
-        "premium_emoji_id": 1,
         "low_stock_threshold": 1,
         "min_order_quantity": 1,
         "max_order_quantity": 1,
@@ -3429,25 +3426,21 @@ async def set_upi_details(ref_id: str, payee_name: str, txn_id: str, screenshot_
     }
     if screenshot_file_id:
         update["upi_screenshot_file_id"] = screenshot_file_id
-    result = await get_db().pending_payments.update_one(
-        {"ref_id": ref_id, "status": "waiting"},
+    await get_db().pending_payments.update_one(
+        {"ref_id": ref_id},
         {"$set": update},
     )
 
-    return bool(result.matched_count)
-
 
 async def set_binance_details(ref_id: str, binance_name: str, screenshot_file_id: str):
-    result = await get_db().pending_payments.update_one(
-        {"ref_id": ref_id, "status": "waiting"},
+    await get_db().pending_payments.update_one(
+        {"ref_id": ref_id},
         {"$set": {
             "binance_name": binance_name,
             "binance_screenshot_file_id": screenshot_file_id,
             "status": "binance_submitted",
         }},
     )
-
-    return bool(result.matched_count)
 
 
 async def mark_payment_reminder_sent(ref_id: str) -> Optional[dict]:
@@ -3528,8 +3521,6 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
     submitted proof, the order remains pending until an admin approves/rejects it.
     This cleanup supports numeric, datetime, and ISO-string created_at fields.
     """
-    from utils.stock_reservations import sweep_reservations_async
-    await sweep_reservations_async(get_db())
     timeout_seconds = max(60, int(timeout_minutes or 30) * 60)
     cutoff_ts = time.time() - timeout_seconds
     now_dt = datetime.now(timezone.utc)
@@ -3539,7 +3530,7 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
     # Expire waiting payments by parsing created_at in Python so legacy datetime
     # or string values are handled too, not only numeric time.time() values.
     waiting_payments = await database.pending_payments.find(
-        {"status": "waiting", "stock_reservation_expires_at": {"$exists": False}},
+        {"status": "waiting"},
         {"ref_id": 1, "pay_type": 1, "created_at": 1},
     ).to_list(length=None)
     stale_payments = [p for p in waiting_payments if (_created_at_ts(p.get("created_at")) or time.time()) < cutoff_ts]
@@ -3564,7 +3555,7 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
         "approved", "confirmed", "completed",
     }
     pending_orders = await database.orders.find(
-        {"status": "pending", "stock_reservation_enabled": {"$ne": True}},
+        {"status": "pending"},
         {"order_id": 1, "created_at": 1},
     ).to_list(length=None)
     for order in pending_orders:
