@@ -14,6 +14,40 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; min-width: 0; }
+
+/* Secret Settings: compact groups with every field in the same save form. */
+.secret-settings-jumps { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.secret-settings-jumps a { padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font-size: 13px; }
+.secret-settings-jumps a:hover, .secret-settings-jumps a:focus-visible { border-color: var(--primary); }
+.secret-settings-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.secret-settings-toolbar p { margin: 0; }
+.secret-settings-toolbar > div { display: flex; gap: 8px; }
+.secret-settings-section { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); scroll-margin-top: 20px; }
+.secret-settings-section > summary { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 18px; list-style: none; color: var(--text); }
+.secret-settings-section > summary::-webkit-details-marker { display: none; }
+.secret-settings-section > summary strong { display: block; font-size: 16px; }
+.secret-settings-section > summary small { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; line-height: 1.4; }
+.secret-settings-section > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 12px; }
+.secret-settings-chevron { flex-shrink: 0; font-size: 28px; color: var(--primary); }
+.secret-settings-section[open] > summary .secret-settings-chevron { transform: rotate(90deg); }
+.secret-settings-section[open] > summary { border-bottom: 1px solid var(--line); }
+.secret-settings-body { padding: 0 18px 18px; min-width: 0; }
+.secret-settings-body h3 { margin: 20px 0 12px; font-size: 15px; }
+.secret-settings-body .settings-grid { margin-bottom: 18px; }
+.secret-backup-controls { border-top: 1px solid var(--line); padding-top: 4px; }
+.secret-backup-controls > button { margin: 0 8px 8px 0; }
+.secret-settings-save { position: sticky; bottom: 12px; z-index: 5; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); }
+.secret-settings-notes > summary { font-weight: 600; }
+.premium-emoji-mappings { margin: 16px 0; }
+.premium-emoji-table td:first-child { width: 100px; font-size: 24px; }
+.premium-emoji-table input { min-width: 180px; font-family: ui-monospace, monospace; }
+@media (max-width: 640px) {
+  .secret-settings-panel { padding: 14px; }
+  .secret-settings-section > summary { padding: 14px; }
+  .secret-settings-body { padding: 0 14px 14px; }
+  .secret-settings-save { bottom: 8px; }
+  .secret-settings-save > button { width: 100%; }
+}
 a { color: #7dd3fc; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .sidebar { position: fixed; inset: 0 auto 0 0; width: var(--sidebar-width); height: 100vh; max-height: 100vh; padding: 24px 18px; background: #020617; border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 20px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; }
@@ -3863,3 +3897,17 @@ button.small-button,
     grid-template-columns: 1fr;
   }
 }
+
+.product-display-controls { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+.product-emoji-inline-form { margin-top:12px; display:flex; flex-wrap:wrap; align-items:center; gap:8px; max-width:440px; }
+.product-emoji-inline-form label { font-weight:600; }
+.product-emoji-inline-form input { width:210px; }
+.product-emoji-inline-form small { flex-basis:100%; color:var(--muted); }
+/* Account security */
+.account-security-link { display: block; padding: 10px 14px; }
+.authenticator-qr { max-width: 100%; height: auto; background: #fff; border-radius: 8px; margin: 12px 0; }
+.setup-key { overflow-wrap: anywhere; user-select: all; }
+.recovery-code-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 12px; padding-left: 22px; }
+.recovery-code-list code { font-size: 13px; user-select: all; overflow-wrap: anywhere; }
+@media (max-width: 420px) { .recovery-code-list { grid-template-columns: 1fr; } }
+@media print { .sidebar, .mobile-topbar, .flash-wrap, .recovery-panel ~ section { display: none !important; } .main { margin: 0; } }

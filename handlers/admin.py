@@ -45,6 +45,7 @@ from utils.wallet_history import (
 )
 
 import database as db
+from utils.product_emojis import label as product_emoji_label
 from config import (
     ADMIN_ID,
     ADMIN_IDS,
@@ -266,7 +267,7 @@ async def flush_maintenance_notifications(bot) -> dict[str, int]:
 
 
 async def _new_product_notification_text(product: dict, product_name: str) -> str:
-    product_label = html.escape(product_name, quote=False)
+    product_label = html.escape(product_emoji_label(product, product_name), quote=False)
     lines = []
     try:
         if product.get("price_inr") is not None:
@@ -320,7 +321,7 @@ async def notify_users_new_stock(bot, product_name: str, available_stock: int | 
     if available_stock <= 0:
         return 0
     clean_name = str(product.get("name") or product_name)
-    product_label = html.escape(clean_name, quote=False)
+    product_label = html.escape(product_emoji_label(product, clean_name), quote=False)
     text = (
         "📦 <b>Fresh Stock Added!</b>\n\n"
         f"<b>{product_label}</b> is available now.\n"
@@ -351,7 +352,7 @@ async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=N
         pass
     if not lines:
         return 0
-    product_label = html.escape(product_name, quote=False)
+    product_label = html.escape(product_emoji_label(product, product_name), quote=False)
     text = (
         "🔻 <b>Price Dropped!</b>\n\n"
         f"<b>{product_label}</b> price is lower now.\n"

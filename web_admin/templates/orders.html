@@ -56,7 +56,7 @@
         <td>{{ fmt_dt(order.created_at) }}</td>
         <td>{{ order.product_name }} × {{ order.quantity }}</td>
         <td>{{ method_label(order.payment_method) }}</td>
-        <td class="center-cell status-cell"><span class="{{ status_badge_class(order.display_status or order.status) }}">{{ status_label(order.display_status or order.status) }}</span></td>
+        <td class="center-cell status-cell"><span class="{{ status_badge_class(order.display_status or order.status) }}">{{ status_label(order.display_status or order.status) }}</span>{% if order.api_error_code %}<br><small>{{ order.api_error_message }}</small>{% endif %}</td>
         <td class="money-cell"><span class="money-text">{{ order_amount_text(order) }}</span></td>
         <td class="center-cell order-action-cell">
           {% if order.status == 'pending_stock' and current_admin_role in ['owner','orders_manager'] %}
@@ -66,7 +66,7 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="danger small-button">Expire</button>
             </form>
-          {% elif order.status == 'delivered' and order.get('has_items') and not order.get('delivery_revoked') %}
+          {% elif order.status == 'delivered' and order.get('items') and not order.get('delivery_revoked') %}
             <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <input type="hidden" name="next" value="{{ request.full_path }}">

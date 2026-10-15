@@ -33,6 +33,13 @@ def language_name(lang: str | None) -> str:
 
 TEXT = {
     "en": {
+        "channel_join_required": "📢 Please join our channel to use this bot.\n\nAfter joining, tap ‘I’ve joined’ below. Stay subscribed to keep access.",
+        "btn_join_channel": "📢 Join channel",
+        "btn_check_channel_join": "✅ I’ve joined",
+        "btn_retry_channel_check": "🔄 Check again",
+        "channel_not_joined": "Please join the channel first. If your join request is pending, wait for approval and try again.",
+        "channel_check_unavailable": "We couldn’t verify channel membership right now. Please try again shortly. If this continues, contact support.",
+        "channel_join_verified": "✅ You can now use the bot.",
         # Global / buttons
         "btn_shop": "🛍 Shop",
         "btn_wallet": "👛 My Wallet",
@@ -84,12 +91,12 @@ TEXT = {
         "no_payment_methods": "⚠️ No payment methods are configured right now. Please contact support.",
         "product_out_stock": "❌ *{product}* is currently out of stock.\nPreorder is not available for this product right now. Please check back later!",
         "product_not_enough_stock": "❌ *{product}* does not have enough available stock for ordering right now.\nPlease check back later or choose another product.",
-        "product_description_block": "📝 Description:\n{description}",
+        "product_description_block": "<blockquote><b>{description}</b></blockquote>",
         "product_warranty_block": "🛡 Warranty: {days} {day_label}",
         "day": "day",
         "days": "days",
-        "quantity_prompt": "📦 *{product}*\n\n{description}\n\n💰 Price: {price} per unit\n📦 In Stock: {stock} unit(s)\n\nEnter the *quantity* you want to purchase:",
-        "preorder_quantity_prompt": "📦 *{product}*\n\n{description}\n\n💰 Price: {price} per unit\n🕒 Preorder available: up to {max_qty} unit(s)\n\nThis item is not in stock yet.\nEnter the *quantity* you want to preorder:",
+        "quantity_prompt": "📦 <b>{product}</b>\n💰 Price: {price} per unit\n📦 In Stock: {stock} unit(s)\n\n{description}\n\nEnter the <b>quantity</b> you want to purchase:",
+        "preorder_quantity_prompt": "📦 <b>{product}</b>\n💰 Price: {price} per unit\n🕒 Preorder available: up to {max_qty} unit(s)\n\n{description}\n\nThis item is not in stock yet.\nEnter the <b>quantity</b> you want to preorder:",
         "product_now_unavailable": "🚫 This product is currently unavailable. Please choose another product from /shop.",
         "enter_valid_number": "❌ Please enter a valid number.",
         "min_purchase": "❌ Minimum purchase is {min_qty} unit(s) for this order. Please enter a higher quantity.",
@@ -333,6 +340,12 @@ TEXT = {
         # User notifications
         "new_product_added": "🆕 <b>New Product Added!</b>\n\n<b>{product}</b> is available now.\n{lines}\n\nTap below to buy.",
         "fresh_stock_added": "📦 <b>Fresh Stock Added!</b>\n\n<b>{product}</b> is available now.\n🛒 Available stock: <b>{stock}</b>\n\nTap below to buy.",
+        "stock_available_again": "📦 <b>Stock available again!</b>\n\n<b>{product}</b> is available now.\n🛒 Available stock: <b>{stock}</b>\n\nTap below to buy.",
+        "btn_stock_notify": "🔔 Notify me when available",
+        "btn_stock_notify_cancel": "🔔 Cancel stock alert",
+        "stock_notify_subscribed": "You’ll receive one notification when this product is available again.",
+        "stock_notify_cancelled": "Your availability notification has been cancelled.",
+        "stock_notify_already_available": "This product is already available. You can purchase it now.",
         "price_dropped": "🔻 <b>Price Dropped!</b>\n\n<b>{product}</b> price is lower now.\n{lines}\n\nTap below to buy.",
         "order_expired_admin_reason": "This pending order was expired by admin.",
         "order_expired_time_reason": "The payment was not completed in time.",
@@ -347,6 +360,13 @@ TEXT = {
         "commands_text": "📋 *Commands*\n\nHere are the available user commands and how to use the bot:\n\n🛍 *Shopping*\nUse /shop or the Shop button to browse available products. Select a product, enter quantity, choose payment method and follow the steps.\n\n📦 *Orders*\nUse /orders to view your previous purchase orders, 10 per page. Each order includes a tappable /getorder shortcut so you can receive old order items again. Use /replacements to view replacement deliveries separately.\n\n🎁 *Replacements*\nUse /replacements to view replacement delivery history. You can still use the /getorder shortcut there to receive replacement items again.\n\n⭐ *Favorites*\nUse /favorites or the Favorite Products button to quickly open products you buy often.\n\n🌐 *Language*\nUse /language or the Language button to switch between English and Spanish.\n\n👛 *Wallet*\nUse /wallet to check your INR and USDT balance. Use /wallethistory to view wallet top-up logs, 10 per page. Use the Top-up Wallet button to top up via UPI, USDT (BEP20), USDT (POLYGON), or Binance Pay. Once topped up, you can checkout instantly.\n\n📞 *Support*\nUse /support or the Support button to contact support.\n\n🛠 *Reports / Replacements*\nUse /report or the Report button if a delivered account/item is damaged or not working. The bot will verify the item belongs to your delivered orders and submit a report to admin.\n\n💳 *Payment Methods*\n• *USDT (BEP20) / USDT (POLYGON)* — Send the exact amount to the wallet. The bot checks it automatically. If it still does not verify, use Manual Verify and submit your TxHash.\n• *UPI* — Pay via QR or UPI ID, submit payer/account holder name + UTR + screenshot, admin confirms.\n• *Binance Pay* — Pay through the Binance app. The bot checks it automatically; Manual Verify is available if needed. For wallet top-ups, approved Binance Pay adds to your USDT balance.\n• *Wallet* — Instant, no verification needed.\n\n📦 *After Payment*\nItems are delivered automatically once payment is confirmed. Unpaid payments get a reminder and expire after the configured time. If stock runs out after payment, your paid order waits for stock and is auto-delivered when admin adds stock.\n\nNeed support? Use /support.",
     },
     "es": {
+        "channel_join_required": "📢 Únete a nuestro canal para usar este bot.\n\nDespués de unirte, pulsa «Ya me uní» abajo. Mantén tu suscripción para conservar el acceso.",
+        "btn_join_channel": "📢 Unirme al canal",
+        "btn_check_channel_join": "✅ Ya me uní",
+        "btn_retry_channel_check": "🔄 Comprobar de nuevo",
+        "channel_not_joined": "Primero debes unirte al canal. Si tu solicitud está pendiente, espera a que la aprueben y vuelve a intentarlo.",
+        "channel_check_unavailable": "No pudimos verificar si te has unido al canal. Inténtalo de nuevo en unos momentos. Si el problema continúa, contacta con soporte.",
+        "channel_join_verified": "✅ Ya puedes usar el bot.",
         "btn_shop": "🛍 Tienda",
         "btn_wallet": "👛 Mi billetera",
         "btn_topup": "➕ Recargar billetera",
@@ -396,12 +416,12 @@ TEXT = {
         "no_payment_methods": "⚠️ No hay métodos de pago configurados ahora. Contacta con soporte.",
         "product_out_stock": "❌ *{product}* está agotado.\nEl prepedido no está disponible para este producto ahora. ¡Vuelve más tarde!",
         "product_not_enough_stock": "❌ *{product}* no tiene suficiente stock disponible para pedidos ahora.\nVuelve más tarde o elige otro producto.",
-        "product_description_block": "📝 Descripción:\n{description}",
+        "product_description_block": "<blockquote><b>{description}</b></blockquote>",
         "product_warranty_block": "🛡 Garantía: {days} {day_label}",
         "day": "día",
         "days": "días",
-        "quantity_prompt": "📦 *{product}*\n\n{description}\n\n💰 Precio: {price} por unidad\n📦 En stock: {stock} unidad(es)\n\nIngresa la *cantidad* que quieres comprar:",
-        "preorder_quantity_prompt": "📦 *{product}*\n\n{description}\n\n💰 Precio: {price} por unidad\n🕒 Prepedido disponible: hasta {max_qty} unidad(es)\n\nEste artículo aún no está en stock.\nIngresa la *cantidad* que quieres prepedir:",
+        "quantity_prompt": "📦 <b>{product}</b>\n💰 Precio: {price} por unidad\n📦 En stock: {stock} unidad(es)\n\n{description}\n\nIngresa la <b>cantidad</b> que quieres comprar:",
+        "preorder_quantity_prompt": "📦 <b>{product}</b>\n💰 Precio: {price} por unidad\n🕒 Prepedido disponible: hasta {max_qty} unidad(es)\n\n{description}\n\nEste artículo aún no está en stock.\nIngresa la <b>cantidad</b> que quieres prepedir:",
         "product_now_unavailable": "🚫 Este producto no está disponible ahora. Elige otro producto desde /shop.",
         "enter_valid_number": "❌ Ingresa un número válido.",
         "min_purchase": "❌ La compra mínima es de {min_qty} unidad(es) para este pedido. Ingresa una cantidad mayor.",
@@ -639,6 +659,12 @@ TEXT = {
         "order_expired_body": "El pago no se completó dentro de *{minutes} minutos*.\n\nCrea un nuevo pedido.",
         "new_product_added": "🆕 <b>¡Nuevo producto agregado!</b>\n\n<b>{product}</b> está disponible ahora.\n{lines}\n\nToca abajo para comprar.",
         "fresh_stock_added": "📦 <b>¡Nuevo stock agregado!</b>\n\n<b>{product}</b> está disponible ahora.\n🛒 Stock disponible: <b>{stock}</b>\n\nToca abajo para comprar.",
+        "stock_available_again": "📦 <b>¡Stock disponible de nuevo!</b>\n\n<b>{product}</b> está disponible ahora.\n🛒 Stock disponible: <b>{stock}</b>\n\nToca abajo para comprar.",
+        "btn_stock_notify": "🔔 Avisarme cuando esté disponible",
+        "btn_stock_notify_cancel": "🔔 Cancelar aviso de stock",
+        "stock_notify_subscribed": "Recibirás una notificación cuando este producto vuelva a estar disponible.",
+        "stock_notify_cancelled": "Se ha cancelado tu aviso de disponibilidad.",
+        "stock_notify_already_available": "Este producto ya está disponible. Puedes comprarlo ahora.",
         "price_dropped": "🔻 <b>¡Precio rebajado!</b>\n\nEl precio de <b>{product}</b> bajó.\n{lines}\n\nToca abajo para comprar.",
         "order_expired_admin_reason": "Este pedido pendiente fue expirado por el admin.",
         "order_expired_time_reason": "El pago no se completó a tiempo.",
@@ -652,6 +678,11 @@ TEXT = {
         "commands_text": "📋 *Comandos*\n\nEstos son los comandos disponibles y cómo usar el bot:\n\n🛍 *Compras*\nUsa /shop o el botón Tienda para ver productos disponibles. Selecciona un producto, ingresa la cantidad, elige el método de pago y sigue los pasos.\n\n📦 *Pedidos*\nUsa /orders para ver tus pedidos de compra anteriores, 10 por página. Cada pedido incluye un acceso /getorder que puedes tocar para recibir los artículos otra vez. Usa /replacements para ver entregas de reemplazo por separado.\n\n🎁 *Reemplazos*\nUsa /replacements para ver tu historial de reemplazos. También puedes usar /getorder allí para recibir esos artículos otra vez.\n\n⭐ *Favoritos*\nUsa /favorites o el botón Productos favoritos para abrir rápidamente los productos que compras con frecuencia.\n\n🌐 *Idioma*\nUsa /language o el botón Idioma para cambiar entre inglés y español.\n\n👛 *Billetera*\nUsa /wallet para revisar tu saldo INR y USDT. Usa /wallethistory para ver registros de recarga, 10 por página. Usa el botón Recargar billetera para recargar vía UPI, USDT (BEP20), USDT (POLYGON) o Binance Pay. Después de recargar, puedes pagar al instante.\n\n📞 *Soporte*\nUsa /support o el botón Soporte para contactar con soporte.\n\n🛠 *Reportes / Reemplazos*\nUsa /report o el botón Reportar si una cuenta/artículo entregado está dañado o no funciona. El bot verificará que el artículo pertenece a tus pedidos entregados y enviará un reporte al admin.\n\n💳 *Métodos de pago*\n• *USDT (BEP20) / USDT (POLYGON)* — Envía el monto exacto a la billetera. El bot lo revisa automáticamente. Si aún no se verifica, usa Verificación manual y envía tu TxHash.\n• *UPI* — Paga con QR o ID UPI, envía nombre del pagador/titular + UTR + captura, y el admin confirma.\n• *Binance Pay* — Paga desde la app Binance. El bot lo revisa automáticamente; la verificación manual está disponible si hace falta. Para recargas de billetera, Binance Pay aprobado agrega saldo USDT.\n• *Billetera* — Instantáneo, sin verificación.\n\n📦 *Después del pago*\nLos artículos se entregan automáticamente cuando se confirma el pago. Los pagos no pagados reciben recordatorio y expiran tras el tiempo configurado. Si se agota el stock después de pagar, tu pedido queda esperando stock y se entrega automáticamente cuando el admin agregue stock.\n\n¿Necesitas ayuda? Usa /support.",
     },
 }
+
+
+from utils.extra_i18n import EXTRA_TEXT
+for _language, _values in EXTRA_TEXT.items():
+    TEXT[_language].update(_values)
 
 
 def tr(lang: str | None, key: str, **kwargs) -> str:

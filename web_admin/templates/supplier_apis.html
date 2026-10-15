@@ -7,9 +7,10 @@
   <h2>Add vendor API</h2>
   <form method="post" action="{{ url_for('save_supplier_api') }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label>Alias<input name="alias" placeholder="canboso-main" required></label>
+    <label>Alias<input name="alias" placeholder="Vendor Name" required></label>
     <label>Base URL<input name="base_url" placeholder="https://example.com" required></label>
-    <label>API key<input name="api_key" placeholder="tgb_..." required></label>
+    <label>API key<input name="api_key" placeholder="smo_..." required></label>
+    <label class="choice-pill"><input type="checkbox" name="legacy_query_auth" value="1"> Legacy query-key authentication (only for vendors that require ?key=…)</label>
     <label class="choice-pill"><input type="checkbox" name="enabled" value="1" checked> Enabled</label>
     <button class="primary" type="submit">Add vendor</button>
   </form>
@@ -28,12 +29,14 @@
         <td><code>{{ supplier.api_key_prefix or 'saved' }}</code></td>
         <td>{{ 'Enabled' if supplier.enabled is not sameas false else 'Disabled' }}</td>
         <td>
+          {% if supplier.enabled is not sameas false %}<a class="small-button" href="{{ url_for('vendor_products', supplier_id=supplier._id|string) }}">Load vendor products</a>{% endif %}
           <form method="post" action="{{ url_for('save_supplier_api') }}" class="stacked-form compact-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="supplier_id" value="{{ supplier._id }}">
             <input name="alias" value="{{ supplier.alias }}" required>
             <input name="base_url" value="{{ supplier.base_url }}" required>
             <input name="api_key" value="{{ supplier.api_key }}" required>
+            <label class="choice-pill"><input type="checkbox" name="legacy_query_auth" value="1" {% if supplier.legacy_query_auth is not sameas false %}checked{% endif %}> Legacy query-key authentication</label>
             <label class="choice-pill"><input type="checkbox" name="enabled" value="1" {% if supplier.enabled is not sameas false %}checked{% endif %}> Enabled</label>
             <button type="submit">Save</button>
           </form>

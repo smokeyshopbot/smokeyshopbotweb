@@ -32,6 +32,7 @@
     {% endif %}
     <p><span class="date-pill">{{ fmt_dt(product.created_at) }}</span></p>
     {% if can_access('update_product_shop_order') %}
+    <div class="product-display-controls">
     <form method="post" action="{{ url_for('update_product_shop_order', name=product.name) }}" class="display-position-inline-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label for="product-display-position">Display position</label>
@@ -39,6 +40,14 @@
       <span class="position-total">of {{ product.total_product_positions or 1 }}</span>
       <button class="primary" type="submit">Save</button>
     </form>
+    <form method="post" action="{{ url_for('update_product_premium_emoji', name=product.name) }}" class="product-emoji-inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="product-premium-emoji-id">Premium emoji ID</label>
+      <input id="product-premium-emoji-id" name="premium_emoji_id" value="{{ product.premium_emoji_id or '' }}" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" autocomplete="off" placeholder="Optional emoji ID">
+      <button class="primary" type="submit">Save</button>
+      <small>Blank or premium emojis disabled: no service logo.</small>
+    </form>
+    </div>
     {% endif %}
   </div>
   <div class="product-manage-side">
@@ -66,7 +75,10 @@
         <strong class="stock-number stock-good">{{ stock_count }}</strong>
       {% endif %}
     </div>
-    <div><span>Total stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    <div><span>Available local stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    {% set held = namespace(count=0) %}{% for hold in (product.get('stock_reservations') or {}).values() %}{% set held.count = held.count + hold.get('items', [])|length %}{% endfor %}
+    <div><span>Reserved local stock</span><strong>{{ held.count }}</strong></div>
+    {% if product.external_supplier_stock %}<div><span>Vendor stock</span><strong>{{ product.external_supplier_stock }}</strong></div>{% endif %}
     <div><span>Pending orders</span><strong>{{ product.pending_stock_quantity or 0 }}</strong></div>
     {% endif %}
   </div>
@@ -481,7 +493,7 @@ item 2"></textarea>
 {% if can_access('update_product_description') %}
 <section class="panel">
   <h2>Product details</h2>
-  <p class="muted">These details are shown to users after they tap the product in the bot. Stock text is not changed.</p>
+  <p class="muted">Descriptions appear in a Telegram quote panel with bold text after users tap the product. Write plain text and keep any line breaks you want to show. Telegram controls the panel colors.</p>
   <form method="post" action="{{ url_for('update_product_description', name=product.name) }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="product-details-warranty-row">
