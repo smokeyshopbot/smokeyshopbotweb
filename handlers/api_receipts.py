@@ -49,8 +49,17 @@ async def process_api_receipts(bot, limit=10):
 
 async def start_api_receipt_watcher(application):
     async def worker():
+        import time
+        last_sweep = 0.0
         while True:
             try:
+                if time.monotonic() - last_sweep >= 10:
+                    from utils.stock_reservations import sweep_reservations_async
+                    await sweep_reservations_async(db.get_db())
+                    from handlers.payment import _expire_payment_session
+                    async for pending in db.get_db().pending_payments.find({"status": "expired", "stock_hold_expiry_notice_pending": True}).limit(10):
+                        await _expire_payment_session(application.bot, pending["ref_id"])
+                    last_sweep = time.monotonic()
                 await process_api_receipts(application.bot)
             except asyncio.CancelledError:
                 raise

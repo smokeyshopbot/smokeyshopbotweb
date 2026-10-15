@@ -19,6 +19,7 @@ import io
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest
 
 import database as db
 from utils.product_emojis import label as product_emoji_label, prefix as product_emoji_prefix, normal_prefix, product_heading
@@ -26,6 +27,7 @@ from config import SUPPORT_USERNAMES
 from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
+from utils.stock_subscriptions import subscribe_async, unsubscribe_async, is_subscribed_async
 from handlers.replacements import start_report_from_query
 
 logger = logging.getLogger(__name__)
@@ -1322,6 +1324,55 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
 
+async def _stock_watch_keyboard(product, user_id, lang, back_keyboard):
+    if not product.get("_id"):
+        return back_keyboard
+    subscribed = await is_subscribed_async(db.get_db(), product["_id"], user_id)
+    action = "off" if subscribed else "on"
+    label = tr(lang, "btn_stock_notify_cancel" if subscribed else "btn_stock_notify")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label,
+        callback_data=f"stock_watch:{action}:{product['_id']}")], *back_keyboard.inline_keyboard])
+
+
+async def handle_stock_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    lang = await _user_lang(user_id)
+    if not query.message or query.message.chat.type != "private":
+        await query.answer()
+        return
+    if await db.is_blocked(user_id):
+        await query.answer(tr(lang, "blocked"), show_alert=True)
+        return
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"on", "off"}:
+        await query.answer()
+        return
+    product = await db.get_product_by_id(parts[2])
+    if not product or product.get("enabled") is False:
+        await query.answer(tr(lang, "product_not_found"), show_alert=True)
+        return
+    if parts[1] == "off":
+        await unsubscribe_async(db.get_db(), product["_id"], user_id)
+        message = tr(lang, "stock_notify_cancelled")
+    else:
+        external = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
+        count = (await db.get_combined_available_stock_count(product) if external
+                 else await db.get_available_stock_count(product["name"]))
+        if count > 0:
+            await query.answer(tr(lang, "stock_notify_already_available"))
+            await _show_quantity_prompt(query, user_id, product["name"])
+            return
+        await subscribe_async(db.get_db(), product["_id"], user_id)
+        message = tr(lang, "stock_notify_subscribed")
+    await query.answer(message, show_alert=True)
+    try:
+        await _show_quantity_prompt(query, user_id, product["name"])
+    except BadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            raise
+
+
 async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_to: str = "shop"):
     """Validate a product and show the quantity prompt without favorite controls."""
     lang = await _user_lang(user_id)
@@ -1368,6 +1419,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     preorder_max_qty = 0
 
     if stock_count <= 0:
+        back_keyboard = await _stock_watch_keyboard(product, user_id, lang, back_keyboard)
         status = await _preorder_status_for_user(product, user_id)
         preorder_capacity = int(status["total_remaining"] or 0)
         preorder_max_qty = int(status["max_qty"] or 0)
@@ -1668,7 +1720,20 @@ async def _create_checkout_order(
 ) -> str | None:
     product_name = str(product.get("name") or "")
     if not is_preorder:
-        return await db.create_order(user_id, product_name, qty, method, total_inr, total_usdt, username, is_preorder=False)
+        from utils.stock_reservations import reserve_stock_async
+        order_id = await db.create_order(user_id, product_name, qty, method, total_inr, total_usdt, username, is_preorder=False)
+        settings = await db.get_secret_settings()
+        if method.startswith("wallet_") or str(settings.get("stock_reservations_enabled", "1")) == "1":
+            partial = await db.product_has_external_supplier_fallback(product)
+            result = await reserve_stock_async(db.get_db(), order_id, product_name, qty, user_id,
+                minutes=int(settings.get("payment_timeout_minutes") or 30), partial=partial,
+                protected=method.startswith("wallet_"), pending_quantity=await db.get_pending_stock_quantity(product_name))
+            if not result.get("ok"):
+                await db.update_order_status(order_id, "cancelled")
+                key = "stock_checkout_active" if result.get("reason") == "active_checkout" else "qty_or_stock_changed"
+                await context.bot.send_message(user_id, tr(lang, key))
+                return None
+        return order_id
 
     result = await db.create_preorder_order_with_limits(
         user_id,

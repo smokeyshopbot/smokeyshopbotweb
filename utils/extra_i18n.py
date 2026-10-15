@@ -13,6 +13,7 @@ EXTRA_TEXT = {
         "api_key_active": "*Your API key is active.*", "api_key_prefix": "Key prefix: {prefix}",
         "api_legacy_key": "Regenerate your older key below to get a visible key.", "api_no_key": "Tap Generate API key below to create your key.",
         "api_endpoints": "*Endpoints:*", "api_instructions": "Authenticate with the header shown above. Every purchase requires client_order_id: use a unique value for a new purchase and the same value when retrying it. Purchases use your main USDT wallet. Regenerating a key disables the old one.",
+        "api_endpoint_url": "*Endpoint URL*", "api_endpoint_not_configured": "Not configured yet. Contact support for the public API URL.",
         "api_generate": "Generate API key", "api_regenerate": "Regenerate API key", "api_private": "Open a private chat with this bot to manage your API key.",
         "delivery_revoked_message": "🚫 This delivery was revoked by admin and can no longer be fetched from the bot.",
         "delivery_disabled_by_admin": "Disabled by admin", "status_revoked": "Revoked",
@@ -33,6 +34,7 @@ EXTRA_TEXT = {
         "api_key_active": "*Tu clave API está activa.*", "api_key_prefix": "Prefijo de la clave: {prefix}",
         "api_legacy_key": "Regenera tu clave anterior abajo para obtener una clave visible.", "api_no_key": "Pulsa Generar clave API abajo para crear tu clave.",
         "api_endpoints": "*Rutas de la API:*", "api_instructions": "Autentícate con el encabezado mostrado arriba. Cada compra requiere client_order_id: usa un valor único para una compra nueva y el mismo valor al reintentarla. Las compras usan tu billetera USDT principal. Regenerar la clave desactiva la anterior.",
+        "api_endpoint_url": "*URL del endpoint*", "api_endpoint_not_configured": "Todavía no está configurada. Contacta con soporte para obtener la URL pública de la API.",
         "api_generate": "Generar clave API", "api_regenerate": "Regenerar clave API", "api_private": "Abre un chat privado con este bot para gestionar tu clave API.",
         "delivery_revoked_message": "🚫 El admin revocó esta entrega y ya no puedes recuperarla desde el bot.",
         "delivery_disabled_by_admin": "Desactivado por el admin", "status_revoked": "Revocado",
@@ -55,6 +57,9 @@ API_ERRORS_ES = {
     "client_order_id already belongs to a different purchase": "client_order_id ya corresponde a otra compra",
     "Shop is under maintenance. Try again later.": "La tienda está en mantenimiento. Inténtalo de nuevo más tarde.",
     "Product USDT price is not configured": "El precio USDT del producto no está configurado", "Inventory not enough": "No hay suficiente stock",
+    "Wallet or API access changed during purchase": "La billetera o el acceso API cambió durante la compra",
+    "Insufficient wallet balance": "Saldo insuficiente en la billetera",
+    "API access is disabled": "El acceso API está desactivado",
     "Wallet balance is not enough or API access is disabled": "El saldo de la billetera es insuficiente o el acceso API está desactivado",
     "Another purchase is processing. Retry using the same client_order_id.": "Hay otra compra en proceso. Reintenta con el mismo client_order_id.",
     "Order conflict. Please retry.": "Conflicto de pedido. Inténtalo de nuevo.",
@@ -100,3 +105,17 @@ CATALOG_TEXT = {'en': {'api_catalog_button': '📋 View API products',
         'channel_buy_product': '🛒 Comprar este producto'}}
 for _lang, _entries in CATALOG_TEXT.items():
     EXTRA_TEXT[_lang].update(_entries)
+
+for _lang, _entries in {
+    'en': {'api_balance_alerts_on': 'Low balance alerts: ON', 'api_balance_alerts_off': 'Low balance alerts: OFF',
+           'api_failed_balance': 'Failure reason: Insufficient main wallet balance. No balance was deducted. Top up and submit a new API purchase with a new client_order_id.'},
+    'es': {'api_balance_alerts_on': 'Avisos de saldo bajo: ACTIVADOS', 'api_balance_alerts_off': 'Avisos de saldo bajo: DESACTIVADOS',
+           'api_failed_balance': 'Motivo del fallo: saldo insuficiente en la billetera principal. No se descontó saldo. Recarga y envía una nueva compra API con un client_order_id nuevo.'}
+}.items():
+    EXTRA_TEXT[_lang].update(_entries)
+
+EXTRA_TEXT['en']['stock_checkout_active'] = 'You already have an unpaid checkout for this product. Complete it or wait for its payment window to expire before starting another.'
+EXTRA_TEXT['es']['stock_checkout_active'] = 'Ya tienes un pago pendiente para este producto. Complétalo o espera a que venza su plazo antes de iniciar otro.'
+
+EXTRA_TEXT['en']['api_failed_attempt_hint'] = 'An insufficient_balance response is a final failed attempt. It includes orderCode for later lookup. After topping up, use a NEW client_order_id. Repeating the old ID returns its saved failure; it never places the order automatically.'
+EXTRA_TEXT['es']['api_failed_attempt_hint'] = 'Una respuesta insufficient_balance es un intento fallido definitivo e incluye orderCode para consultarlo después. Tras recargar, usa un client_order_id NUEVO. Repetir el ID anterior devuelve el fallo guardado y nunca realiza el pedido automáticamente.'
