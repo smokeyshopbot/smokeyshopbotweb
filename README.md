@@ -69,6 +69,8 @@ For Render/Railway, use this start command:
 gunicorn admin_panel:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
 ```
 
+Open `/admin/login` after starting WebAdmin. Change the admin path in **Secret Settings → API and admin security**. Set up Google Authenticator and save recovery codes under **Login security**. Reseller API URLs remain `/api/telegram-buyer/...`. See the top-level `UPDATE_GUIDE.md` for path recovery and encryption-key details.
+
 The WebAdmin UI is tuned for free hosts by default: sidebar/live checks are cached for a few seconds and full-page auto refresh is disabled unless you set `ADMIN_LIVE_FULL_REFRESH=1`.
 
 Run the Telegram polling bot only from `Bot/sellingbot-main` with `python bot.py`. Do not run `WebAdmin/sellingbot-main/bot.py`.
