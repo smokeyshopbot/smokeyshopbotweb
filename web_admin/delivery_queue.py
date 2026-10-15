@@ -87,6 +87,7 @@ def _expand_bulk(app, shop, job):
                  "language": language,
                  "reply_markup": payload.get("markups", {}).get(language), "notification": payload.get("notification", {}),
                  "product_name": product_name, "cleanup_previous_stock": payload.get("cleanup_previous_stock", False),
+                 "stock_notice_started_at": job["created_at"],
                  "maintenance_policy": payload.get("maintenance_policy", "continue"), "bulk_recipient": True,
                  "admin_recipient": uid in payload.get("admin_ids", [])}
         ack = enqueue_job(db, "text", child, job_id=f"{job['job_id']}:{uid}", parent_id=job["job_id"], priority=20)
@@ -125,7 +126,16 @@ def _deliver(app, shop, job):
     if payload.get('replace_channel_job_id') and not job.get('acknowledged_at'):
         _finish(db, job, {'status': 'cancelled', 'error': 'Legacy channel results delivery is retired.'})
         return
-    current_groups = group_settings(shop.get_secret_settings(db))
+    current_settings = shop.get_secret_settings(db)
+    current_groups = group_settings(current_settings)
+    if payload.get('api_low_balance_alert') and not job.get('acknowledged_at'):
+        from web_admin.api_balance_alerts import validate_settings, eligible, alert_text
+        alert_settings = validate_settings(current_settings)
+        user = db.users.find_one({'user_id': payload['chat_id']})
+        if not eligible(user, alert_settings):
+            _finish(db, job, {'status': 'cancelled', 'error': 'API balance alert is no longer applicable'})
+            return
+        payload['text'] = alert_text(user, alert_settings)
     if payload.get('channel_recipient'):
         if job['kind'] != 'text':
             _finish(db, job, {'status': 'cancelled', 'error': 'Channel announcement actions have been removed.'})
@@ -195,6 +205,15 @@ def _deliver(app, shop, job):
             _finish(db, job, {'status': 'cancelled', 'error': 'Poll deadline passed'})
             return
     meta = payload.get("delivery_meta") or {}
+    if payload.get("cleanup_previous_stock") and not job.get("acknowledged_at"):
+        from web_admin.stock_notifications import prepare_delivery
+        error = prepare_delivery(db, shop, job)
+        if error:
+            retry = isinstance(error, dict) and error.get("retry")
+            _finish(db, job, {"status": "queued" if retry else "cancelled",
+                "error": error["error"] if retry else error,
+                "next_attempt_at": now() + timedelta(seconds=5)})
+            return
     if meta.get("order_id"):
         order = db.orders.find_one({"order_id": meta["order_id"]})
         if not order:
@@ -222,12 +241,13 @@ def _deliver(app, shop, job):
                 _finish(db, job, {"status": "cancelled", "error": "Product is unavailable"})
                 return
             if payload.get("cleanup_previous_stock"):
-                available = shop.get_available_stock_count(db, product["name"])
+                available = (payload["current_available_stock"] if payload.get("stock_subscription_id")
+                             else shop.get_available_stock_count(db, product["name"]))
                 if available <= 0:
                     _finish(db, job, {"status": "cancelled", "error": "Stock is no longer available"})
                     return
                 if not job.get("acknowledged_at"):
-                    payload["text"] = shop.tr(payload.get("language", "en"), "fresh_stock_added",
+                    payload["text"] = shop.tr(payload.get("language", "en"), payload.get("stock_notice_key", "fresh_stock_added"),
                         product=shop.html.escape(shop.product_emoji_label(product), quote=False), stock=available)
     if (payload.get('deep_link_product_id') or payload.get('deep_link_poll_id')) and not job.get('acknowledged_at'):
         from web_admin.group_announcements import bot_username
@@ -256,7 +276,10 @@ def _deliver(app, shop, job):
         except DuplicateKeyError:
             _finish(db, job, {"status": "queued", "next_attempt_at": now() + timedelta(seconds=0.25)})
             return
-        db.delivery_jobs.update_one({"job_id": job["job_id"], "claim_token": job["claim_token"]}, {"$set": {"send_started_at": now()}})
+        started_fields = {"send_started_at": now()}
+        if payload.get("cleanup_previous_stock"):
+            started_fields["payload"] = payload
+        db.delivery_jobs.update_one({"job_id": job["job_id"], "claim_token": job["claim_token"]}, {"$set": started_fields})
     if job.get("acknowledged_at"):
         status = {"ok": True, "result": job.get("telegram_result") or {}}
     elif job["kind"] == "document":
@@ -273,6 +296,9 @@ def _deliver(app, shop, job):
         result = status.get("result") if isinstance(status.get("result"), dict) else {}
         # Save the acknowledgement before optional bookkeeping/cleanup.
         db.delivery_jobs.update_one({"job_id": job["job_id"], "claim_token": job["claim_token"]}, {"$set": {"telegram_result": result, "acknowledged_at": now()}})
+        if job.get("stock_subscription_delivery"):
+            from web_admin.stock_notifications import acknowledge_delivery
+            acknowledge_delivery(db, job)
         if payload.get('group_recipient') and (result.get('chat') or {}).get('id'):
             payload['chat_id'] = result['chat']['id']
             db.delivery_jobs.update_one({'job_id': job['job_id']}, {'$set': {'payload.chat_id': payload['chat_id']}})

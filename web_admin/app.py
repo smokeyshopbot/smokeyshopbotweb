@@ -14,6 +14,7 @@ from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
 from web_admin.delivery_queue import enqueue_job, enqueue_bulk, bulk_count, ensure_delivery_indexes, register_delivery_routes, start_delivery_worker
+from utils.stock_subscriptions import ensure_indexes as ensure_stock_subscription_indexes
 import functools
 import html
 import hmac
@@ -63,6 +64,7 @@ from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amou
 from utils.channel_gate_settings import validate_channel_settings
 from utils.data_guard import GuardedDatabase, work_guard
 from utils.wallet_audit import change_wallet, event_id
+from utils.stock_reservations import reserve_stock, release_stock
 from web_admin.operations import DEFAULTS as OPERATIONS_DEFAULTS, BOOL_KEYS as OPERATIONS_BOOL_KEYS, validate_settings as validate_operations_settings, register_operations_routes, start_operations_worker
 
 load_dotenv()
@@ -792,6 +794,7 @@ def create_app() -> Flask:
     ensure_api_indexes(app.db)
     ensure_poll_indexes(app.db)
     ensure_delivery_indexes(app.db)
+    ensure_stock_subscription_indexes(app.db)
     if ADMIN_AUTO_INDEXES:
         try:
             ensure_admin_indexes(app.db)
@@ -1760,24 +1763,31 @@ def fulfill_product_items(db, product_name: str, quantity: int, *, order_id: str
         return saved["result"]
     if saved.get("phase") in {"requesting", "uncertain"}:
         return {"items": [], "source": "supplier", "uncertain": True, "error": "Supplier purchase needs owner review"}
-    local = pop_available_stock_for_admin_send(db, product_name, quantity, reserve_pending=reserve_pending, partial=True)
+    order = db.orders.find_one(order_query) if order_id else None
+    reservation = None
+    if order and order.get("stock_reservation_enabled"):
+        reservation = reserve_stock(db, order_id, product_name, quantity, order["user_id"], protected=True, partial=True,
+                                    pending_quantity=get_pending_stock_quantity(db, product_name) if reserve_pending else 0)
+        if not reservation.get("ok"):
+            return {"items": [], "source": "none", "error": "Stock reservation is busy"}
+    local = list(reservation["items"]) if reservation else pop_available_stock_for_admin_send(db, product_name, quantity, reserve_pending=reserve_pending, partial=True)
     if len(local) == quantity:
-        return {"items": local, "local_items": local, "source": "local_stock"}
+        return {"items": local, "local_items": local, "source": "local_stock", "reserved_local": bool(reservation)}
     if order_id:
         db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
             "phase": "requesting", "local_items": local, "supplier_quantity": quantity - len(local)}}})
     try:
         result = purchase_from_supplier_fallbacks(db, product_name, quantity - len(local), order_id=order_id)
     except Exception:
-        if local:
+        if local and not reservation:
             restore_popped_stock_items(db, product_name, local)
         raise
     if len(result.get("items") or []) == quantity - len(local):
-        result.update(items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
+        result.update(reserved_local=bool(reservation), items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
         if order_id:
             db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {"phase": "ready", "result": result}}})
         return result
-    if local:
+    if local and not reservation:
         restore_popped_stock_items(db, product_name, local)
     if order_id:
         db.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
@@ -3186,6 +3196,9 @@ def register_routes(app: Flask) -> None:
         if not product:
             flash("Product not found.", "error")
             return redirect(url_for("products"))
+        if product.get("stock_reservations"):
+            flash("Finish or cancel active stock reservations before renaming this product.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
         old_name = str(product.get("name") or name).strip()
         new_name = (request.form.get("name") or "").strip()
         if not new_name:
@@ -3196,7 +3209,12 @@ def register_routes(app: Flask) -> None:
             flash(f"Product {new_name} already exists.", "error")
             return redirect(url_for("product_manage", name=old_name))
 
-        app.db.products.update_one({"_id": product["_id"]}, {"$set": {"name": new_name, "updated_at": utcnow()}})
+        renamed = app.db.products.update_one({"_id": product["_id"], "$or": [
+            {"stock_reservations": {"$exists": False}}, {"stock_reservations": {}}]},
+            {"$set": {"name": new_name, "updated_at": utcnow()}})
+        if not renamed.matched_count:
+            flash("Product gained an active reservation. Try renaming after it finishes.", "error")
+            return redirect(url_for("product_manage", name=old_name))
         updated_refs = rename_product_references(app.db, old_name, new_name)
         assignment_updates = replace_assigned_product_name_references(app.db, old_name, new_name)
         log_admin_action(app.db, "product_renamed", f"{old_name} -> {new_name}; {updated_refs}; assigned_accounts={assignment_updates}")
@@ -3773,7 +3791,11 @@ def register_routes(app: Flask) -> None:
     @login_required
     @csrf_required
     def delete_product(name: str):
-        res = app.db.products.delete_one({"name": name_regex(name)})
+        product = app.db.products.find_one({"name": name_regex(name)})
+        if product and product.get("stock_reservations"):
+            flash("Finish or cancel active stock reservations before deleting this product.", "error")
+            return redirect(url_for("product_manage", name=product["name"]))
+        res = app.db.products.delete_one({"name": name_regex(name), "$or": [{"stock_reservations": {"$exists": False}}, {"stock_reservations": {}}]})
         if res.deleted_count:
             log_admin_action(app.db, "product_deleted", name)
         flash("Product removed." if res.deleted_count else "Product not found.", "success" if res.deleted_count else "error")
@@ -6231,8 +6253,11 @@ def order_blocks_stock_reuse(order: dict | None) -> bool:
 
 
 def get_used_stock_items(db, product_name: str) -> list[str]:
-    """Return stock items that were already delivered and still block reuse."""
+    """Return delivered and currently reserved items that block reuse."""
     used: list[str] = []
+    product = db.products.find_one({"name": name_regex(product_name)}, {"stock_reservations": 1}) or {}
+    for hold in (product.get("stock_reservations") or {}).values():
+        used.extend(hold.get("items") or [])
     for order in db.orders.find(
         {"product_name": name_regex(product_name), "items.0": {"$exists": True}},
         {
@@ -9127,14 +9152,16 @@ def expire_stale_unpaid_payments_and_orders(db) -> dict[str, int]:
     action. Rejected manual order payments are moved from order Pending to Failed.
     Supports numeric, datetime, and ISO-string created_at values.
     """
+    from utils.stock_reservations import sweep_reservations
+    sweep_reservations(db)
     timeout_seconds = max(60, int(get_runtime_int(db, "payment_timeout_minutes", PAYMENT_TIMEOUT_MINUTES) or 30) * 60)
     cutoff_ts = time.time() - timeout_seconds
     now_dt = utcnow()
     result = {"payments_expired": 0, "orders_expired": 0, "orphan_orders_expired": 0, "failed_orders_marked": 0}
 
     waiting_payments = list(db.pending_payments.find(
-        {"status": "waiting"},
-        {"ref_id": 1, "pay_type": 1, "created_at": 1},
+        {"status": "waiting", "stock_reservation_expires_at": {"$exists": False}},
+        {"ref_id": 1, "pay_type": 1, "created_at": 1, "stock_reservation_expires_at": 1},
     ))
     stale_payments = [p for p in waiting_payments if (_created_at_ts(p.get("created_at")) or time.time()) < cutoff_ts]
     stale_refs = [str(p.get("ref_id") or "") for p in stale_payments if p.get("ref_id")]
@@ -9158,8 +9185,8 @@ def expire_stale_unpaid_payments_and_orders(db) -> dict[str, int]:
         "approved", "confirmed", "completed",
     }
     pending_orders = list(db.orders.find(
-        {"status": "pending"},
-        {"order_id": 1, "created_at": 1},
+        {"status": "pending", "stock_reservation_enabled": {"$ne": True}},
+        {"order_id": 1, "created_at": 1, "stock_reservation_expires_at": 1},
     ))
     for order in pending_orders:
         ref_id = str(order.get("order_id") or "")
@@ -9364,7 +9391,7 @@ def release_product_preorder_lock(db, product_name: str, token: str | None) -> b
 def get_pending_stock_quantity(db, product_name: str) -> int:
     rows = list(db.orders.aggregate([
         {"$match": {"product_name": name_regex(product_name), "status": "pending_stock"}},
-        {"$group": {"_id": None, "total": {"$sum": "$quantity"}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$max": [0, {"$subtract": [{"$ifNull": ["$quantity", 1]}, {"$ifNull": ["$stock_reserved_quantity", 0]}]}]}}}},
     ]))
     return int(rows[0].get("total", 0)) if rows else 0
 
@@ -9607,7 +9634,7 @@ def _product_stock_count_expr() -> dict[str, Any]:
 def _pending_stock_quantity_map(db) -> dict[str, int]:
     rows = db.orders.aggregate([
         {"$match": {"status": "pending_stock"}},
-        {"$group": {"_id": "$product_name", "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+        {"$group": {"_id": "$product_name", "total": {"$sum": {"$max": [0, {"$subtract": [{"$ifNull": ["$quantity", 1]}, {"$ifNull": ["$stock_reserved_quantity", 0]}]}]}}}},
     ])
     totals: dict[str, int] = {}
     for row in rows:
@@ -10601,8 +10628,10 @@ def notification_type_label(value: str | None) -> str:
         "broadcast": "Broadcast",
         "new_product": "New product",
         "new_stock": "Fresh stock",
+        "stock_available_again": "Stock available again",
         "price_drop": "Price drop",
         "wallet_adjustment": "Wallet adjustment",
+        "api_low_balance": "API low balance",
         "payment": "Payment notice",
         "order": "Order notice",
         "replacement": "Replacement notice",

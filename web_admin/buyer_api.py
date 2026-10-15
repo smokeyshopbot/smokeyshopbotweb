@@ -8,6 +8,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from web_admin.api_security import request_key, rate_limit, ensure_security_indexes
 from utils.wallet_audit import change_wallet, event_id
+from utils.stock_reservations import reserve_stock, release_stock
 from werkzeug.exceptions import TooManyRequests
 from utils.extra_i18n import api_message
 
@@ -28,6 +29,12 @@ def ensure_api_indexes(db):
     db.orders.create_index([("api_buyer_user_id", 1), ("api_client_order_id", 1)], unique=True,
                            partialFilterExpression={"api_client_order_id": {"$type": "string"}})
     db.api_purchase_locks.create_index("key", unique=True)
+    db.users.create_index([("wallet_usdt", 1), ("api_low_balance_next_at", 1)], name="api_low_balance_candidates",
+                         partialFilterExpression={"api_request_count": {"$gt": 0}, "api_last_used_at": {"$exists": True}})
+    db.users.create_index("api_low_balance_outbox.job_id", name="api_low_balance_outbox",
+                         partialFilterExpression={"api_low_balance_outbox.job_id": {"$exists": True}})
+    db.products.create_index([("stock_reservation_count", 1), ("_id", 1)], name="active_stock_reservations",
+                             partialFilterExpression={"stock_reservation_count": {"$gt": 0}})
 
 
 def register_buyer_api_routes(app, shop):
@@ -257,13 +264,37 @@ def register_buyer_api_routes(app, shop):
                 existing = existing_request()
                 return existing if existing is not None else shop.buyer_api_error("Order conflict. Please retry.", 409)
             debit_path = f"api_wallet_debits.{order_id}"
+            reservation = reserve_stock(app.db, order_id, product["name"], quantity, uid,
+                protected=True, partial=bool(shop.normalize_supplier_fallbacks(product)),
+                pending_quantity=shop.get_pending_stock_quantity(app.db, product["name"]))
+            if not reservation.get("ok"):
+                response = {"success": False, "status": "failed", "code": "out_of_stock", "message": "Inventory not enough",
+                            "orderCode": order_id, "client_order_id": client_id, "retryable": False}
+                app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"status": "failed", "api_stage": "rejected_before_charge",
+                    "api_error_code": "out_of_stock", "api_error_message": "Inventory not enough", "failed_at": shop.utcnow(),
+                    "api_error_response": response, "api_response_status": 409}})
+                return jsonify(response), 409
             updated_user = change_wallet(app.db, uid, "usdt", -amount, reference="api-purchase-" + order_id, source="api_purchase",
                 conditions={"api_enabled": {"$ne": False}, "blocked": {"$ne": True}, "wallet_usdt": {"$gte": amount}, debit_path: {"$exists": False}},
                 extra={"$set": {debit_path: amount}})
             if not updated_user:
-                response = {"success": False, "message": "Wallet balance is not enough or API access is disabled"}
-                app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"status": "failed", "api_error_response": response, "api_response_status": 400}})
-                return jsonify(response), 400
+                latest_user = app.db.users.find_one({"user_id": uid}) or {}
+                balance = round(shop.safe_float(latest_user.get("wallet_usdt"), 0), 6)
+                disabled = not latest_user or latest_user.get("blocked") or latest_user.get("api_enabled") is False
+                insufficient = balance < amount
+                code = "api_access_disabled" if disabled else "insufficient_balance" if insufficient else "wallet_state_changed"
+                message = "API access is disabled" if disabled else "Insufficient wallet balance" if insufficient else "Wallet or API access changed during purchase"
+                status = 403 if disabled else 400 if insufficient else 409
+                failed_at = shop.utcnow()
+                response = {"success": False, "status": "failed", "code": code, "message": message,
+                    "orderCode": order_id, "client_order_id": client_id, "walletCurrency": "USDT",
+                    "balance": balance, "requiredBalance": amount, "shortfall": round(max(0, amount - balance), 6),
+                    "failedAt": failed_at.isoformat(), "retryable": False, "retryWithNewClientOrderId": not disabled}
+                app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"status": "failed", "api_stage": "rejected_before_charge",
+                    "api_error_code": code, "api_error_message": message, "failed_at": failed_at,
+                    "api_error_response": response, "api_response_status": status}})
+                release_stock(app.db, order_id, product["name"])
+                return jsonify(response), status
             app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"api_stage": "charged", "paid_at": shop.utcnow()}})
             fulfillment = shop.fulfill_product_items(app.db, product["name"], quantity, order_id=order_id, reserve_pending=True)
             items = fulfillment.get("items") or []
@@ -288,6 +319,7 @@ def register_buyer_api_routes(app, shop):
             committed = True
             # Optional bookkeeping must never refund an already delivered order.
             try:
+                release_stock(app.db, order_id, product["name"], discard=True)
                 app.db.users.update_one({"_id": user["_id"]}, {"$unset": {debit_path: ""}})
                 shop.record_order_items_delivered_in_ledger(app.db, {**order, **fields}, items, source="api")
             except Exception:
@@ -302,12 +334,13 @@ def register_buyer_api_routes(app, shop):
                 latest = app.db.orders.find_one({"_id": order["_id"]}) or {}
                 if latest.get("status") == "delivered":
                     return cached_order(latest)
-                if items and fulfillment.get("source") == "local_stock":
+                if items and fulfillment.get("source") == "local_stock" and not fulfillment.get("reserved_local"):
                     shop.restore_admin_send_stock_items(app.db, product["name"], items, username="api", stock_upload_kind="api_rollback", note=f"API rollback {order['order_id']}")
                 if debit_path:
                     refund()
                 response = {"success": False, "orderCode": order["order_id"], "message": "Supplier response is uncertain; wallet deduction was reversed. Contact support with this order ID." if fulfillment.get("uncertain") else "Inventory not enough" if isinstance(exc, ValueError) else "Purchase failed; wallet deduction was reversed."}
                 app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"status": "failed", "api_stage": "rolled_back", "api_error_response": response, "api_response_status": 409 if isinstance(exc, ValueError) else 503}})
+                release_stock(app.db, order["order_id"], product["name"])
                 return jsonify(response), 409 if isinstance(exc, ValueError) else 503
             return shop.buyer_api_error("Purchase failed. Retry using the same client_order_id.", 503)
         finally:

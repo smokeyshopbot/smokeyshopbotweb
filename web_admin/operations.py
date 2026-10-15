@@ -21,8 +21,17 @@ from pymongo import ReturnDocument
 from utils.data_guard import freeze_writes, raw_database, work_guard, as_utc
 from utils.wallet_audit import reconcile_user
 from web_admin.delivery_queue import enqueue_job
+from web_admin.api_balance_alerts import DEFAULTS as API_BALANCE_DEFAULTS, validate_settings as validate_api_balance_settings, process_alerts
+from utils.stock_reservations import sweep_reservations
+from utils.stock_subscriptions import DEFAULTS as STOCK_NOTICE_DEFAULTS
+from utils.buyer_api_settings import DEFAULTS as BUYER_API_DEFAULTS, normalize_endpoint_url
+from web_admin.stock_notifications import process_subscriptions
 
 DEFAULTS = {
+    "stock_reservations_enabled": "1",
+    **STOCK_NOTICE_DEFAULTS,
+    **BUYER_API_DEFAULTS,
+    **API_BALANCE_DEFAULTS,
     "api_key_requests_per_minute": "60", "api_ip_requests_per_minute": "180", "api_allow_legacy_query_keys": "1",
     "backup_enabled": "0", "backup_chat_id": "", "backup_schedule": "daily", "backup_time": "02:00",
     "backup_timezone": "Asia/Kolkata", "backup_interval_hours": "24", "backup_chunk_mb": "18",
@@ -30,8 +39,10 @@ DEFAULTS = {
     "backup_temp_retention_hours": "24", "backup_encryption_key": "",
     "wallet_reconcile_enabled": "1", "wallet_reconcile_interval_minutes": "60", "wallet_reconcile_alert_chat_id": "",
 }
-BOOL_KEYS = {"backup_enabled", "wallet_reconcile_enabled", "api_allow_legacy_query_keys"}
+BOOL_KEYS = {"backup_enabled", "wallet_reconcile_enabled", "api_allow_legacy_query_keys", "api_low_balance_alerts_enabled", "stock_reservations_enabled"}
 INTEGER_LIMITS = {
+    "stock_available_again_delay_seconds": (0, 600),
+    "stock_available_again_cooldown_minutes": (1, 10080),
     "api_key_requests_per_minute": (1, 10000), "api_ip_requests_per_minute": (1, 100000),
     "backup_interval_hours": (1, 720), "backup_chunk_mb": (1, 18), "backup_timeout_minutes": (1, 30),
     "backup_max_mb": (1, 2048), "backup_retry_minutes": (5, 1440), "backup_temp_retention_hours": (1, 168),
@@ -57,6 +68,8 @@ def is_backup_directory(db, directory):
 
 def validate_settings(settings):
     result = {key: str(settings.get(key, default) or "").strip() for key, default in DEFAULTS.items()}
+    result.update(validate_api_balance_settings(result))
+    result["buyer_api_endpoint_url"] = normalize_endpoint_url(result["buyer_api_endpoint_url"])
     for key in BOOL_KEYS:
         if result[key] not in {"0", "1"}: raise ValueError(key.replace("_", " ") + " must be enabled or disabled")
     for key, (minimum, maximum) in INTEGER_LIMITS.items():
@@ -281,6 +294,10 @@ def service_tick(app, shop):
             control.update_one({"_id": "services", "owner": owner}, {"$set": {"expires_at": now() + timedelta(minutes=2)}})
     pulse = threading.Thread(target=heartbeat, daemon=True); pulse.start()
     try:
+        with work_guard(db):
+            sweep_reservations(db)
+            process_alerts(app, shop, settings)
+            process_subscriptions(app, shop, settings)
         state = control.find_one({"_id": "backup"}) or {}
         fingerprint = hashlib.sha256(json.dumps({key: settings[key] for key in ("backup_enabled", "backup_schedule", "backup_time", "backup_timezone", "backup_interval_hours")}, sort_keys=True).encode()).hexdigest()
         if state.get("schedule_fingerprint") != fingerprint:

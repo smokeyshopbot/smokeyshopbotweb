@@ -75,7 +75,9 @@
         <strong class="stock-number stock-good">{{ stock_count }}</strong>
       {% endif %}
     </div>
-    <div><span>Locally held stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    <div><span>Available local stock</span><strong>{{ product.total_stock or 0 }}</strong></div>
+    {% set held = namespace(count=0) %}{% for hold in (product.get('stock_reservations') or {}).values() %}{% set held.count = held.count + hold.get('items', [])|length %}{% endfor %}
+    <div><span>Reserved local stock</span><strong>{{ held.count }}</strong></div>
     {% if product.external_supplier_stock %}<div><span>Vendor stock</span><strong>{{ product.external_supplier_stock }}</strong></div>{% endif %}
     <div><span>Pending orders</span><strong>{{ product.pending_stock_quantity or 0 }}</strong></div>
     {% endif %}
