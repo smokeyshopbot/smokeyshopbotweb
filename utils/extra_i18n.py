@@ -7,13 +7,13 @@ EXTRA_TEXT = {
         "search_invalid": "Enter between 1 and 100 characters to search.", "search_results": "🔎 Results for ‘{keyword}’\n\n{count} products · Page {page}/{pages}",
         "search_empty": "No products match ‘{keyword}’. Try a different name or keyword.", "search_again": "🔎 New search",
         "search_help": "\n\n🔎 *Product search*\nUse /search keyword or the Search products button to find products by name or description.",
-        "btn_api": "🔗 API access", "api_disabled": "*API access disabled*\n\nContact support to enable API access.",
-        "api_title": "*Reseller API*", "api_intro": "Use this key from your bot or website to list products, check your USDT wallet and buy stock automatically.",
-        "api_your_key": "*Your API key:*", "api_key_again": "Use /api to view this key again or regenerate it below.",
-        "api_key_active": "*Your API key is active.*", "api_key_prefix": "Key prefix: {prefix}",
+        "btn_api": "🔗 API access", "api_disabled": "<b>API access disabled</b>\n\nContact support to enable API access.",
+        "api_title": "<b>Reseller API</b>", "api_intro": "Use this key from your bot or website to list products, check your USDT wallet and buy stock automatically.",
+        "api_your_key": "<b>Your API key:</b>", "api_key_again": "Use /api to view this key again or regenerate it below.",
+        "api_key_active": "<b>Your API key is active.</b>", "api_key_prefix": "Key prefix: {prefix}",
         "api_legacy_key": "Regenerate your older key below to get a visible key.", "api_no_key": "Tap Generate API key below to create your key.",
-        "api_endpoints": "*Endpoints:*", "api_instructions": "Authenticate with the header shown above. Every purchase requires client_order_id: use a unique value for a new purchase and the same value when retrying it. Purchases use your main USDT wallet. Regenerating a key disables the old one.",
-        "api_endpoint_url": "*Endpoint URL*", "api_endpoint_not_configured": "Not configured yet. Contact support for the public API URL.",
+        "api_endpoints": "<b>Endpoints:</b>", "api_instructions": "Authenticate with the header shown above. Every purchase requires <code>client_order_id</code>: use a unique value for a new purchase and the same value when retrying it. Purchases use your main USDT wallet. Regenerating a key disables the old one.",
+        "api_endpoint_url": "<b>Endpoint URL</b>", "api_endpoint_not_configured": "Not configured yet. Contact support for the public API URL.",
         "api_generate": "Generate API key", "api_regenerate": "Regenerate API key", "api_private": "Open a private chat with this bot to manage your API key.",
         "delivery_revoked_message": "🚫 This delivery was revoked by admin and can no longer be fetched from the bot.",
         "delivery_disabled_by_admin": "Disabled by admin", "status_revoked": "Revoked",
@@ -28,13 +28,13 @@ EXTRA_TEXT = {
         "search_invalid": "Escribe entre 1 y 100 caracteres para buscar.", "search_results": "🔎 Resultados para «{keyword}»\n\n{count} productos · Página {page}/{pages}",
         "search_empty": "No hay productos que coincidan con «{keyword}». Prueba otro nombre o palabra.", "search_again": "🔎 Nueva búsqueda",
         "search_help": "\n\n🔎 *Búsqueda de productos*\nUsa /search palabra o el botón Buscar productos para buscar por nombre o descripción.",
-        "btn_api": "🔗 Acceso API", "api_disabled": "*Acceso API desactivado*\n\nContacta con soporte para activarlo.",
-        "api_title": "*API para revendedores*", "api_intro": "Usa esta clave desde tu bot o sitio web para listar productos, consultar tu billetera USDT y comprar stock automáticamente.",
-        "api_your_key": "*Tu clave API:*", "api_key_again": "Usa /api para volver a consultar esta clave o regenerarla abajo.",
-        "api_key_active": "*Tu clave API está activa.*", "api_key_prefix": "Prefijo de la clave: {prefix}",
+        "btn_api": "🔗 Acceso API", "api_disabled": "<b>Acceso API desactivado</b>\n\nContacta con soporte para activarlo.",
+        "api_title": "<b>API para revendedores</b>", "api_intro": "Usa esta clave desde tu bot o sitio web para listar productos, consultar tu billetera USDT y comprar stock automáticamente.",
+        "api_your_key": "<b>Tu clave API:</b>", "api_key_again": "Usa /api para volver a consultar esta clave o regenerarla abajo.",
+        "api_key_active": "<b>Tu clave API está activa.</b>", "api_key_prefix": "Prefijo de la clave: {prefix}",
         "api_legacy_key": "Regenera tu clave anterior abajo para obtener una clave visible.", "api_no_key": "Pulsa Generar clave API abajo para crear tu clave.",
-        "api_endpoints": "*Rutas de la API:*", "api_instructions": "Autentícate con el encabezado mostrado arriba. Cada compra requiere client_order_id: usa un valor único para una compra nueva y el mismo valor al reintentarla. Las compras usan tu billetera USDT principal. Regenerar la clave desactiva la anterior.",
-        "api_endpoint_url": "*URL del endpoint*", "api_endpoint_not_configured": "Todavía no está configurada. Contacta con soporte para obtener la URL pública de la API.",
+        "api_endpoints": "<b>Rutas de la API:</b>", "api_instructions": "Autentícate con el encabezado mostrado arriba. Cada compra requiere <code>client_order_id</code>: usa un valor único para una compra nueva y el mismo valor al reintentarla. Las compras usan tu billetera USDT principal. Regenerar la clave desactiva la anterior.",
+        "api_endpoint_url": "<b>URL del endpoint</b>", "api_endpoint_not_configured": "Todavía no está configurada. Contacta con soporte para obtener la URL pública de la API.",
         "api_generate": "Generar clave API", "api_regenerate": "Regenerar clave API", "api_private": "Abre un chat privado con este bot para gestionar tu clave API.",
         "delivery_revoked_message": "🚫 El admin revocó esta entrega y ya no puedes recuperarla desde el bot.",
         "delivery_disabled_by_admin": "Desactivado por el admin", "status_revoked": "Revocado",
@@ -117,5 +117,5 @@ for _lang, _entries in {
 EXTRA_TEXT['en']['stock_checkout_active'] = 'You already have an unpaid checkout for this product. Complete it or wait for its payment window to expire before starting another.'
 EXTRA_TEXT['es']['stock_checkout_active'] = 'Ya tienes un pago pendiente para este producto. Complétalo o espera a que venza su plazo antes de iniciar otro.'
 
-EXTRA_TEXT['en']['api_failed_attempt_hint'] = 'An insufficient_balance response is a final failed attempt. It includes orderCode for later lookup. After topping up, use a NEW client_order_id. Repeating the old ID returns its saved failure; it never places the order automatically.'
-EXTRA_TEXT['es']['api_failed_attempt_hint'] = 'Una respuesta insufficient_balance es un intento fallido definitivo e incluye orderCode para consultarlo después. Tras recargar, usa un client_order_id NUEVO. Repetir el ID anterior devuelve el fallo guardado y nunca realiza el pedido automáticamente.'
+EXTRA_TEXT['en']['api_failed_attempt_hint'] = 'An <code>insufficient_balance</code> response is a final failed attempt. It includes <code>orderCode</code> for later lookup. After topping up, use a NEW <code>client_order_id</code>. Repeating the old ID returns its saved failure; it never places the order automatically.'
+EXTRA_TEXT['es']['api_failed_attempt_hint'] = 'Una respuesta <code>insufficient_balance</code> es un intento fallido definitivo e incluye <code>orderCode</code> para consultarlo después. Tras recargar, usa un <code>client_order_id</code> NUEVO. Repetir el ID anterior devuelve el fallo guardado y nunca realiza el pedido automáticamente.'
