@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import sys
 from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
+from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
 from web_admin.delivery_queue import enqueue_job, enqueue_bulk, bulk_count, ensure_delivery_indexes, register_delivery_routes, start_delivery_worker
 import functools
@@ -77,9 +78,6 @@ RESTOCK_BIG_ADDITION_THRESHOLD = int(os.getenv("RESTOCK_BIG_ADDITION_THRESHOLD",
 RESTOCK_HIGH_STOCK_THRESHOLD = RESTOCK_BIG_ADDITION_THRESHOLD  # Backwards-compatible alias.
 PAYMENT_TIMEOUT_MINUTES = int(os.getenv("PAYMENT_TIMEOUT_MINUTES", "30") or 30)
 STOCK_MANAGER_MIN_PAYOUT_USDT = 10.0
-LOGIN_ATTEMPT_LIMIT = 5
-LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60
-LOGIN_LOCK_SECONDS = 15 * 60
 SENSITIVE_SECRET_SETTING_KEYS = {
     "backup_encryption_key",
     "bot_token",
@@ -355,6 +353,7 @@ SECRET_DEFAULTS: dict[str, Any] = {
     "restock_long_notification_cooldown_minutes": "360",
     "restock_big_addition_threshold": "20",
     "restock_high_stock_threshold": "20",  # legacy name; kept for older saved settings
+    "admin_panel_path": DEFAULT_ADMIN_PATH,
     "admin_panel_username": "",
     "admin_panel_password_hash": "",
     "admin_panel_secret_key": "",
@@ -824,8 +823,9 @@ def create_app() -> Flask:
     if os.getenv("ADMIN_PANEL_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}:
         app.config["SESSION_COOKIE_SECURE"] = True
 
+    install_admin_security(app, sys.modules[__name__])
+
     app._last_expiry_cleanup = 0  # type: ignore[attr-defined]
-    app._login_attempts = {}  # type: ignore[attr-defined]
 
     @app.before_request
     def coordinate_database_work():
@@ -1081,42 +1081,6 @@ def ensure_admin_indexes(db) -> None:
     db.supplier_apis.create_index([("alias", 1)])
     db.supplier_api_logs.create_index([("created_at", -1)])
     db.supplier_stock_cache.create_index([("key", 1)], unique=True)
-
-
-def _login_rate_key(username: str) -> str:
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
-    user = str(username or "").strip().lower() or "<blank>"
-    return f"{ip}|{user}"
-
-
-def _login_blocked_seconds(app: Flask, username: str) -> int:
-    attempts = getattr(app, "_login_attempts", {})
-    record = attempts.get(_login_rate_key(username)) or {}
-    locked_until = float(record.get("locked_until") or 0)
-    remaining = int(locked_until - time.time())
-    return max(0, remaining)
-
-
-def _record_failed_login(app: Flask, username: str) -> None:
-    attempts = getattr(app, "_login_attempts", None)
-    if attempts is None:
-        attempts = {}
-        app._login_attempts = attempts  # type: ignore[attr-defined]
-    key = _login_rate_key(username)
-    now = time.time()
-    record = attempts.get(key) or {"count": 0, "first_at": now, "locked_until": 0}
-    if now - float(record.get("first_at") or now) > LOGIN_ATTEMPT_WINDOW_SECONDS:
-        record = {"count": 0, "first_at": now, "locked_until": 0}
-    record["count"] = int(record.get("count") or 0) + 1
-    if record["count"] >= LOGIN_ATTEMPT_LIMIT:
-        record["locked_until"] = now + LOGIN_LOCK_SECONDS
-    attempts[key] = record
-
-
-def _clear_login_attempts(app: Flask, username: str) -> None:
-    attempts = getattr(app, "_login_attempts", None)
-    if isinstance(attempts, dict):
-        attempts.pop(_login_rate_key(username), None)
 
 
 def _normalize_usdt_tx_hash(txn_hash: Any) -> str:
@@ -1845,59 +1809,6 @@ def register_routes(app: Flask) -> None:
 
 
 
-    @app.get("/login")
-    def login_form():
-        if _is_logged_in():
-            return redirect(url_for("dashboard"))
-        return render_template("login.html")
-
-    @app.post("/login")
-    def login_submit():
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
-        locked_for = _login_blocked_seconds(app, username)
-        if locked_for:
-            minutes = max(1, math.ceil(locked_for / 60))
-            flash(f"Too many failed login attempts. Try again in about {minutes} minute(s).", "error")
-            return redirect(url_for("login_form"))
-
-        expected_user, expected_secret, uses_db_password = get_admin_login_config(app.db)
-        accounts = get_admin_accounts(app.db)
-        if not expected_secret and not accounts:
-            flash("Set ADMIN_PANEL_PASSWORD in .env for initial login, then move credentials to Secret Settings.", "error")
-            return redirect(url_for("login_form"))
-
-        password_ok = bool(expected_secret) and (check_password_hash(expected_secret, password) if uses_db_password else hmac.compare_digest(password, expected_secret))
-        if expected_secret and hmac.compare_digest(username, expected_user) and password_ok:
-            _clear_login_attempts(app, username)
-            session.clear()
-            session["admin_logged_in"] = True
-            session["admin_role"] = ADMIN_ROLE_OWNER
-            session["admin_username"] = expected_user
-            session["csrf"] = secrets.token_urlsafe(32)
-            flash("Logged in as Owner.", "success")
-            return redirect(url_for(role_home_endpoint(ADMIN_ROLE_OWNER)))
-
-        for account in accounts:
-            if not account.get("enabled", True):
-                continue
-            if not hmac.compare_digest(username.lower(), str(account.get("username") or "").lower()):
-                continue
-            if check_password_hash(str(account.get("password_hash") or ""), password):
-                _clear_login_attempts(app, username)
-                role = normalize_admin_role(account.get("role"))
-                session.clear()
-                session["admin_logged_in"] = True
-                session["admin_role"] = role
-                session["admin_username"] = account.get("username")
-                session["csrf"] = secrets.token_urlsafe(32)
-                flash(f"Logged in as {ADMIN_ROLE_LABELS.get(role, role)}.", "success")
-                return redirect(url_for(role_home_endpoint(role)))
-
-        _record_failed_login(app, username)
-        flash("Invalid username or password.", "error")
-        return redirect(url_for("login_form"))
-
     @app.post("/logout")
     @login_required
     @csrf_required
@@ -2094,6 +2005,10 @@ def register_routes(app: Flask) -> None:
         if new_password.strip():
             settings["admin_panel_password_hash"] = generate_password_hash(new_password.strip())
         validation_errors = []
+        if (settings.get("admin_panel_secret_key") != existing.get("admin_panel_secret_key")
+                and not os.getenv("ADMIN_2FA_ENCRYPTION_KEY", "").strip()
+                and app.db.admin_security.count_documents({"enabled": True})):
+            validation_errors.append("Disable all account authenticators before changing the panel secret key. It protects their encrypted setup keys; re-enable them after restarting WebAdmin.")
         try:
             settings.update(premium_form_settings(request.form, existing))
         except ValueError as error:

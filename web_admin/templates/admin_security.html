@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Login security{% endblock %}
+{% block content %}
+<div class="page-header"><div><h1>Login security</h1><p class="muted">Authenticator settings for {{ identity.username }}. Each admin uses their own authenticator.</p></div></div>
+{% if recovery_codes %}
+<section class="panel recovery-panel">
+  <h2>Save your recovery codes</h2>
+  <p>These codes appear only now. Store them somewhere safe outside this panel. Each code works once, together with your password, if you lose your phone.</p>
+  <ul class="recovery-code-list">{% for code in recovery_codes %}<li><code>{{ code }}</code></li>{% endfor %}</ul>
+  <button type="button" onclick="window.print()">Print recovery codes</button>
+</section>
+{% endif %}
+<section class="panel">
+  <h2>Google Authenticator</h2>
+  <p>Status: <strong>{{ 'Enabled' if security.enabled else 'Not enabled' }}</strong></p>
+  {% if not security.enabled %}
+    {% if qr %}
+    <p>1. Open Google Authenticator and choose <strong>Scan a QR code</strong>.</p>
+    <img class="authenticator-qr" src="data:image/png;base64,{{ qr }}" width="240" height="240" alt="Authenticator setup QR code">
+    <details><summary>Enter a setup key manually</summary><p>Account: {{ identity.username }}<br>Type: Time based<br>Key: <code class="setup-key">{{ manual_key }}</code></p></details>
+    <p>2. Enter the current code to enable two-factor authentication. This setup expires after 10 minutes.</p>
+    <form method="post" action="{{ url_for('admin_2fa_enable') }}" class="stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>6-digit authenticator code<input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+      <button type="submit" class="primary">Enable two-factor authentication</button>
+    </form>
+    {% else %}
+    <p>Add a time-based code to your login. After setup, your password and an authenticator code will be required to open the admin panel.</p>
+    <form method="post" action="{{ url_for('admin_2fa_start') }}" class="stacked-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label>
+      <button type="submit" class="primary">Set up Google Authenticator</button>
+    </form>
+    {% endif %}
+  {% else %}
+    <p>Your password and a security code are required on every new login. Recovery codes remaining: <strong>{{ recovery_count }}</strong>.</p>
+    <p class="muted">Use a fresh code for each action. If you just logged in, wait for the next code. Keep your phone's time set to automatic.</p>
+    <details><summary>Create new recovery codes</summary>
+      <p>This immediately invalidates all previous recovery codes.</p>
+      <form method="post" action="{{ url_for('admin_2fa_recovery') }}" class="stacked-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label>
+        <label>Authenticator or unused recovery code<input name="code" autocomplete="one-time-code" required maxlength="64"></label>
+        <button type="submit">Create new recovery codes</button>
+      </form>
+    </details>
+    <details><summary>Disable or replace authenticator</summary>
+      <p>To replace your authenticator, disable it here and then start setup again.</p>
+      <form method="post" action="{{ url_for('admin_2fa_disable') }}" class="stacked-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Current password<input name="current_password" type="password" autocomplete="current-password" required></label>
+        <label>Authenticator or unused recovery code<input name="code" autocomplete="one-time-code" required maxlength="64"></label>
+        <button type="submit" class="danger">Disable two-factor authentication</button>
+      </form>
+    </details>
+  {% endif %}
+</section>
+{% endblock %}

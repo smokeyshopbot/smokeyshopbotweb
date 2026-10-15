@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Authenticator verification{% endblock %}
+{% block content %}
+<section class="login-card">
+  <h1>Verify your login</h1>
+  <p>Enter the 6-digit code from Google Authenticator, or an unused recovery code.</p>
+  <form method="post" action="{{ url_for('login_two_factor_submit') }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Authenticator or recovery code<input name="code" autocomplete="one-time-code" maxlength="64" required autofocus spellcheck="false"></label>
+    <button class="primary" type="submit">Verify and log in</button>
+  </form>
+  <p class="muted">Codes change every 30 seconds. A code can only be used once. This login expires after 5 minutes.</p>
+  <a href="{{ url_for('login_form') }}">Back to login</a>
+</section>
+{% endblock %}

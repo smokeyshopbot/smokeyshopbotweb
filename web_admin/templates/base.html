@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Admin Panel{% endblock %} · Telegram Shop Bot</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261014_product_logos">
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261015_admin_security">
 </head>
 <body>
   {% if session.get('admin_logged_in') %}
@@ -73,6 +73,7 @@
       {% if current_admin_role == 'owner' %}<a href="{{ url_for('delivery_queue') }}">Delivery queue</a><a href="{{ url_for('wallet_reconciliation') }}">Wallet reconciliation</a>{% endif %}
       {% if can_access('help_page') %}<a href="{{ url_for('help_page') }}">Admin Map</a>{% endif %}
     </nav>
+    <a class="account-security-link" href="{{ url_for('admin_security') }}">Login security</a>
     <form method="post" action="{{ url_for('logout') }}" class="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="link-button">Logout</button>
@@ -120,7 +121,7 @@
   {% if session.get('admin_logged_in') %}
   <script>
   (function () {
-    const LIVE_PATHS = new Set(['/', '/products', '/orders', '/replacement-orders', '/pending-orders', '/payments', '/admins', '/replacements', '/ranking']);
+    const LIVE_PATHS = new Set({{ [url_for('dashboard'), url_for('dashboard').rstrip('/'), url_for('products'), url_for('orders'), url_for('replacement_orders'), url_for('pending_orders'), url_for('payments'), url_for('admins_panel'), url_for('replacements'), url_for('ranking')]|tojson }});
     const STATE_URL = '{{ url_for("live_state") }}';
     const STATE_REFRESH_MS = {{ live_state_refresh_ms or 15000 }};
     const PAGE_REFRESH_DEBOUNCE_MS = 1500;
