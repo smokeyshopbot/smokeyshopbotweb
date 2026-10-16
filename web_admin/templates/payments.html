@@ -26,7 +26,7 @@
         <tr>
           <td><strong>{{ p.ref_id }}</strong><br><small>{{ fmt_dt(p.created_at) }}</small></td>
           {% if show_payment_user_identity %}<td><a href="{{ url_for('user_detail', user_id=p.user_id) }}">{{ telegram_user_label(p.user_id, p.username) }}</a></td>{% endif %}
-          <td>{{ p.pay_type|title }}</td>
+          <td>{{ p.pay_type|title }}{% if p.wallet_credit_state in ['pending', 'review'] %}<br><strong>Wallet credit: {{ p.wallet_credit_state }}</strong>{% if p.wallet_credit_error %}<br><small>{{ p.wallet_credit_error }}</small>{% endif %}{% endif %}</td>
           <td>{{ method_label(p.method) }}</td>
           <td>{% if p.admin_wallet_action == 'remove' %}-{% elif p.admin_wallet_action == 'add' %}+{% endif %}{% if p.method == 'upi' or p.currency == 'inr' %}{{ money_inr(p.expected_inr or p.load_amount) }}{% else %}{{ money_usdt(p.expected_usdt or p.unique_usdt or p.load_amount) }}{% endif %}</td>
           <td>

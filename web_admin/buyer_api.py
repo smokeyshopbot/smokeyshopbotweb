@@ -29,6 +29,7 @@ def ensure_api_indexes(db):
     db.orders.create_index([("api_buyer_user_id", 1), ("api_client_order_id", 1)], unique=True,
                            partialFilterExpression={"api_client_order_id": {"$type": "string"}})
     db.api_purchase_locks.create_index("key", unique=True)
+    db.orders.create_index([("status", 1), ("api_recovery_state", 1), ("created_at", 1)], name="api_recovery_candidates")
     db.users.create_index([("wallet_usdt", 1), ("api_low_balance_next_at", 1)], name="api_low_balance_candidates",
                          partialFilterExpression={"api_request_count": {"$gt": 0}, "api_last_used_at": {"$exists": True}})
     db.users.create_index("api_low_balance_outbox.job_id", name="api_low_balance_outbox",
@@ -95,7 +96,7 @@ def register_buyer_api_routes(app, shop):
         response = order.get("api_purchase_response") or order.get("api_error_response")
         if response:
             return jsonify(response), int(order.get("api_response_status", 200))
-        return jsonify({"success": False, "pending": True, "orderCode": order["order_id"],
+        return jsonify({"success": False, "pending": True, "needsReview": order.get("api_recovery_state") == "review", "orderCode": order["order_id"],
                         "message": "Order is processing or requires review. Do not submit it with a new client_order_id."}), 202
 
     @app.get("/api/telegram-buyer/products")
@@ -253,7 +254,7 @@ def register_buyer_api_routes(app, shop):
                      "quantity": quantity, "items": [], "payment_method": "api_wallet_usdt", "amount_inr": 0.0, "amount_usdt": amount,
                      "status": "api_processing", "created_at": now, "api_purchase": True, "api_delivery_mode": "json",
                      "api_buyer_user_id": uid, "api_product_id": shop.public_api_product_id(product), "api_request_product_id": product_id.strip(),
-                     "api_stage": "created", "effective_price_group": priced.get("effective_price_group"),
+                     "api_stage": "created", "api_recovery_version": 1, "effective_price_group": priced.get("effective_price_group"),
                      "wallet_event_id": event_id(uid, "usdt", "api-purchase-" + order_id), "wallet_event_delta": -amount,
                      "effective_price_source": priced.get("effective_price_source"), **shop.product_order_txt_instruction_fields(product)}
             if client_id:
@@ -296,6 +297,7 @@ def register_buyer_api_routes(app, shop):
                 release_stock(app.db, order_id, product["name"])
                 return jsonify(response), status
             app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"api_stage": "charged", "paid_at": shop.utcnow()}})
+            app.db.orders.update_one({"_id": order["_id"]}, {"$set": {"api_fulfillment_started_at": shop.utcnow()}})
             fulfillment = shop.fulfill_product_items(app.db, product["name"], quantity, order_id=order_id, reserve_pending=True)
             items = fulfillment.get("items") or []
             if len(items) != quantity:
@@ -333,6 +335,14 @@ def register_buyer_api_routes(app, shop):
                 # A lost database acknowledgement may have committed delivery.
                 latest = app.db.orders.find_one({"_id": order["_id"]}) or {}
                 if latest.get("status") == "delivered":
+                    return cached_order(latest)
+                saved = latest.get("fulfillment_reservation") or {}
+                ready = saved.get("phase") == "ready" and len((saved.get("result") or {}).get("items") or []) == quantity
+                if ready or (len(items) == quantity and fulfillment.get("source") == "supplier"):
+                    if not ready:
+                        app.db.orders.update_one({"_id": order["_id"]}, {"$set": {
+                            "fulfillment_reservation": {"phase": "ready", "result": fulfillment}}})
+                    # A confirmed purchase must finish, never refund and restore sold units.
                     return cached_order(latest)
                 if items and fulfillment.get("source") == "local_stock" and not fulfillment.get("reserved_local"):
                     shop.restore_admin_send_stock_items(app.db, product["name"], items, username="api", stock_upload_kind="api_rollback", note=f"API rollback {order['order_id']}")

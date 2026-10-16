@@ -141,7 +141,8 @@ def prepare_delivery(db, shop, job):
         if error:
             return error
     elif payload.get("cleanup_previous_stock") and not payload.get("group_recipient"):
-        product = db.products.find_one({"name": shop.name_regex(payload["product_name"])})
+        from web_admin.delivery_snapshot import cached_product
+        product = cached_product(db, shop, payload["product_name"])
         if product:
             row = db.stock_subscriptions.find_one({"_id": subscription_id(product["_id"], payload["chat_id"])})
             started = payload.get("stock_notice_started_at") or job["created_at"]

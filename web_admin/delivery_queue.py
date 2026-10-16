@@ -1,13 +1,15 @@
 """Persistent, bounded Telegram delivery outside Gunicorn request threads."""
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from utils.data_guard import work_guard, raw_database
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
 
-from flask import flash, redirect, render_template, request, url_for
+from flask import flash, redirect, render_template, request, url_for, g
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, BulkWriteError
+from utils.notification_limits import NotificationDeferred, notification_slot
 
 
 def now():
@@ -21,6 +23,7 @@ def ensure_delivery_indexes(db):
     db.delivery_jobs.create_index([("lease_until", 1)])
     db.delivery_jobs.create_index("expires_at", expireAfterSeconds=0)
     db.delivery_control.create_index("key", unique=True)
+    db.delivery_control.create_index("expires_at", expireAfterSeconds=0)
 
 
 def enqueue_job(db, kind, payload, *, job_id=None, parent_id=None, priority=5):
@@ -74,11 +77,15 @@ def _expand_bulk(app, shop, job):
     cursor = int(job.get("recipient_cursor", 0))
     if payload.get("recipient_ids") is not None:
         ids = sorted({int(uid) for uid in payload["recipient_ids"] if int(uid) > cursor})[:100]
-        users = [db.users.find_one({"user_id": uid}) or {"user_id": uid, "language": "en"} for uid in ids]
+        profiles = {u["user_id"]: u for u in db.users.find({"user_id": {"$in": ids}},
+                     {"user_id": 1, "language": 1, "language_code": 1})}
+        users = [profiles.get(uid) or {"user_id": uid, "language": "en"} for uid in ids]
     else:
         query = _bulk_query(payload)
         query["$and"] = [{"user_id": {"$gt": cursor}}]
         users = list(db.users.find(query, {"user_id": 1, "language": 1, "language_code": 1}).sort("user_id", 1).limit(100))
+    children = []
+    created = now()
     for user in users:
         uid = int(user["user_id"])
         language = shop.lang_from_user(user)
@@ -90,12 +97,24 @@ def _expand_bulk(app, shop, job):
                  "stock_notice_started_at": job["created_at"],
                  "maintenance_policy": payload.get("maintenance_policy", "continue"), "bulk_recipient": True,
                  "admin_recipient": uid in payload.get("admin_ids", [])}
-        ack = enqueue_job(db, "text", child, job_id=f"{job['job_id']}:{uid}", parent_id=job["job_id"], priority=20)
-        if not text:
-            db.delivery_jobs.update_one({"job_id": ack["job_id"], "status": "queued"}, {"$set": {"status": "cancelled", "error": "No message for this user's language"}})
+        children.append({"job_id": f"{job['job_id']}:{uid}", "kind": "text", "payload": child,
+                         "parent_id": job["job_id"], "priority": 20, "attempts": 0,
+                         "status": "queued" if text else "cancelled", "created_at": created,
+                         "next_attempt_at": created, **({"error": "No message for this user's language",
+                             "expires_at": created + timedelta(days=30)} if not text else {})})
+    if children:
+        # One batch write replaces one round trip per recipient. Unique job IDs
+        # make a replay safe after a crash between inserting children and saving the cursor.
+        try:
+            db.delivery_jobs.insert_many(children, ordered=False)
+        except BulkWriteError as error:
+            details = error.details or {}
+            if details.get("writeConcernErrors") or any(e.get("code") != 11000 for e in details.get("writeErrors", [])):
+                raise
+
     _finish(db, job, {"status": "queued" if len(users) == 100 else "expanded",
                      "recipient_cursor": max([cursor] + [int(u["user_id"]) for u in users]),
-                     "next_attempt_at": now() + timedelta(seconds=1)})
+                     "next_attempt_at": now()})
 
 
 def _handle_stock_work(app, shop, job):
@@ -126,7 +145,10 @@ def _deliver(app, shop, job):
     if payload.get('replace_channel_job_id') and not job.get('acknowledged_at'):
         _finish(db, job, {'status': 'cancelled', 'error': 'Legacy channel results delivery is retired.'})
         return
-    current_settings = shop.get_secret_settings(db)
+    g.pop("delivery_secret_settings", None)
+    snapshot = getattr(g, "delivery_snapshot", None)
+    current_settings = snapshot.settings() if snapshot else shop.get_secret_settings(db)
+    g.delivery_secret_settings = current_settings
     current_groups = group_settings(current_settings)
     if payload.get('api_low_balance_alert') and not job.get('acknowledged_at'):
         from web_admin.api_balance_alerts import validate_settings, eligible, alert_text
@@ -225,24 +247,26 @@ def _deliver(app, shop, job):
             _finish(db, job, {"status": "cancelled", "error": "Order delivery has been revoked"})
             return
     if (payload.get("bulk_recipient") or payload.get('group_recipient')) and not job.get("acknowledged_at"):
-        user = db.users.find_one({"user_id": payload["chat_id"]}) or {}
+        user = snapshot.user(payload["chat_id"]) if snapshot else db.users.find_one({"user_id": payload["chat_id"]}) or {}
+        g.delivery_user_profile = (payload["chat_id"], user)
         if payload.get('bulk_recipient') and user.get("blocked") and not payload.get("admin_recipient"):
             _finish(db, job, {"status": "cancelled", "error": "User is blocked"})
             return
-        if shop.get_setting(db, "maintenance_mode", False) and not payload.get("admin_recipient"):
+        maintenance = snapshot.maintenance() if snapshot else shop.get_setting(db, "maintenance_mode", False)
+        if maintenance and not payload.get("admin_recipient"):
             policy = payload.get("maintenance_policy")
             if policy in {"pause", "skip"}:
                 _finish(db, job, {"status": "cancelled" if policy == "skip" else "queued",
                                  "next_attempt_at": now() + timedelta(seconds=10), "error": "Maintenance mode"})
                 return
         if payload.get("product_name"):
-            product = db.products.find_one({"name": shop.name_regex(payload["product_name"])})
+            product = snapshot.product(payload["product_name"]) if snapshot else db.products.find_one({"name": shop.name_regex(payload["product_name"])})
             if not product or product.get("enabled") is False:
                 _finish(db, job, {"status": "cancelled", "error": "Product is unavailable"})
                 return
             if payload.get("cleanup_previous_stock"):
                 available = (payload["current_available_stock"] if payload.get("stock_subscription_id")
-                             else shop.get_available_stock_count(db, product["name"]))
+                             else snapshot.available(product["name"]) if snapshot else shop.get_available_stock_count(db, product["name"]))
                 if available <= 0:
                     _finish(db, job, {"status": "cancelled", "error": "Stock is no longer available"})
                     return
@@ -266,16 +290,22 @@ def _deliver(app, shop, job):
             label = shop.tr(payload.get('language', 'en'), 'channel_buy_product')
             link = 'product_' + payload['deep_link_product_id']
         payload['reply_markup'] = {'inline_keyboard': [[{'text': label, 'url': 'https://t.me/' + username + '?start=' + link}]]}
+    if job.get("acknowledged_at"):
+        return _send_delivery(app, shop, job)
+    try:
+        with notification_slot(db, payload["chat_id"], group=bool(payload.get("group_recipient"))):
+            return _send_delivery(app, shop, job)
+    except NotificationDeferred as error:
+        _finish(db, job, {"status": "queued", "next_attempt_at": now() + timedelta(seconds=error.retry_after)})
+
+
+def _send_delivery(app, shop, job):
+    db, payload = app.db, job["payload"]
+    meta = payload.get("delivery_meta") or {}
+    group_post = job["kind"] == "text" and bool(payload.get("group_recipient"))
     # Persist the fact that sending began. A process crash with no Telegram
     # acknowledgement is flagged for review rather than silently sent again.
     if not job.get("acknowledged_at"):
-        try:
-            db.delivery_control.find_one_and_update({"key": "webadmin_send_slot", "$or": [
-                {"next_at": {"$lte": now()}}, {"next_at": {"$exists": False}}]},
-                {"$set": {"next_at": now() + timedelta(seconds=0.25)}}, upsert=True, return_document=ReturnDocument.AFTER)
-        except DuplicateKeyError:
-            _finish(db, job, {"status": "queued", "next_attempt_at": now() + timedelta(seconds=0.25)})
-            return
         started_fields = {"send_started_at": now()}
         if payload.get("cleanup_previous_stock"):
             started_fields["payload"] = payload
@@ -357,8 +387,7 @@ def _deliver(app, shop, job):
         db.orders.update_one({"order_id": meta["order_id"]}, {"$set": {"telegram_delivery_status": state, "telegram_delivery_error": status.get("error", "")}})
 
 
-def process_delivery_jobs(app, shop, *, limit=1):
-    db = app.db
+def _recover_expired_jobs(db):
     current = now()
     expired = list(db.delivery_jobs.find({"status": "working", "lease_until": {"$lt": current}}).limit(100))
     for job in expired:
@@ -367,10 +396,18 @@ def process_delivery_jobs(app, shop, *, limit=1):
         db.delivery_jobs.update_one({"job_id": job["job_id"], "status": "working", "lease_until": {"$lt": current}},
             {"$set": {"status": state, "error": "Worker interrupted; review before retrying" if state == "review" else "", "next_attempt_at": current},
              "$unset": {"claim_token": "", "lease_until": ""}})
+
+
+def process_delivery_jobs(app, shop, *, limit=1, recover=True):
+    db = app.db
+    if recover:
+        _recover_expired_jobs(db)
+    processed = 0
     for _ in range(limit):
         token = uuid.uuid4().hex
         query = {"status": "queued", "next_attempt_at": {"$lte": now()}}
-        pause = db.delivery_control.find_one({"key": "telegram_pause"}) or {}
+        snapshot = getattr(g, "delivery_snapshot", None)
+        pause = snapshot.pause() if snapshot else db.delivery_control.find_one({"key": "telegram_pause"}) or {}
         if pause.get("until") and pause["until"].replace(tzinfo=timezone.utc) > now():
             query["kind"] = {"$in": ["bulk", "stock_work"]}
         job = db.delivery_jobs.find_one_and_update(query,
@@ -378,6 +415,7 @@ def process_delivery_jobs(app, shop, *, limit=1):
             sort=[("priority", 1), ("created_at", 1)], return_document=ReturnDocument.AFTER)
         if not job:
             break
+        processed += 1
         stop_heartbeat = threading.Event()
         def heartbeat():
             while not stop_heartbeat.wait(30):
@@ -401,19 +439,68 @@ def process_delivery_jobs(app, shop, *, limit=1):
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=1)
+    return processed
+
+
+class DeliveryPool:
+    """A rolling pool: one slow recipient never holds up the next whole batch."""
+    def __init__(self, app, shop, *, workers=12):
+        self.app, self.shop, self.workers = app, shop, workers
+        self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="telegram-delivery")
+        self.pending = set()
+        self.last_recovery = 0.0
+        self.last_probe = -1.0
+        from web_admin.delivery_snapshot import DeliverySnapshot
+        self.snapshot = DeliverySnapshot(app.db, shop)
+
+    def _run_one(self):
+        with self.app.app_context(), work_guard(self.app.db):
+            g.delivery_snapshot = self.snapshot
+            return process_delivery_jobs(self.app, self.shop, recover=False, limit=3)
+
+    def tick(self):
+        for future in list(self.pending):
+            if future.done():
+                self.pending.remove(future)
+                try:
+                    future.result()
+                except Exception:
+                    self.app.logger.exception("Delivery worker failed")
+        if time.monotonic() - self.last_recovery >= 10:
+            with self.app.app_context(), work_guard(self.app.db, wait=False):
+                _recover_expired_jobs(self.app.db)
+            self.last_recovery = time.monotonic()
+        room = self.workers - len(self.pending)
+        if room <= 0 or time.monotonic() - self.last_probe < 0.25:
+            return
+        self.last_probe = time.monotonic()
+        query = {"status": "queued", "next_attempt_at": {"$lte": now()}}
+        pause = self.app.db.delivery_control.find_one({"key": "telegram_pause"}) or {}
+        if pause.get("until") and pause["until"].replace(tzinfo=timezone.utc) > now():
+            query["kind"] = {"$in": ["bulk", "stock_work"]}
+        # Probe once while idle instead of making every worker poll MongoDB.
+        ready = list(self.app.db.delivery_jobs.find(query, {"kind": 1, "payload.chat_id": 1}).limit(room * 3))
+        self.snapshot.prefetch_users(ready)
+        for _ in range(min(room, (len(ready) + 2) // 3)):
+            self.pending.add(self.executor.submit(self._run_one))
+
+    def shutdown(self):
+        self.executor.shutdown(wait=True)
 
 
 def start_delivery_worker(app, shop):
     if app.config.get("DELIVERY_WORKER_STARTED"):
         return
     app.config["DELIVERY_WORKER_STARTED"] = True
+    pool = DeliveryPool(app, shop)
+    app.delivery_pool = pool
     def worker():
         while True:
             try:
-                with app.app_context(), work_guard(app.db): process_delivery_jobs(app, shop)
+                pool.tick()
             except Exception:
                 app.logger.exception("Delivery queue unavailable")
-            time.sleep(0.25)
+            time.sleep(0.05 if pool.pending else 0.5)
     app.delivery_thread = threading.Thread(target=worker, name="webadmin-delivery", daemon=True)
     app.delivery_thread.start()
 

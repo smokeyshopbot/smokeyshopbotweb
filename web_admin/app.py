@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import csv
 import sys
+from dotenv import load_dotenv
+load_dotenv()
 from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
+from web_admin.api_recovery import register_routes as register_api_recovery_routes
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
@@ -37,12 +40,12 @@ from urllib.parse import parse_qsl, urlsplit
 import requests
 from utils.premium_emojis import DEFAULTS as EMOJI_DEFAULTS, EMOJI_CHOICES, mapping as premium_mapping, form_settings as premium_form_settings, transform_payload, emoji_rejected, plain_product_payload, multipart_data, file_positions, rewind_files
 from bson import ObjectId
-from dotenv import load_dotenv
 from web_admin.vendor_catalog import register_vendor_catalog_routes
 from web_admin.group_announcements import DEFAULTS as GROUP_DEFAULTS, BOOL_KEYS as GROUP_BOOL_KEYS, validate as validate_group_announcements, enqueue_notice
 from utils.group_notifications import settings as group_notification_settings
 from utils.product_emojis import label as product_emoji_label
 from flask import (
+    has_app_context,
     Flask,
     Response,
     jsonify,
@@ -65,10 +68,9 @@ from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amou
 from utils.channel_gate_settings import validate_channel_settings
 from utils.data_guard import GuardedDatabase, work_guard
 from utils.wallet_audit import change_wallet, event_id
+from utils.wallet_credits import WalletCreditReview, credit_topup, ensure_indexes as ensure_wallet_credit_indexes
 from utils.stock_reservations import reserve_stock, release_stock
 from web_admin.operations import DEFAULTS as OPERATIONS_DEFAULTS, BOOL_KEYS as OPERATIONS_BOOL_KEYS, validate_settings as validate_operations_settings, register_operations_routes, start_operations_worker
-
-load_dotenv()
 
 PAGE_SIZE = 10
 TELEGRAM_DELETE_WINDOW_HOURS = 48
@@ -654,6 +656,8 @@ def get_runtime_bot_token(db=None) -> str:
 def get_secret_settings(db=None) -> dict:
     if db is None:
         db = current_app.db  # type: ignore[attr-defined]
+    if has_app_context() and getattr(g, "delivery_secret_settings", None) is not None:
+        return g.delivery_secret_settings
     doc = db.settings.find_one({"key": SECRET_SETTINGS_KEY}) or {}
     value = doc.get("value") if isinstance(doc, dict) else {}
     cleaned = clean_secret_settings(value if isinstance(value, dict) else None)
@@ -797,6 +801,7 @@ def create_app() -> Flask:
     app.db = GuardedDatabase(_connect_db())  # type: ignore[attr-defined]
     app.db.wallet_ledger.create_index([("user_id", 1), ("currency", 1)])
     ensure_api_indexes(app.db)
+    ensure_wallet_credit_indexes(app.db)
     ensure_poll_indexes(app.db)
     ensure_delivery_indexes(app.db)
     ensure_stock_subscription_indexes(app.db)
@@ -999,6 +1004,7 @@ def create_app() -> Flask:
 
     register_routes(app)
     register_buyer_api_routes(app, sys.modules[__name__])
+    register_api_recovery_routes(app, sys.modules[__name__])
     register_poll_routes(app, login_required, owner_required, csrf_required, log_admin_action, shop=sys.modules[__name__])
     register_delivery_routes(app, sys.modules[__name__])
     register_operations_routes(app, sys.modules[__name__])
@@ -5885,7 +5891,12 @@ def register_routes(app: Flask) -> None:
         if pending.get("pay_type") == "order":
             complete_order(app.db, int(pending.get("user_id", 0) or 0), ref_id)
         else:
-            complete_wallet_load(app.db, int(pending.get("user_id", 0) or 0), pending)
+            try:
+                complete_wallet_load(app.db, int(pending.get("user_id", 0) or 0), pending)
+            except WalletCreditReview:
+                log_admin_action(app.db, "payment_approved_credit_review", ref_id)
+                flash("Payment confirmed; the wallet credit needs owner review. Check Wallet Reconciliation.", "warning")
+                return redirect(url_for("payments"))
         log_admin_action(app.db, "payment_approved", ref_id)
         flash(f"Payment {ref_id} approved and completed.", "success")
         return redirect(url_for("payments"))
@@ -10550,21 +10561,14 @@ def _process_pending_stock_orders_now(db, product_name: str, *, limit: int = 100
 
 def complete_wallet_load(db, user_id: int, pending: dict) -> None:
     ref_id = pending.get("ref_id", "")
-    credited = db.pending_payments.find_one_and_update(
-        {"ref_id": ref_id, "pay_type": "wallet", "$or": [{"wallet_credited_at": None}, {"wallet_credited_at": {"$exists": False}}]},
-        {"$set": {"wallet_credited_at": utcnow(), "status": "completed",
-            "wallet_event_id": event_id(user_id, pending.get("currency", "inr"), "topup-" + ref_id),
-            "wallet_event_delta": round(float(pending.get("load_amount", 0) or 0), 2)}},
-        return_document=ReturnDocument.AFTER,
-    )
+    credited = credit_topup(db, ref_id, user_id)
     if not credited:
-        delete_payment_message(db, ref_id)
         latest = db.pending_payments.find_one({"ref_id": ref_id}) or pending
+        if latest.get("wallet_credit_state") != "done":
+            return
+        delete_payment_message(db, ref_id)
         send_wallet_load_status(db, user_id, latest, already=True)
         return
-    currency = credited.get("currency", "inr")
-    amount = float(credited.get("load_amount", 0.0) or 0.0)
-    change_wallet(db, user_id, currency, round(amount, 2), reference="topup-" + ref_id, source="topup")
     delete_payment_message(db, ref_id)
     send_wallet_load_status(db, user_id, credited, already=False)
 
@@ -11005,6 +11009,15 @@ def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") ->
     if not uid:
         return
     now = utcnow()
+    snapshot = getattr(g, "delivery_snapshot", None) if has_app_context() else None
+    if snapshot:
+        checked = getattr(g, "delivery_user_profile", None)
+        profile = checked[1] if checked and checked[0] == uid else snapshot.user(uid)
+        delivered = profile.get("last_message_delivered_at")
+        if (profile.get("telegram_delivery_status") == "active" and not profile.get("blocked_by_delivery")
+                and not profile.get("blocked") and delivered
+                and (now - delivered.replace(tzinfo=timezone.utc)).total_seconds() < 60):
+            return
     db.users.update_one(
         {
             "user_id": uid,
@@ -11291,9 +11304,6 @@ def send_telegram_message_status(
 
 
 def _send_telegram_message_now(chat_id, text, parse_mode=None, reply_markup=None, **notification):
-    token = get_bot_token()
-    if not token:
-        return {"ok": False, "error": "Bot token is not configured"}
     payload = {"chat_id": chat_id if str(chat_id).startswith('@') else int(chat_id), "text": text}
     if parse_mode: payload["parse_mode"] = parse_mode
     if reply_markup: payload["reply_markup"] = reply_markup
@@ -11301,11 +11311,14 @@ def _send_telegram_message_now(chat_id, text, parse_mode=None, reply_markup=None
 
 
 def _telegram_http_result(method, payload, files=None):
-    token = get_bot_token()
+    settings = getattr(g, "delivery_secret_settings", None)
+    if settings is None:
+        settings = get_secret_settings()
+    token = str(settings.get("bot_token") or "").strip()
     if not token:
         return {"ok": False, "error": "Bot token is not configured"}
     try:
-        rendered, changed = transform_payload(method, payload, get_secret_settings())
+        rendered, changed = transform_payload(method, payload, settings)
         positions = file_positions(files)
         if files and positions is None:
             rendered, changed = plain_product_payload(method, payload), False

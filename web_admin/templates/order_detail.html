@@ -48,12 +48,30 @@
   <p>Telegram receipt: <strong>{{ order.api_receipt_status or 'Not queued' }}</strong></p>
   {% if order.api_receipt_error %}<p class="muted">{{ order.api_receipt_error }}</p>{% endif %}
   {% if order.supplier_outcome_uncertain %}<p>Supplier response was uncertain. Check Vendor APIs logs and the supplier order before placing another purchase.</p>{% endif %}
-  {% if order.status == 'api_processing' %}<p>This interrupted API order requires review. Check its wallet debit marker and supplier logs before refunding or delivering it.</p>{% endif %}
+  {% if order.status == 'api_processing' %}
+  <p>Interrupted purchases are checked automatically after their active purchase lock expires. Saved deliveries can complete and confirmed unused charges can be refunded. Uncertain vendor purchases require owner review.</p>
+  {% if order.api_recovery_reason %}<p><strong>Recovery:</strong> {{ order.api_recovery_reason }}</p>{% endif %}
+  {% if current_admin_role == 'owner' %}
+  <form method="post" action="{{ url_for('recover_api_order', order_id=order.order_id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit">Check safe recovery now</button>
+  </form>
+  {% if order.api_recovery_state == 'review' %}
+  <form method="post" action="{{ url_for('recover_api_order', order_id=order.order_id) }}" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Resolution<select name="action"><option value="complete">Complete with confirmed vendor items</option><option value="refund">Refund after verifying no delivery</option></select></label>
+    <label>Confirmed vendor items<textarea name="items" rows="5" placeholder="Separate units with a line containing ---"></textarea><small>Enter only the missing vendor units. Reserved local stock is included automatically.</small></label>
+    <label>Review note<input name="note" required maxlength="1000" placeholder="Existing vendor order checked and outcome confirmed"></label>
+    <label><input type="checkbox" name="verified" value="1" required> I checked the existing vendor order and confirmed this resolution.</label>
+    <button type="submit">Apply verified resolution</button>
+  </form>
+  {% endif %}{% endif %}{% endif %}
   {% if current_admin_role == 'owner' and order.status == 'delivered' and order.api_receipt_status == 'failed' %}
   <form method="post" action="{{ url_for('retry_api_receipt', order_id=order.order_id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry Telegram receipt</button></form>
   {% endif %}
 </section>
 {% endif %}
+{% if order.wallet_credit_state in ['pending', 'review'] %}<section class="panel"><h2>Wallet refund</h2><p>Status: {{ order.wallet_credit_state }}. {{ order.wallet_credit_error or 'The recorded credit will be retried automatically.' }}</p></section>{% endif %}
 {% if delivery_revoked %}
 <section class="panel revoked-delivery-panel">
   <h2>Delivery revoked</h2>

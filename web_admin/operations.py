@@ -23,6 +23,8 @@ from utils.wallet_audit import reconcile_user
 from web_admin.delivery_queue import enqueue_job
 from web_admin.api_balance_alerts import DEFAULTS as API_BALANCE_DEFAULTS, validate_settings as validate_api_balance_settings, process_alerts
 from utils.stock_reservations import sweep_reservations
+from utils.wallet_credits import recover_credits
+from web_admin.api_recovery import process_recovery
 from utils.stock_subscriptions import DEFAULTS as STOCK_NOTICE_DEFAULTS
 from utils.buyer_api_settings import DEFAULTS as BUYER_API_DEFAULTS, normalize_endpoint_url
 from web_admin.stock_notifications import process_subscriptions
@@ -295,6 +297,8 @@ def service_tick(app, shop):
     pulse = threading.Thread(target=heartbeat, daemon=True); pulse.start()
     try:
         with work_guard(db):
+            recover_credits(db)
+            process_recovery(app, shop)
             sweep_reservations(db)
             process_alerts(app, shop, settings)
             process_subscriptions(app, shop, settings)
