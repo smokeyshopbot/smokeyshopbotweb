@@ -131,12 +131,14 @@ def reconcile_user(db, user):
         if abs(difference) > Decimal("0.00001" if currency == "usdt" else "0.005") or actual < 0:
             report["issues"].append(currency + " balance mismatch")
     projection = {field: 1 for field in ("ref_id", "order_id", "wallet_event_id", "wallet_event_delta", "wallet_refund_event_id", "wallet_refund_event_delta",
-        "wallet_charge_applied_at", "api_stage", "wallet_credited_at", "wallet_adjusted_at", "refund_wallet_credited_at", "paid_at", "created_at")}
-    records = list(db.pending_payments.find({"user_id": uid, "wallet_event_id": {"$exists": True}}, projection))
-    records += list(db.orders.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_refund_event_id": {"$exists": True}}]}, projection))
+        "wallet_credit_state", "wallet_credit_error", "wallet_charge_applied_at", "api_stage", "wallet_credited_at", "wallet_adjusted_at", "refund_wallet_credited_at", "paid_at", "created_at")}
+    records = list(db.pending_payments.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_credit_state": "review"}]}, projection))
+    records += list(db.orders.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_refund_event_id": {"$exists": True}}, {"wallet_credit_state": "review"}]}, projection))
     references = set()
     cutoff = report["checked_at"].timestamp() - 300
     for record in records:
+        if record.get("wallet_credit_state") == "review":
+            report["issues"].append("Wallet credit requires verification: " + str(record.get("ref_id") or record.get("order_id")))
         for field, amount_field in (("wallet_event_id", "wallet_event_delta"), ("wallet_refund_event_id", "wallet_refund_event_delta")):
             identifier = record.get(field)
             if not identifier: continue
