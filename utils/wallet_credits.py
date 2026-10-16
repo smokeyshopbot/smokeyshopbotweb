@@ -1,7 +1,7 @@
 """Retryable wallet-credit intents. Completion follows an idempotent wallet event."""
 from datetime import datetime, timezone
 from decimal import Decimal
-from utils.wallet_audit import change_wallet, change_wallet_async, event_id, LEGACY_CREDIT_ERROR, legacy_credit_history
+from utils.wallet_events import change_wallet, change_wallet_async, event_id
 
 
 class WalletCreditReview(RuntimeError):
@@ -27,13 +27,7 @@ def _credit(kind, reference, user_id=None):
     row = yield collection, 'find_one', ({key: reference},), {}
     if not row or (user_id is not None and int(row.get('user_id', 0)) != int(user_id)):
         return None
-    if row.get('wallet_credit_state') in {'done', 'legacy_unverified'}:
-        return None
-    if legacy_credit_history(row):
-        yield collection, 'update_one', ({'_id': row['_id'], 'wallet_credit_state': 'review',
-            'wallet_credit_error': LEGACY_CREDIT_ERROR, 'wallet_credit_version': {'$in': [None, 0]}}, {'$set': {
-                'wallet_credit_state': 'legacy_unverified', 'wallet_credit_history_note': LEGACY_CREDIT_ERROR,
-                'wallet_credit_classified_at': datetime.now(timezone.utc)}, '$unset': {'wallet_credit_error': ''}}), {}
+    if row.get('wallet_credit_state') in {'done', 'legacy_completed', 'legacy_unverified'}:
         return None
     if row.get('wallet_credit_state') == 'review':
         raise WalletCreditReview('Wallet credit needs owner review; no extra credit was applied')
@@ -67,8 +61,7 @@ def _credit(kind, reference, user_id=None):
         event = yield 'wallet_ledger', 'find_one', ({'_id': identifier},), {}
         if not event:
             yield collection, 'update_one', ({'_id': row['_id'], 'wallet_credit_state': {'$exists': False}},
-                {'$set': {'wallet_credit_state': 'legacy_unverified', 'wallet_credit_history_note': LEGACY_CREDIT_ERROR,
-                          'wallet_credit_classified_at': datetime.now(timezone.utc)}}), {}
+                {'$set': {'wallet_credit_state': 'legacy_completed'}}), {}
             return None  # The old completion is not proof that another credit is owed.
     if row.get('wallet_credit_state') != 'pending':
         fields = {'wallet_credit_state': 'pending', 'wallet_credit_version': 1,
@@ -151,11 +144,9 @@ def _recovery_sources():
     return (
         ('pending_payments', 'topup', {'pay_type': 'wallet', 'admin_wallet_adjustment': {'$ne': True}, 'method': {'$nin': ['admin_add', 'admin_remove']}, '$or': [
             {'wallet_credit_state': 'pending'},
-            {'wallet_credit_state': 'review', 'wallet_credit_error': LEGACY_CREDIT_ERROR, 'wallet_credit_version': {'$in': [None, 0]}},
             {'wallet_credit_state': {'$exists': False}, 'status': {'$in': ['confirmed', 'approved', 'completed']}}]}),
         ('orders', 'refund', {'$or': [
             {'wallet_credit_state': 'pending', 'refund_status': 'wallet_credit_pending'},
-            {'wallet_credit_state': 'review', 'wallet_credit_error': LEGACY_CREDIT_ERROR, 'wallet_credit_version': {'$in': [None, 0]}},
             {'wallet_credit_state': {'$exists': False}, 'refund_status': 'wallet_credited'}]}))
 
 
