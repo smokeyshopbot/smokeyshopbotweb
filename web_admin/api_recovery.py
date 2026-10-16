@@ -5,7 +5,7 @@ from decimal import Decimal
 from flask import request, flash, redirect, url_for
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
-from utils.wallet_audit import change_wallet, event_id
+from utils.wallet_events import change_wallet, event_id
 from utils.stock_reservations import release_stock
 
 

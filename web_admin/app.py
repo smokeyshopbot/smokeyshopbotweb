@@ -67,7 +67,8 @@ from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
 from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amount_from_error
 from utils.channel_gate_settings import validate_channel_settings
 from utils.data_guard import GuardedDatabase, work_guard
-from utils.wallet_audit import change_wallet, event_id
+from utils.wallet_events import change_wallet, event_id
+from utils.runtime_upgrade import remove_obsolete_state
 from utils.wallet_credits import WalletCreditReview, credit_topup, ensure_indexes as ensure_wallet_credit_indexes
 from utils.stock_reservations import reserve_stock, release_stock
 from web_admin.operations import DEFAULTS as OPERATIONS_DEFAULTS, BOOL_KEYS as OPERATIONS_BOOL_KEYS, validate_settings as validate_operations_settings, register_operations_routes, start_operations_worker
@@ -799,6 +800,7 @@ def stock_manager_payout_paid_by_label(db, record: dict | None) -> str:
 def create_app() -> Flask:
     app = Flask(__name__)
     app.db = GuardedDatabase(_connect_db())  # type: ignore[attr-defined]
+    remove_obsolete_state(app.db)
     app.db.wallet_ledger.create_index([("user_id", 1), ("currency", 1)])
     ensure_api_indexes(app.db)
     ensure_wallet_credit_indexes(app.db)
@@ -843,7 +845,7 @@ def create_app() -> Flask:
     @app.before_request
     def coordinate_database_work():
         if request.endpoint == "static": return None
-        if request.method == "GET" and request.endpoint in {"secret_settings_form", "wallet_reconciliation"}:
+        if request.method == "GET" and request.endpoint in {"secret_settings_form"}:
             g.read_only_backup_status = True
             return None
         guard = work_guard(app.db, wait=False)
@@ -5895,7 +5897,7 @@ def register_routes(app: Flask) -> None:
                 complete_wallet_load(app.db, int(pending.get("user_id", 0) or 0), pending)
             except WalletCreditReview:
                 log_admin_action(app.db, "payment_approved_credit_review", ref_id)
-                flash("Payment confirmed; the wallet credit needs owner review. Check Wallet Reconciliation.", "warning")
+                flash("Payment confirmed; the wallet credit needs owner review. Open this payment record to check its status.", "warning")
                 return redirect(url_for("payments"))
         log_admin_action(app.db, "payment_approved", ref_id)
         flash(f"Payment {ref_id} approved and completed.", "success")

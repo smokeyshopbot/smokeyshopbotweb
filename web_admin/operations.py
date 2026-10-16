@@ -1,9 +1,8 @@
-"""Scheduled encrypted Telegram exports and wallet reconciliation. No restore routes."""
+"""Scheduled encrypted Telegram exports and background order services. No restore routes."""
 import base64
 import hashlib
 import json
 import os
-import re
 import shutil
 import tarfile
 import tempfile
@@ -17,11 +16,9 @@ from zoneinfo import ZoneInfo
 import requests
 from bson import BSON, json_util
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from flask import Response, flash, redirect, render_template, url_for
+from flask import Response, flash, redirect, url_for
 from pymongo import ReturnDocument
 from utils.data_guard import freeze_writes, raw_database, work_guard, as_utc
-from utils.wallet_audit import reconcile_user
-from web_admin.delivery_queue import enqueue_job
 from web_admin.api_balance_alerts import DEFAULTS as API_BALANCE_DEFAULTS, validate_settings as validate_api_balance_settings, process_alerts
 from utils.stock_reservations import sweep_reservations
 from utils.wallet_credits import recover_credits
@@ -40,16 +37,14 @@ DEFAULTS = {
     "backup_timezone": "Asia/Kolkata", "backup_interval_hours": "24", "backup_chunk_mb": "18",
     "backup_timeout_minutes": "10", "backup_max_mb": "512", "backup_retry_minutes": "30",
     "backup_temp_retention_hours": "24", "backup_encryption_key": "",
-    "wallet_reconcile_enabled": "1", "wallet_reconcile_interval_minutes": "60", "wallet_reconcile_alert_chat_id": "",
 }
-BOOL_KEYS = {"backup_enabled", "wallet_reconcile_enabled", "api_allow_legacy_query_keys", "api_low_balance_alerts_enabled", "stock_reservations_enabled"}
+BOOL_KEYS = {"backup_enabled", "api_allow_legacy_query_keys", "api_low_balance_alerts_enabled", "stock_reservations_enabled"}
 INTEGER_LIMITS = {
     "stock_available_again_delay_seconds": (0, 600),
     "stock_available_again_cooldown_minutes": (1, 10080),
     "api_key_requests_per_minute": (1, 10000), "api_ip_requests_per_minute": (1, 100000),
     "backup_interval_hours": (1, 720), "backup_chunk_mb": (1, 18), "backup_timeout_minutes": (1, 30),
     "backup_max_mb": (1, 2048), "backup_retry_minutes": (5, 1440), "backup_temp_retention_hours": (1, 168),
-    "wallet_reconcile_interval_minutes": (5, 10080),
 }
 MAGIC = b"SHOPBACKUP1"
 TRANSIENT = {"operational_control", "api_rate_limits", "api_purchase_locks", "runtime_locks"}
@@ -84,7 +79,7 @@ def validate_settings(settings):
         datetime.strptime(result["backup_time"], "%H:%M")
         ZoneInfo(result["backup_timezone"])
     except (ValueError, KeyError): raise ValueError("Enter a valid backup time and timezone, e.g. 02:00 and Asia/Kolkata") from None
-    for key in ("backup_chat_id", "wallet_reconcile_alert_chat_id"):
+    for key in ("backup_chat_id",):
         if result[key]:
             try: chat_id = int(result[key])
             except ValueError: raise ValueError(key.replace("_", " ") + " must be a numeric Telegram chat ID") from None
@@ -256,45 +251,6 @@ def run_backup(app, shop, settings):
         state.update_one({"_id": "backup"}, {"$set": {"error": "Backup delivered; encrypted temporary files await cleanup"}})
 
 
-def process_reconciliation(app, shop, settings):
-    db = app.db
-    state = db.operational_control.find_one({"_id": "reconciliation"}) or {}
-    if state.get("history_classification_version") != 1:
-        # Once per upgrade, replace the old history-only review reports promptly.
-        fields = {"history_classification_version": 1, "running": True, "cursor": None, "next_at": now()}
-        db.operational_control.update_one({"_id": "reconciliation"}, {"$set": fields}, upsert=True)
-        state.update(fields)
-    if not state.get("running") and as_utc(state.get("next_at", now())) > now(): return
-    query = {"_id": {"$gt": state["cursor"]}} if state.get("cursor") else {}
-    users = list(db.users.find(query).sort("_id", 1).limit(50))
-    for user in users:
-        if "user_id" not in user: continue
-        previous = user.get("wallet_reconciliation", {})
-        try:
-            report = reconcile_user(db, user)
-        except Exception:
-            app.logger.error("Wallet audit failed for user %s; inspect wallet records.", user["user_id"])
-            report = {"status": "review", "checked_at": now(), "issues": ["Wallet records could not be checked; review ledger and stored amounts"],
-                "inr": {"expected": None, "actual": user.get("wallet_inr"), "difference": None},
-                "usdt": {"expected": None, "actual": user.get("wallet_usdt"), "difference": None}}
-            db.users.update_one({"_id": user["_id"]}, {"$set": {"wallet_reconciliation": report}})
-        if report and report["status"] == "ok" and (previous.get("status") == "review" or (report.get("history_notes") and not previous.get("history_notes"))):
-            # Includes untagged alerts already queued by the previous release.
-            prefix = "⚠️ Wallet review required\nUser: " + str(user["user_id"]) + "\n"
-            db.delivery_jobs.update_many({"kind": "text", "status": "queued", "acknowledged_at": {"$exists": False},
-                "send_started_at": {"$exists": False}, "$or": [{"payload.wallet_review_user_id": user["user_id"]},
-                    {"payload.text": re.compile("^" + re.escape(prefix))}]}, {"$set": {
-                        "status": "cancelled", "updated_at": now(), "expires_at": now() + timedelta(days=30),
-                        "error": "Wallet now reconciles; old history-only/resolved alert cancelled"}})
-        if report and report["status"] == "review" and report["issues"] != previous.get("issues"):
-            targets = [int(settings["wallet_reconcile_alert_chat_id"])] if settings["wallet_reconcile_alert_chat_id"] else shop.get_admin_ids(db)
-            for target in targets:
-                enqueue_job(db, "text", {"chat_id": target, "wallet_review_user_id": user["user_id"],
-                    "wallet_review_issues": report["issues"], "text": f"⚠️ Wallet review required\nUser: {user['user_id']}\n" + "\n".join(report["issues"]) + "\nOpen WebAdmin → Wallet reconciliation. Balances were not automatically changed."})
-    fields = {"running": bool(users), "checked_at": now()}
-    if users: fields["cursor"] = users[-1]["_id"]
-    else: fields.update(cursor=None, next_at=now() + timedelta(minutes=int(settings["wallet_reconcile_interval_minutes"])))
-    db.operational_control.update_one({"_id": "reconciliation"}, {"$set": fields}, upsert=True)
 
 
 def service_tick(app, shop):
@@ -333,8 +289,6 @@ def service_tick(app, shop):
                 app.logger.error("Telegram backup failed (%s); see Secret Settings status.", type(error).__name__)
                 safe_error = str(error) if isinstance(error, (ValueError, RuntimeError, TimeoutError)) else "Backup failed; check server logs, database access and Telegram connectivity"
                 control.update_one({"_id": "backup"}, {"$set": {"status": "failed", "error": safe_error[:400], "retry_at": now() + timedelta(minutes=int(settings["backup_retry_minutes"]))}})
-        if settings["wallet_reconcile_enabled"] == "1":
-            with work_guard(db): process_reconciliation(app, shop, settings)
         retention = now().timestamp() - int(settings["backup_temp_retention_hours"]) * 3600
         for path in Path(tempfile.gettempdir()).glob(backup_temp_prefix(db) + "*"):
             if is_backup_directory(db, path) and path.is_dir() and path.stat().st_mtime < retention:
@@ -382,22 +336,3 @@ def register_operations_routes(app, shop):
             shop.set_secret_settings(app.db, settings, preserve_routing=True)
         return Response(settings["backup_encryption_key"] + "\n", mimetype="text/plain",
             headers={"Content-Disposition": "attachment; filename=shop-backup-encryption-key.txt", "Cache-Control": "no-store"})
-
-    @app.get("/wallet-reconciliation")
-    @shop.login_required
-    @shop.owner_required
-    def wallet_reconciliation():
-        users = list(app.db.users.find({"wallet_reconciliation.status": "review"}).limit(200))
-        history_users = list(app.db.users.find({"wallet_reconciliation.status": "ok",
-            "wallet_reconciliation.history_notes.0": {"$exists": True}}).limit(50))
-        state = app.db.operational_control.find_one({"_id": "reconciliation"}) or {}
-        return render_template("wallet_reconciliation.html", users=users, history_users=history_users, state=state)
-
-    @app.post("/wallet-reconciliation/run")
-    @shop.login_required
-    @shop.owner_required
-    @shop.csrf_required
-    def wallet_reconciliation_run():
-        app.db.operational_control.update_one({"_id": "reconciliation"}, {"$set": {"running": False, "cursor": None, "next_at": now()}}, upsert=True)
-        flash("Wallet reconciliation requested. The background worker will scan accounts.", "success")
-        return redirect(url_for("wallet_reconciliation"))

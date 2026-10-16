@@ -7,7 +7,7 @@ from flask import flash, jsonify, redirect, request, url_for, g, make_response
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from web_admin.api_security import request_key, rate_limit, ensure_security_indexes
-from utils.wallet_audit import change_wallet, event_id
+from utils.wallet_events import change_wallet, event_id
 from utils.stock_reservations import reserve_stock, release_stock
 from werkzeug.exceptions import TooManyRequests
 from utils.extra_i18n import api_message
