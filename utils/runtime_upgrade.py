@@ -10,7 +10,8 @@ def _cleanup_plan():
     yield 'settings', 'update_one', ({'key': 'secret_settings'}, {'$unset': {'value.' + key: '' for key in old_settings}})
     yield 'settings', 'delete_many', ({'key': {'$in': old_settings}},)
     yield 'operational_control', 'delete_one', ({'_id': 'reconciliation'},)
-    notice = re.compile(r'^⚠\ufe0f? Wallet review required\s+User: \d+\s')
+    # Use a literal variation selector: MongoDB PCRE2 rejects Python Unicode escapes.
+    notice = re.compile(r'^⚠️? Wallet review required\s+User: \d+\s')
     yield 'delivery_jobs', 'delete_many', ({'$or': [{'payload.wallet_review_user_id': {'$exists': True}}, {'payload.text': notice}]},)
     yield 'sent_notifications', 'delete_many', ({'text_preview': notice},)
     for collection in ('pending_payments', 'orders'):
