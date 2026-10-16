@@ -8,6 +8,12 @@
 <section class="panel"><h2>Accounts needing review</h2>
 {% for user in users %}<article class="setting-card"><h3><a href="{{ url_for('user_detail', user_id=user.user_id) }}">{{ user.user_id }}{% if user.username %} — @{{ user.username }}{% endif %}</a></h3>
 <p>{{ user.wallet_reconciliation.issues|join('; ') }}</p><p>Checked: {{ user.wallet_reconciliation.checked_at|fmt_dt }}</p>
+{% if user.wallet_reconciliation.history_notes %}<details><summary>Older records without audit references</summary><ul>{% for note in user.wallet_reconciliation.history_notes %}<li>{{ note }}</li>{% endfor %}</ul></details>{% endif %}
 <div class="table-wrap"><table><thead><tr><th>Currency</th><th>Expected</th><th>Actual</th><th>Difference</th></tr></thead><tbody>{% for currency in ['usdt', 'inr'] %}{% set row = user.wallet_reconciliation[currency] %}<tr><td>{{ currency|upper }}</td><td>{{ row.expected }}</td><td>{{ row.actual }}</td><td>{{ row.difference }}</td></tr>{% endfor %}</tbody></table></div></article>
 {% else %}<p>No accounts are currently flagged. A scan must finish before this is meaningful.</p>{% endfor %}</section>
+<section class="panel"><h2>Matched balances with older records</h2>
+<p class="muted">These accounts match their recorded opening checkpoint and wallet changes. Older completed credits lack audit references and are shown for information. They are not credited again or treated as missing money. This does not independently verify transactions before the checkpoint. Showing up to 50 accounts.</p>
+{% for user in history_users %}<article class="setting-card"><h3><a href="{{ url_for('user_detail', user_id=user.user_id) }}">{{ user.user_id }}{% if user.username %} — @{{ user.username }}{% endif %}</a></h3>
+<details><summary>{{ user.wallet_reconciliation.history_notes|length }} historical record note(s)</summary><ul>{% for note in user.wallet_reconciliation.history_notes %}<li>{{ note }}</li>{% endfor %}</ul></details></article>
+{% else %}<p>No history-only notes in the completed scan.</p>{% endfor %}</section>
 {% endblock %}

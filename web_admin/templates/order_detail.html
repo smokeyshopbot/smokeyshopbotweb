@@ -72,6 +72,7 @@
 </section>
 {% endif %}
 {% if order.wallet_credit_state in ['pending', 'review'] %}<section class="panel"><h2>Wallet refund</h2><p>Status: {{ order.wallet_credit_state }}. {{ order.wallet_credit_error or 'The recorded credit will be retried automatically.' }}</p></section>{% endif %}
+{% if order.wallet_credit_state == 'legacy_unverified' %}<section class="panel"><h2>Historical wallet refund</h2><p>This completed refund has no reliable audit reference. It is retained as a history note and has not been credited again.</p></section>{% endif %}
 {% if delivery_revoked %}
 <section class="panel revoked-delivery-panel">
   <h2>Delivery revoked</h2>

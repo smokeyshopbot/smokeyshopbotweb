@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -258,6 +259,11 @@ def run_backup(app, shop, settings):
 def process_reconciliation(app, shop, settings):
     db = app.db
     state = db.operational_control.find_one({"_id": "reconciliation"}) or {}
+    if state.get("history_classification_version") != 1:
+        # Once per upgrade, replace the old history-only review reports promptly.
+        fields = {"history_classification_version": 1, "running": True, "cursor": None, "next_at": now()}
+        db.operational_control.update_one({"_id": "reconciliation"}, {"$set": fields}, upsert=True)
+        state.update(fields)
     if not state.get("running") and as_utc(state.get("next_at", now())) > now(): return
     query = {"_id": {"$gt": state["cursor"]}} if state.get("cursor") else {}
     users = list(db.users.find(query).sort("_id", 1).limit(50))
@@ -272,10 +278,19 @@ def process_reconciliation(app, shop, settings):
                 "inr": {"expected": None, "actual": user.get("wallet_inr"), "difference": None},
                 "usdt": {"expected": None, "actual": user.get("wallet_usdt"), "difference": None}}
             db.users.update_one({"_id": user["_id"]}, {"$set": {"wallet_reconciliation": report}})
+        if report and report["status"] == "ok" and (previous.get("status") == "review" or (report.get("history_notes") and not previous.get("history_notes"))):
+            # Includes untagged alerts already queued by the previous release.
+            prefix = "⚠️ Wallet review required\nUser: " + str(user["user_id"]) + "\n"
+            db.delivery_jobs.update_many({"kind": "text", "status": "queued", "acknowledged_at": {"$exists": False},
+                "send_started_at": {"$exists": False}, "$or": [{"payload.wallet_review_user_id": user["user_id"]},
+                    {"payload.text": re.compile("^" + re.escape(prefix))}]}, {"$set": {
+                        "status": "cancelled", "updated_at": now(), "expires_at": now() + timedelta(days=30),
+                        "error": "Wallet now reconciles; old history-only/resolved alert cancelled"}})
         if report and report["status"] == "review" and report["issues"] != previous.get("issues"):
             targets = [int(settings["wallet_reconcile_alert_chat_id"])] if settings["wallet_reconcile_alert_chat_id"] else shop.get_admin_ids(db)
             for target in targets:
-                enqueue_job(db, "text", {"chat_id": target, "text": f"⚠️ Wallet review required\nUser: {user['user_id']}\n" + "\n".join(report["issues"]) + "\nOpen WebAdmin → Wallet reconciliation. Balances were not automatically changed."})
+                enqueue_job(db, "text", {"chat_id": target, "wallet_review_user_id": user["user_id"],
+                    "wallet_review_issues": report["issues"], "text": f"⚠️ Wallet review required\nUser: {user['user_id']}\n" + "\n".join(report["issues"]) + "\nOpen WebAdmin → Wallet reconciliation. Balances were not automatically changed."})
     fields = {"running": bool(users), "checked_at": now()}
     if users: fields["cursor"] = users[-1]["_id"]
     else: fields.update(cursor=None, next_at=now() + timedelta(minutes=int(settings["wallet_reconcile_interval_minutes"])))
@@ -373,8 +388,10 @@ def register_operations_routes(app, shop):
     @shop.owner_required
     def wallet_reconciliation():
         users = list(app.db.users.find({"wallet_reconciliation.status": "review"}).limit(200))
+        history_users = list(app.db.users.find({"wallet_reconciliation.status": "ok",
+            "wallet_reconciliation.history_notes.0": {"$exists": True}}).limit(50))
         state = app.db.operational_control.find_one({"_id": "reconciliation"}) or {}
-        return render_template("wallet_reconciliation.html", users=users, state=state)
+        return render_template("wallet_reconciliation.html", users=users, history_users=history_users, state=state)
 
     @app.post("/wallet-reconciliation/run")
     @shop.login_required

@@ -138,6 +138,12 @@ def _handle_stock_work(app, shop, job):
 def _deliver(app, shop, job):
     db = app.db
     payload = job["payload"]
+    if payload.get("wallet_review_user_id") and not job.get("acknowledged_at"):
+        user = db.users.find_one({"user_id": payload["wallet_review_user_id"]}, {"wallet_reconciliation": 1}) or {}
+        current = user.get("wallet_reconciliation") or {}
+        if current.get("status") != "review" or current.get("issues") != payload.get("wallet_review_issues"):
+            _finish(db, job, {"status": "cancelled", "error": "Wallet finding was resolved or replaced before delivery"})
+            return
     if job['kind'] in {'emoji_test_source', 'emoji_forward', 'channel_poll', 'channel_poll_close'}:
         _finish(db, job, {'status': 'cancelled', 'error': 'Channel announcements and forwarding have been removed.'})
         return
