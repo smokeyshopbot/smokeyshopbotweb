@@ -195,7 +195,8 @@ def apply_effective_price_to_product(product: dict, user: dict | None = None, cu
     product["effective_price_group"] = group_key
     product["effective_price_group_label"] = price_group_label(group_key)
     product["effective_price_source"] = source
-    return product
+    from utils.promotions import apply_sale
+    return apply_sale(product)
 
 
 async def get_user_product_custom_price(user_id: int, product_name: str) -> dict | None:
@@ -1645,6 +1646,7 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "price_inr": 1,
         "price_usdt": 1,
         "price_group_prices": 1,
+        "sale": 1,
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
