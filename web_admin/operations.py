@@ -269,6 +269,9 @@ def service_tick(app, shop):
     try:
         with work_guard(db):
             recover_credits(db)
+            from web_admin.promotions import process_sales, recover_coupons
+            process_sales(db, shop)
+            recover_coupons(db, shop)
             process_recovery(app, shop)
             sweep_reservations(db)
             process_alerts(app, shop, settings)

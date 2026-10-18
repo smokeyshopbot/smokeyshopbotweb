@@ -4,18 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Admin Panel{% endblock %} · Telegram Shop Bot</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261015_admin_security">
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}?v=20261018_emoji_usage">
 </head>
 <body>
   {% if session.get('admin_logged_in') %}
   <header class="mobile-topbar" data-mobile-topbar>
     <button type="button" class="mobile-nav-toggle" data-mobile-nav-toggle aria-expanded="false" aria-controls="admin-sidebar-nav">☰ Menu</button>
-    <div class="mobile-topbar-title">🛍 Shop Admin</div>
+    <div class="mobile-topbar-title">Shop Admin</div>
   </header>
   <div class="sidebar-overlay" data-sidebar-overlay hidden></div>
   <aside class="sidebar" data-sidebar>
     <div class="sidebar-top">
-      <div class="brand">🛍 Shop Admin</div>
+      <div class="brand">Shop Admin</div>
       <button type="button" class="mobile-nav-toggle" data-mobile-nav-close aria-expanded="false" aria-controls="admin-sidebar-nav">✕ Close</button>
     </div>
     <nav id="admin-sidebar-nav">
@@ -29,6 +29,7 @@
       </a>
       {% endif %}
       {% if current_admin_role == 'owner' %}<a href="{{ url_for('supplier_apis') }}">Vendor APIs</a>{% endif %}
+      {% if current_admin_role == 'owner' %}<a href="{{ url_for('coupons') }}">Coupons</a>{% endif %}
       {% if can_access('users') %}<a href="{{ url_for('users') }}">Users</a>{% endif %}
       {% if can_access('orders') %}
       <a href="{{ url_for('orders', filter='status:refund_requested') if pending_refund_request_count else url_for('orders') }}" class="nav-with-badge">

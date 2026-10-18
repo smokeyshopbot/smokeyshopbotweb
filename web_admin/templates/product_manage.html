@@ -393,6 +393,22 @@ item 2"></textarea>
 
 
 {% if can_access('update_product_price') and current_admin_role == 'owner' %}
+<section class="panel" id="product-sale">
+  <h2>Timed sale</h2>
+  <p class="muted">Enter a sale price and duration. A sale starts immediately and sends a notification with a Buy product button. Lower group or personal prices stay in place. Blank currencies keep their existing price.</p>
+  {% if product.sale_running %}<p><strong>Sale is active</strong> · ends {{ product.sale.ends_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>{% endif %}
+  <form method="post" action="{{ url_for('update_product_sale', name=product.name) }}" class="stacked-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="settings-grid compact-settings-grid">
+      {% for currency in payment_currencies %}<label>Sale price ({{ currency|upper }})<input name="sale_price_{{ currency }}" type="number" min="0.01" step="0.01" max="1000000000" placeholder="Regular: {{ product['price_' + currency] or 0 }}" value="{{ product.sale.get('price_' + currency, '') if product.sale_running else '' }}"></label>{% endfor %}
+      <label>Duration<input name="duration" type="number" min="1" max="525600" value="24" required></label>
+      <label>Duration unit<select name="duration_unit"><option value="minutes">Minutes</option><option value="hours" selected>Hours</option><option value="days">Days</option></select></label>
+    </div>
+    <button class="primary" type="submit">{{ 'Replace sale and notify users' if product.sale_running else 'Start sale and notify users' }}</button>
+  </form>
+  {% if product.sale_running %}<form method="post" action="{{ url_for('update_product_sale', name=product.name) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="stop"><button type="submit">Stop sale now</button></form>{% endif %}
+  <p class="muted">A payment session already opened at the sale price keeps its agreed amount until its payment deadline. New checkouts return to their regular price at the sale deadline.</p>
+</section>
 <section class="panel custom-pricing-panel">
   <h2>Custom pricing groups</h2>
   <p class="muted">Normal users use the default product price from the Products page. Fill only the group prices you want to override. Blank fields use the default price.</p>

@@ -1,0 +1,54 @@
+{% extends 'base.html' %}
+{% block title %}Coupons{% endblock %}
+{% block content %}
+<style>#coupon-create [hidden] { display: none !important; }</style>
+<div class="page-header"><div><h1>Coupons</h1><p class="muted">Give a product or credit a user's main wallet with /redeem CODE.</p></div></div>
+<section class="panel">
+  <h2>Create coupon</h2>
+  <form method="post" action="{{ url_for('create_coupon') }}" class="stacked-form" id="coupon-create">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Coupon code<input name="code" minlength="8" maxlength="64" pattern="[A-Za-z0-9_-]{8,64}" placeholder="Leave blank to generate a random code"><small class="muted">8–64 letters, numbers, hyphens or underscores. Codes are case insensitive.</small></label>
+    <label>Reward<select name="kind" id="coupon-kind"><option value="product">Product delivery</option><option value="wallet">Wallet balance</option></select></label>
+    <div data-coupon-product class="settings-grid compact-settings-grid">
+      <label>Product<select name="product_id">{% for product in products %}<option value="{{ product._id }}">{{ product.name }}</option>{% endfor %}</select></label>
+      <label>Quantity per redemption<input name="quantity" type="number" min="1" max="100" value="1"></label>
+    </div>
+    <div data-coupon-wallet class="settings-grid compact-settings-grid" hidden>
+      <label>Wallet currency<select name="currency"><option value="usdt">USDT</option><option value="inr">INR</option></select></label>
+      <label>Amount per redemption<input name="amount" type="number" min="0.01" max="1000000000" step="0.01" placeholder="5.00"></label>
+    </div>
+    <div class="settings-grid compact-settings-grid">
+      <label>Total redemptions allowed<input name="max_uses" type="number" min="1" max="10000" value="1" required></label>
+      <label>Expires after (hours)<input name="expiry_hours" type="number" min="0" max="8760" value="24" required><small class="muted">0 = no expiry. Each user can redeem this code once.</small></label>
+    </div>
+    <p class="muted">A product coupon uses available stock, including a configured vendor if needed. Vendor costs are paid by the shop. Rewards already claimed continue if you later disable a coupon. Reward details cannot be edited after creation.</p>
+    <button class="primary" type="submit">Create coupon</button>
+  </form>
+</section>
+<section class="panel"><h2>Coupons</h2>
+  <div class="table-wrap"><table><thead><tr><th>Code</th><th>Reward</th><th>Claimed / limit</th><th>Expires (UTC)</th><th>Status</th><th></th></tr></thead><tbody>
+  {% for coupon in coupons %}<tr><td><code>{{ coupon.code }}</code></td><td>{% if coupon.kind == 'product' %}{{ coupon.product_name }} ×{{ coupon.quantity }}{% else %}{{ '%.2f'|format(coupon.amount) }} {{ coupon.currency|upper }}{% endif %}</td><td>{{ coupon.claimed_count }} / {{ coupon.max_uses }}{% if coupon.pending_count %}<br><small>{{ coupon.pending_count }} processing</small>{% endif %}</td><td>{{ coupon.expires_at.strftime('%Y-%m-%d %H:%M') if coupon.expires_at else 'No expiry' }}</td><td>{{ 'Disabled' if not coupon.enabled else 'Expired' if coupon.expired else 'Used up' if coupon.claimed_count >= coupon.max_uses else 'Active' }}</td><td><form method="post" action="{{ url_for('toggle_coupon', identifier=coupon._id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="enabled" value="{{ '0' if coupon.enabled else '1' }}"><button type="submit">{{ 'Disable' if coupon.enabled else 'Enable' }}</button></form></td></tr>
+  {% else %}<tr><td colspan="6">No coupons yet.</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="panel"><h2>Recent redemptions</h2>
+  <div class="table-wrap"><table><thead><tr><th>Code / user</th><th>Reward</th><th>Status</th><th>Claimed (UTC)</th><th></th></tr></thead><tbody>
+  {% for row in redemptions %}<tr><td><code>{{ row.code }}</code><br>{{ row.user_id }}{% if row.username %} · @{{ row.username }}{% endif %}</td><td>{% if row.kind == 'product' %}{{ row.product_name }} ×{{ row.quantity }}<br><a href="{{ url_for('orders', q=row.order_id) }}">{{ row.order_id }}</a>{% else %}{{ '%.2f'|format(row.amount) }} {{ row.currency|upper }}{% endif %}</td><td>{{ row.status }}{% if row.error %}<br><small>{{ row.error }}</small>{% endif %}</td><td>{{ row.created_at.strftime('%Y-%m-%d %H:%M') }}</td><td>{% if row.status != 'completed' %}<form method="post" action="{{ url_for('retry_coupon', identifier=row._id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry safely</button></form>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="5">No redemptions yet.</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<script>
+(() => {
+  const form = document.getElementById('coupon-create'), kind = document.getElementById('coupon-kind');
+  function refresh() {
+    const wallet = kind.value === 'wallet';
+    ['product', 'wallet'].forEach(type => {
+      const box = form.querySelector('[data-coupon-' + type + ']'), enabled = (type === 'wallet') === wallet;
+      box.hidden = !enabled;
+      box.querySelectorAll('input, select').forEach(input => { input.disabled = !enabled; input.required = enabled; });
+    });
+  }
+  kind.addEventListener('change', refresh); refresh();
+})();
+</script>
+{% endblock %}

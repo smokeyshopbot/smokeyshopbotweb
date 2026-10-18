@@ -54,6 +54,8 @@ def enqueue_notice(db, shop, payload, category):
     notification['notification_target_kind'] = 'group'
     recipient.update(text=text, parse_mode=payload.get('parse_mode'), product_name=payload.get('product_name'),
                      cleanup_previous_stock=payload.get('cleanup_previous_stock', False), notification=notification)
+    if payload.get('sale_id'):
+        recipient.update(sale_id=payload['sale_id'], sale_expires_at=payload.get('sale_expires_at'))
     if payload.get('product_name'):
         product = db.products.find_one({'name': shop.name_regex(payload['product_name'])}, {'_id': 1})
         if product:

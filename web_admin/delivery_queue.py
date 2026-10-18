@@ -61,9 +61,20 @@ def _finish(db, job, fields):
         {"$set": fields, "$unset": {"lease_until": "", "claim_token": ""}})
 
 
+def _sale_unavailable(db, payload):
+    if not payload.get('sale_id'):
+        return False
+    from utils.promotions import active_sale
+    product = db.products.find_one({'name': payload.get('product_name')}, {'sale': 1, 'enabled': 1})
+    return not product or product.get('enabled') is False or active_sale(product).get('id') != payload['sale_id']
+
+
 def _expand_bulk(app, shop, job):
     db = app.db
     payload = job["payload"]
+    if _sale_unavailable(db, payload):
+        _finish(db, job, {'status': 'cancelled', 'error': 'Sale ended or was replaced before delivery'})
+        return
     maintenance = shop.get_setting(db, "maintenance_mode", False)
     if maintenance and payload.get("maintenance_policy") == "pause":
         _finish(db, job, {"status": "queued", "next_attempt_at": now() + timedelta(seconds=10)})
@@ -97,6 +108,8 @@ def _expand_bulk(app, shop, job):
                  "stock_notice_started_at": job["created_at"],
                  "maintenance_policy": payload.get("maintenance_policy", "continue"), "bulk_recipient": True,
                  "admin_recipient": uid in payload.get("admin_ids", [])}
+        if payload.get('sale_id'):
+            child.update(sale_id=payload['sale_id'], sale_expires_at=payload.get('sale_expires_at'))
         children.append({"job_id": f"{job['job_id']}:{uid}", "kind": "text", "payload": child,
                          "parent_id": job["job_id"], "priority": 20, "attempts": 0,
                          "status": "queued" if text else "cancelled", "created_at": created,
@@ -138,6 +151,9 @@ def _handle_stock_work(app, shop, job):
 def _deliver(app, shop, job):
     db = app.db
     payload = job["payload"]
+    if not job.get('acknowledged_at') and _sale_unavailable(db, payload):
+        _finish(db, job, {'status': 'cancelled', 'error': 'Sale ended or was replaced before delivery'})
+        return
     if job['kind'] in {'emoji_test_source', 'emoji_forward', 'channel_poll', 'channel_poll_close'}:
         _finish(db, job, {'status': 'cancelled', 'error': 'Channel announcements and forwarding have been removed.'})
         return

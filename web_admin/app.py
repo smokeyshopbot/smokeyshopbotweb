@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
 from web_admin.api_recovery import register_routes as register_api_recovery_routes
+from web_admin.promotions import register_promotions
+from web_admin.emoji_usage import EMOJI_USAGE
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
@@ -1011,6 +1013,7 @@ def create_app() -> Flask:
     register_delivery_routes(app, sys.modules[__name__])
     register_operations_routes(app, sys.modules[__name__])
     register_vendor_catalog_routes(app, sys.modules[__name__])
+    register_promotions(app, sys.modules[__name__])
     if _env_bool("ADMIN_BACKGROUND_WORKER", True):
         start_delivery_worker(app, sys.modules[__name__])
         start_operations_worker(app, sys.modules[__name__])
@@ -1780,7 +1783,7 @@ def fulfill_product_items(db, product_name: str, quantity: int, *, order_id: str
     reservation = None
     if order and order.get("stock_reservation_enabled"):
         reservation = reserve_stock(db, order_id, product_name, quantity, order["user_id"], protected=True, partial=True,
-                                    pending_quantity=get_pending_stock_quantity(db, product_name) if reserve_pending else 0)
+                                    pending_quantity=get_pending_stock_quantity(db, product_name) if reserve_pending or order.get("coupon_redemption_id") else 0)
         if not reservation.get("ok"):
             return {"items": [], "source": "none", "error": "Stock reservation is busy"}
     local = list(reservation["items"]) if reservation else pop_available_stock_for_admin_send(db, product_name, quantity, reserve_pending=reserve_pending, partial=True)
@@ -1987,6 +1990,7 @@ def register_routes(app: Flask) -> None:
             backup_state=app.db.operational_control.find_one({"_id": "backup"}) or {},
             emoji_choices=EMOJI_CHOICES,
             premium_mapping=premium_mapping(settings),
+            emoji_usage=EMOJI_USAGE,
         )
 
     @app.post("/secret-settings")
@@ -2084,11 +2088,11 @@ def register_routes(app: Flask) -> None:
             for error in validation_errors:
                 flash(error, "error")
             return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
-                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings)), 400
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE), 400
         if not settings.get("bot_token"):
             flash("Telegram bot token is required before the bot can start.", "error")
             return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
-                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings)), 400
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE), 400
         if not settings.get("admin_panel_username") and not os.getenv("ADMIN_PANEL_USERNAME"):
             settings["admin_panel_username"] = "admin"
         set_secret_settings(app.db, settings, preserve_routing=True)
@@ -3018,6 +3022,8 @@ def register_routes(app: Flask) -> None:
         product["supplier_fallback_map"] = {str(row.get("priority")): row for row in product["supplier_fallbacks"]}
         product["warranty_days"] = parse_positive_int(product.get("warranty_days"), 0, minimum=0)
         product["price_group_rows"] = build_price_group_rows(product)
+        from utils.promotions import active_sale
+        product["sale_running"] = bool(active_sale(product))
         if product["max_order_quantity"] < product["min_order_quantity"]:
             product["max_order_quantity"] = product["min_order_quantity"]
         stock_view_items = build_current_stock_view(
@@ -5074,7 +5080,7 @@ def register_routes(app: Flask) -> None:
                 if q.isdigit():
                     ors.append({"user_id": int(q)})
             query["$or"] = ors
-        valid_statuses = {"pending", "delivered", "pending_stock", "expired", "failed", "cancelled", "refund_requested", "awaiting_refund_choice", "wallet_credited", "refund_paid"}
+        valid_statuses = {"pending", "delivered", "pending_stock", "coupon_processing", "expired", "failed", "cancelled", "refund_requested", "awaiting_refund_choice", "wallet_credited", "refund_paid"}
         if status not in valid_statuses:
             status = ""
         if status:
@@ -5089,9 +5095,9 @@ def register_routes(app: Flask) -> None:
         payment_settings = get_payment_settings(app.db)
         methods = sorted([
             m for m in app.db.orders.distinct("payment_method", {"is_replacement": {"$ne": True}})
-            if m and payment_method_enabled(payment_settings, m)
+            if m and (m == 'coupon' or payment_method_enabled(payment_settings, m))
         ])
-        if method and (method not in methods or not payment_method_enabled(payment_settings, method)):
+        if method and (method not in methods or (method != 'coupon' and not payment_method_enabled(payment_settings, method))):
             method = ""
         if method:
             query["payment_method"] = method
@@ -7825,7 +7831,8 @@ def product_effective_price(product: dict, user: dict | None = None, custom_pric
     product["effective_price_group"] = group_key
     product["effective_price_group_label"] = price_group_label(group_key)
     product["effective_price_source"] = source
-    return product
+    from utils.promotions import apply_sale
+    return apply_sale(product)
 
 
 def user_product_custom_price_map(db, user_id: int) -> dict[str, dict]:
@@ -9691,6 +9698,7 @@ def _products_with_stock_counts(db, query: dict[str, Any], *, include_stock_item
         "price_inr": 1,
         "price_usdt": 1,
         "price_group_prices": 1,
+        "sale": 1,
         "enabled": 1,
         "created_at": 1,
         "shop_order": 1,
@@ -10645,6 +10653,7 @@ def notification_type_label(value: str | None) -> str:
         "new_stock": "Fresh stock",
         "stock_available_again": "Stock available again",
         "price_drop": "Price drop",
+        "sale": "Sale",
         "wallet_adjustment": "Wallet adjustment",
         "api_low_balance": "API low balance",
         "payment": "Payment notice",
@@ -11999,7 +12008,7 @@ def status_badge_class(status: str | None) -> str:
     status_key = (status or "unknown").lower()
     if status_key in {"delivered", "confirmed", "completed", "approved", "wallet_credited", "refund_paid"}:
         return "status-badge status-green"
-    if status_key in {"pending", "pending_stock", "needs_review", "waiting", "upi_submitted", "binance_submitted", "usdt_manual_submitted", "awaiting_refund_choice", "waiting_user_choice", "refund_requested"}:
+    if status_key in {"pending", "pending_stock", "coupon_processing", "needs_review", "waiting", "upi_submitted", "binance_submitted", "usdt_manual_submitted", "awaiting_refund_choice", "waiting_user_choice", "refund_requested"}:
         return "status-badge status-yellow"
     if status_key in {"failed", "expired", "rejected", "blocked", "revoked", "cancelled"}:
         return "status-badge status-red"
@@ -12037,6 +12046,7 @@ def method_label(method: str | None) -> str:
         "usdt_polygon": "USDT (POLYGON)",
         "binance": "Binance Pay",
         "replacement": "Replacement",
+        "coupon": "Coupon",
         "admin": "Admin wallet adjustment",
         "admin_add": "Admin wallet add",
         "admin_remove": "Admin wallet remove",

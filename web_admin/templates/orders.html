@@ -24,7 +24,7 @@
       <select name="filter">
         <option value="" {% if not filter_value %}selected{% endif %}>All orders</option>
         <optgroup label="By status">
-          {% for s in ['pending','delivered','pending_stock','cancelled','refund_requested','awaiting_refund_choice','wallet_credited','refund_paid','expired','failed'] %}<option value="status:{{ s }}" {% if filter_value == 'status:' ~ s %}selected{% endif %}>{{ status_label(s) }}</option>{% endfor %}
+          {% for s in ['pending','delivered','pending_stock','coupon_processing','cancelled','refund_requested','awaiting_refund_choice','wallet_credited','refund_paid','expired','failed'] %}<option value="status:{{ s }}" {% if filter_value == 'status:' ~ s %}selected{% endif %}>{{ status_label(s) }}</option>{% endfor %}
         </optgroup>
         {% if methods %}
         <optgroup label="By payment method">
