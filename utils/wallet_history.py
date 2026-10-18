@@ -26,6 +26,8 @@ def method_label(method: str) -> str:
         return "USDT (BEP20)"
     if method in {"polygon", "usdt_polygon", "polygon_usdt"}:
         return "USDT (POLYGON)"
+    if method == "coupon":
+        return "Coupon"
     if method == "upi":
         return "UPI"
     if method == "binance":
@@ -102,7 +104,7 @@ def format_wallet_history_text(
             "",
             f"{tr(lang, 'wallet_topup_id')}: {md_code(ref_id)}",
             f"{tr(lang, 'date_time')}: {format_dt(log.get('created_at'))}",
-            f"{tr(lang, 'payment_method')}: {method_label(method)}",
+            f"{tr(lang, 'payment_method')}: {tr(lang, 'coupon_method') if method == 'coupon' else method_label(method)}",
             f"{tr(lang, 'amount')}: {amount_text(log)}",
             f"{tr(lang, 'status')}: {status_label(log.get('status'), lang)}",
         ])

@@ -25,7 +25,7 @@ def enabled(raw, payload):
     kind = (payload.get('notification') or {}).get('notification_type', '')
     category = {'stock': 'stock', 'restock': 'stock', 'new_stock': 'stock',
                 'broadcast': 'broadcast', 'poll': 'polls', 'poll_result': 'polls',
-                'new_product': 'products', 'product': 'products', 'price_drop': 'prices', 'price_change': 'prices'}.get(kind)
+                'new_product': 'products', 'product': 'products', 'price_drop': 'prices', 'price_change': 'prices', 'sale': 'prices'}.get(kind)
     if not category and payload.get('deep_link_poll_id'):
         category = 'polls'
     if not category and payload.get('cleanup_previous_stock'):

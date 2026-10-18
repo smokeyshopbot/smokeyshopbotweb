@@ -98,7 +98,7 @@ def commands_text(lang: str = "en") -> str:
             "\n\nAPI *Reseller API*\n"
             "Use /api to view or regenerate your API key. Your own bot can list products, check your USDT wallet, and buy stock automatically with wallet balance."
         )
-    return compact_blank_lines(tr(lang, "commands_text") + tr(lang, "search_help") + api_section)
+    return compact_blank_lines(tr(lang, "commands_text") + tr(lang, "search_help") + api_section + tr(lang, "coupon_help"))
 
 
 def admin_commands_text() -> str:

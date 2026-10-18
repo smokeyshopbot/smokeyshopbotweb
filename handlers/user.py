@@ -199,7 +199,8 @@ def _price_label(product: dict, settings: dict, *, quantity: int = 1, lang: str 
         parts.append(_price_usdt_label(float(product.get('price_usdt') or 0) * quantity))
     if inr_enabled:
         parts.append(_price_inr_label(float(product.get('price_inr') or 0) * quantity))
-    return " / ".join(parts) if parts else tr(lang, "payment_not_configured")
+    price_text = " / ".join(parts) if parts else tr(lang, "payment_not_configured")
+    return price_text
 
 
 def _product_description_block(product: dict, lang: str = "en") -> str:
@@ -231,6 +232,7 @@ def _product_details_block(product: dict, lang: str = "en") -> str:
         block for block in (
             _product_description_block(product, lang),
             _product_warranty_block(product, lang),
+            (tr(lang, "sale_until", end=product["sale_ends_at"].strftime("%d %b %Y, %H:%M UTC")) if product.get("sale_active") else ""),
         ) if block
     ))
 
@@ -556,6 +558,7 @@ def _status_emoji(status: str) -> str:
     return {
         "pending": "⏳",
         "pending_stock": "⏳",
+        "coupon_processing": "⏳",
         "delivered": "✅",
         "failed": "❌",
         "expired": "❌",
@@ -574,6 +577,7 @@ def _status_label(status: str, lang: str = "en") -> str:
         return "Revoked"
     key = {
         "pending_stock": "status_pending_stock",
+        "coupon_processing": "status_coupon_processing",
         "pending": "status_pending",
         "delivered": "status_delivered",
         "failed": "status_failed",
@@ -624,7 +628,7 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
         lines.extend([
             f"{tr(lang, 'order_id')}: `{order_id}`",
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}",
-            f"{tr(lang, 'payment_method')}: `{str(order.get('payment_method', 'N/A')).upper()}`",
+            f"{tr(lang, 'payment_method')}: `{tr(lang, 'coupon_method') if order.get('payment_method') == 'coupon' else str(order.get('payment_method', 'N/A')).upper()}`",
             f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
             f"{tr(lang, 'status')}: {_status_emoji(display_status)} {_status_label(display_status, lang)}",
             f"{tr(lang, 'fetch_again')}: {'Disabled by admin' if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
@@ -793,7 +797,7 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
             f"📦 *{id_label} `{order_id}`*\n\n"
             f"{tr(lang, 'product')}: *{product_name}* x{quantity}\n"
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
-            f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
+            f"{tr(lang, 'payment_method')}: {tr(lang, 'coupon_method') if order.get('payment_method') == 'coupon' else str(order.get('payment_method', 'N/A')).upper()}\n"
             f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}"
         )
         if _is_cancelled_pending_stock_order(order):
@@ -818,7 +822,7 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
         text += f"{tr(lang, 'report_id')}: `{order.get('replacement_report_id')}`\n"
     text += (
         f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
-        f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
+        f"{tr(lang, 'payment_method')}: {tr(lang, 'coupon_method') if order.get('payment_method') == 'coupon' else str(order.get('payment_method', 'N/A')).upper()}\n"
         f"{tr(lang, 'delivered')}: {_format_dt(order.get('delivered_at'))}\n"
         f"{tr(lang, 'product')}: *{product_name}*\n"
         f"{tr(lang, 'quantity')}: {quantity}\n\n"
@@ -1817,6 +1821,13 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
             return
     total_inr = state["total_inr"]
     total_usdt = state["total_usdt"]
+    current_inr = round(float(product.get("price_inr") or 0) * qty, 2)
+    current_usdt = round(float(product.get("price_usdt") or 0) * qty, 2)
+    relevant_total = (current_inr, total_inr) if method in {"upi", "wallet_inr"} else (current_usdt, total_usdt)
+    if relevant_total[0] != relevant_total[1]:
+        _shop_flow.pop(user_id, None)
+        await query.edit_message_text(tr(lang, "sale_price_changed"), reply_markup=InlineKeyboardMarkup([_back_button(lang)]))
+        return
 
     payment_settings = await db.get_payment_settings()
     if not db.payment_method_enabled(payment_settings, method):

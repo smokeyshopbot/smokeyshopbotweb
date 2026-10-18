@@ -1,6 +1,7 @@
 """Search, API instructions and remaining customer-facing translations."""
 import re
 
+
 EXTRA_TEXT = {
     "en": {
         "btn_search": "🔎 Search products", "search_prompt": "🔎 Send a product name or a few words from its description. You can also use /search keyword.",
@@ -155,3 +156,81 @@ EXTRA_TEXT['es'].update({
     "api_docs_lookup_note": "Sustituye ORDER_ID por el <code>orderCode</code> devuelto al comprar.",
     "api_docs_uncertain_note": "Si la solicitud agota el tiempo de espera o indica procesamiento/revisión, consulta el pedido o reintenta con el MISMO <code>client_order_id</code>. No uses un ID nuevo mientras el resultado sea incierto. Para HTTP 429, espera el intervalo Retry-After."
 })
+
+
+# Timed sales and reward coupons.
+for _lang, _entries in {'en': {'sale_started': '🔻 Sale started!',
+        'sale_until': '⏰ Sale ends: {end}',
+        'sale_price_changed': '🔄 The price changed before payment was opened. Open the product '
+                              'again to review the current price.',
+        'coupon_method': 'Coupon',
+        'coupon_usage': '🎁 Send your coupon code, or use /redeem CODE.',
+        'coupon_private': '🔖 Open a private chat with this bot to redeem your coupon.',
+        'coupon_rate_limit': '⏳ Too many coupon attempts. Please wait a minute and try again.',
+        'coupon_invalid': '❌ Invalid coupon code.',
+        'coupon_expired': '⏰ This coupon has expired or is disabled.',
+        'coupon_exhausted': '❌ This coupon has reached its redemption limit.',
+        'coupon_already': '❌ You have already redeemed this coupon.',
+        'coupon_out_of_stock': '📦 This product is out of stock. Your coupon has not been used; try '
+                               'again after restock.',
+        'coupon_unavailable': '⚠️ This reward is currently unavailable. Contact support.',
+        'coupon_success': '✅ Coupon redeemed! Your reward receipt or product delivery is on its '
+                          'way.',
+        'coupon_processing': '⏳ Your coupon is being processed. You can retry the same code '
+                             'safely.',
+        'coupon_pending': '⏳ Your coupon reward is saved and is waiting for stock. It will be '
+                          'delivered automatically.',
+        'coupon_review': '⚠️ Your coupon reward is saved, but its delivery needs a shop review. '
+                         'Contact support.',
+        'coupon_retry': '⏳ Redemption was interrupted. Please retry the same coupon code; any '
+                        'reward already claimed will be recovered safely.',
+        'coupon_wallet_success': '🎁 Coupon redeemed!\n'
+                                 '\n'
+                                 '🔖 Code: {code}\n'
+                                 '👛 Added: {amount} {currency}\n'
+                                 '💰 Wallet balance: {balance} {currency}',
+        'coupon_product_success': '🎁 Coupon reward delivered!\n'
+                                  '\n'
+                                  '🧾 Order ID: {order_id}\n'
+                                  '🔖 Code: {code}',
+        'coupon_help': '\n\n🎁 *Coupons*\nUse /redeem CODE to claim a product or wallet reward.',
+        'coupon_used_other': '❌ This coupon has already been redeemed by another user.'},
+ 'es': {'sale_started': '🔻 ¡Oferta iniciada!',
+        'sale_until': '⏰ La oferta termina: {end}',
+        'sale_price_changed': '🔄 El precio cambió antes de abrir el pago. Abre el producto de '
+                              'nuevo para revisar el precio actual.',
+        'coupon_method': 'Cupón',
+        'coupon_usage': '🎁 Envía tu código de cupón o usa /redeem CODIGO.',
+        'coupon_private': '🔖 Abre un chat privado con este bot para canjear tu cupón.',
+        'coupon_rate_limit': '⏳ Demasiados intentos. Espera un minuto y vuelve a intentarlo.',
+        'coupon_invalid': '❌ Código de cupón no válido.',
+        'coupon_expired': '⏰ Este cupón ha caducado o está desactivado.',
+        'coupon_exhausted': '❌ Este cupón ha alcanzado su límite de canjes.',
+        'coupon_already': '❌ Ya has canjeado este cupón.',
+        'coupon_out_of_stock': '📦 Este producto no tiene stock. Tu cupón sigue sin usar; inténtalo '
+                               'después de la reposición.',
+        'coupon_unavailable': '⚠️ Esta recompensa no está disponible ahora. Contacta con soporte.',
+        'coupon_success': '✅ ¡Cupón canjeado! Tu recibo o entrega está en camino.',
+        'coupon_processing': '⏳ Tu cupón se está procesando. Puedes volver a usar el mismo código '
+                             'sin duplicar la recompensa.',
+        'coupon_pending': '⏳ Tu recompensa está guardada y espera stock. Se entregará '
+                          'automáticamente.',
+        'coupon_review': '⚠️ Tu recompensa está guardada, pero la entrega necesita revisión de la '
+                         'tienda. Contacta con soporte.',
+        'coupon_retry': '⏳ El canje se interrumpió. Usa el mismo código; cualquier recompensa ya '
+                        'reclamada se recuperará de forma segura.',
+        'coupon_wallet_success': '🎁 ¡Cupón canjeado!\n'
+                                 '\n'
+                                 '🔖 Código: {code}\n'
+                                 '👛 Añadido: {amount} {currency}\n'
+                                 '💰 Saldo: {balance} {currency}',
+        'coupon_product_success': '🎁 ¡Recompensa entregada!\n'
+                                  '\n'
+                                  '🧾 ID del pedido: {order_id}\n'
+                                  '🔖 Código: {code}',
+        'coupon_help': '\n\n🎁 *Cupones*\nUsa /redeem CODIGO para obtener un producto o saldo.',
+        'coupon_used_other': '❌ Otro usuario ya ha canjeado este cupón.'}}.items():
+    EXTRA_TEXT[_lang].update(_entries)
+
+EXTRA_TEXT['en']['status_coupon_processing'] = 'Coupon processing'
+EXTRA_TEXT['es']['status_coupon_processing'] = 'Cupón en proceso'

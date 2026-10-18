@@ -5,18 +5,6 @@ from decimal import Decimal
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-LEGACY_CREDIT_ERROR = "Legacy completion has no reliable wallet-event reference"
-
-
-def legacy_credit_history(record):
-    """An old completed credit has unknown provenance, not a proven shortfall."""
-    if record.get("wallet_credit_version"):
-        return False
-    completed = (record.get("status") == "completed" or record.get("wallet_credited_at")
-                 or record.get("refund_status") == "wallet_credited")
-    return bool(completed and (record.get("wallet_credit_state") == "legacy_unverified" or
-        (record.get("wallet_credit_state") == "review" and record.get("wallet_credit_error") == LEGACY_CREDIT_ERROR)))
-
 
 def event_id(user_id, currency, reference):
     return hashlib.sha256(f"{user_id}:{currency}:{reference}".encode()).hexdigest()
@@ -134,7 +122,7 @@ def reconcile_user(db, user):
         totals[event["currency"]] = totals.get(event["currency"], Decimal(0)) + Decimal(str(event["delta"]))
     final = db.users.find_one({"_id": user["_id"]})
     if final.get("wallet_revision", 0) != version or final.get("wallet_outbox"): return None
-    report = {"checked_at": datetime.now(timezone.utc), "revision": version, "issues": [], "history_notes": []}
+    report = {"checked_at": datetime.now(timezone.utc), "revision": version, "issues": []}
     for currency in ("inr", "usdt"):
         expected = Decimal(str(user["wallet_audit"].get("opening_" + currency, 0))) + totals.get(currency, Decimal(0))
         actual = Decimal(str(final.get("wallet_" + currency, 0) or 0))
@@ -143,17 +131,13 @@ def reconcile_user(db, user):
         if abs(difference) > Decimal("0.00001" if currency == "usdt" else "0.005") or actual < 0:
             report["issues"].append(currency + " balance mismatch")
     projection = {field: 1 for field in ("ref_id", "order_id", "wallet_event_id", "wallet_event_delta", "wallet_refund_event_id", "wallet_refund_event_delta",
-        "wallet_credit_state", "wallet_credit_error", "wallet_credit_version", "status", "refund_status",
-        "wallet_charge_applied_at", "api_stage", "wallet_credited_at", "wallet_adjusted_at", "refund_wallet_credited_at", "paid_at", "created_at")}
-    records = list(db.pending_payments.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_credit_state": {"$in": ["review", "legacy_unverified"]}}]}, projection))
-    records += list(db.orders.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_refund_event_id": {"$exists": True}}, {"wallet_credit_state": {"$in": ["review", "legacy_unverified"]}}]}, projection))
+        "wallet_credit_state", "wallet_credit_error", "wallet_charge_applied_at", "api_stage", "wallet_credited_at", "wallet_adjusted_at", "refund_wallet_credited_at", "paid_at", "created_at")}
+    records = list(db.pending_payments.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_credit_state": "review"}]}, projection))
+    records += list(db.orders.find({"user_id": uid, "$or": [{"wallet_event_id": {"$exists": True}}, {"wallet_refund_event_id": {"$exists": True}}, {"wallet_credit_state": "review"}]}, projection))
     references = set()
     cutoff = report["checked_at"].timestamp() - 300
     for record in records:
-        legacy = legacy_credit_history(record)
-        if legacy:
-            report["history_notes"].append("Older completed credit has no reliable audit reference: " + str(record.get("ref_id") or record.get("order_id")))
-        elif record.get("wallet_credit_state") == "review":
+        if record.get("wallet_credit_state") == "review":
             report["issues"].append("Wallet credit requires verification: " + str(record.get("ref_id") or record.get("order_id")))
         for field, amount_field in (("wallet_event_id", "wallet_event_delta"), ("wallet_refund_event_id", "wallet_refund_event_delta")):
             identifier = record.get(field)
@@ -165,8 +149,6 @@ def reconcile_user(db, user):
             stamp = stamp or record.get("wallet_credited_at") or record.get("wallet_adjusted_at") or record.get("wallet_charge_applied_at") or record.get("paid_at") or record.get("created_at")
             if stamp and stamp.replace(tzinfo=timezone.utc).timestamp() > cutoff: continue
             event = events.get(identifier)
-            if legacy and not event:
-                continue  # Keep the history gap visible without claiming money is missing.
             if not event or abs(Decimal(str(event["delta"])) - Decimal(str(record.get(amount_field, 0)))) > Decimal("0.00001"):
                 report["issues"].append("Wallet source record needs review: " + str(record.get("ref_id") or record.get("order_id")))
     for event in events.values():
