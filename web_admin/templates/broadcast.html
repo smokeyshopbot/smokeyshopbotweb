@@ -12,12 +12,12 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="bilingual-field-grid">
       <label>English message
-        <textarea name="message_en" rows="7" placeholder="Write the English broadcast message..."></textarea>
+        <textarea name="message_en" rows="7" data-message-emojis placeholder="Write the English broadcast message..."></textarea>
         <span class="muted">English/default users receive this text. Leave empty to skip English/default users.</span>
       </label>
       {% if spanish_enabled %}
       <label>Spanish message
-        <textarea name="message_es" rows="7" placeholder="Write the Spanish broadcast message..."></textarea>
+        <textarea name="message_es" rows="7" data-message-emojis placeholder="Write the Spanish broadcast message..."></textarea>
         <span class="muted">Spanish users receive this text. Leave empty to skip Spanish users.</span>
       </label>
       {% endif %}
@@ -37,6 +37,7 @@
     </div>
   </div>
 </div>
+{% include '_message_emoji_picker.html' %}
 {% endblock %}
 
 {% block scripts %}

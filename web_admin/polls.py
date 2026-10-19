@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import abort, flash, redirect, render_template, request, Response, session, url_for
 from utils.poll_validation import audience_query, parse_user_ids, validate_poll
+from utils.message_emojis import plain_text
 from web_admin.group_announcements import enqueue_poll, target
 from web_admin.delivery_queue import enqueue_job
 
@@ -259,6 +260,6 @@ def register_poll_routes(app, login_required, owner_required, csrf_required, log
             value = str(value)
             return "'" + value if value.startswith(("=", "+", "-", "@", "\t", "\r")) else value
         for row in app.db.poll_deliveries.find({"campaign_id": campaign_id}).sort("user_id", 1):
-            answers = " | ".join(campaign["options"][i] for i in row.get("option_ids", []) if 0 <= i < len(campaign["options"]))
+            answers = " | ".join(plain_text(campaign["options"][i]) for i in row.get("option_ids", []) if 0 <= i < len(campaign["options"]))
             writer.writerow([row["user_id"], cell(row.get("username", "")), cell(answers), row["status"]])
         return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=poll-{campaign_id}.csv"})

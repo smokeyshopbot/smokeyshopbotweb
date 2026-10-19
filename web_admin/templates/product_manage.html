@@ -510,6 +510,7 @@ item 2"></textarea>
 <section class="panel">
   <h2>Product details</h2>
   <p class="muted">Descriptions appear in a Telegram quote panel with bold text after users tap the product. Write plain text and keep any line breaks you want to show. Telegram controls the panel colors.</p>
+  <p class="muted">Use Insert premium emoji to add a custom emoji with any normal fallback emoji. It follows the premium emoji setting.</p>
   <form method="post" action="{{ url_for('update_product_description', name=product.name) }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="product-details-warranty-row">
@@ -519,10 +520,10 @@ item 2"></textarea>
     </div>
     <div class="bilingual-field-grid">
       <label>English description
-        <textarea name="description_en" rows="6" placeholder="Write the English product details, notes, delivery info, etc.">{{ product.description_en or '' }}</textarea>
+        <textarea name="description_en" rows="6" data-message-emojis placeholder="Write the English product details, notes, delivery info, etc.">{{ product.description_en or '' }}</textarea>
       </label>
       <label>Spanish description
-        <textarea name="description_es" rows="6" placeholder="Write the Spanish product details, notes, delivery info, etc.">{{ product.description_es or '' }}</textarea>
+        <textarea name="description_es" rows="6" data-message-emojis placeholder="Write the Spanish product details, notes, delivery info, etc.">{{ product.description_es or '' }}</textarea>
       </label>
     </div>
     <div class="field-help-block">
@@ -620,6 +621,7 @@ item 2"></textarea>
 
 
 {% block scripts %}
+{% if can_access('update_product_description') %}{% include '_message_emoji_picker.html' %}{% endif %}
 <script>
 (function () {
   function uniqueNonEmptyLines(value) {

@@ -9,12 +9,13 @@
   <p class="muted">Single-answer votes lock on the first tap. For multiple answers, users select their options and press Submit vote; submitted votes cannot be changed. Options appear only on buttons while voting is open.</p>
   <form method="post" action="{{ url_for('create_user_poll') }}" class="stacked-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label>Question<textarea name="question" maxlength="300" rows="3" required placeholder="Which product should we add next?"></textarea></label>
+    <label>Question<textarea name="question" data-message-emojis data-emoji-limit="300" rows="3" required placeholder="Which product should we add next?"></textarea></label>
     <div id="poll-options">
-      {% for i in range(2) %}<div class="poll-option"><label class="poll-option-label">Answer {{ i + 1 }}<textarea name="answer" rows="3" maxlength="250" required placeholder="Write one answer here. Multiple lines are allowed."></textarea></label><button type="button" class="delete-poll-option" disabled>Delete option</button></div>{% endfor %}
+      {% for i in range(2) %}<div class="poll-option"><label class="poll-option-label">Answer {{ i + 1 }}<textarea name="answer" rows="3" data-message-emojis data-emoji-limit="250" data-emoji-icons="1" required placeholder="Write one answer here. Multiple lines are allowed."></textarea></label><button type="button" class="delete-poll-option" disabled>Delete option</button></div>{% endfor %}
     </div>
     <button type="button" id="add-poll-option">Add another option</button>
     <small class="muted">2–10 separate options, up to 250 characters each. Line breaks stay within the same option.</small>
+    <small class="muted">Questions can contain several custom emojis. Each answer button supports one premium emoji icon.</small>
     <label class="choice-pill"><input type="checkbox" name="multiple" value="1"> Allow multiple answers</label>
     {% include '_poll_timer.html' %}
     <label>Language audience<select name="language"><option value="all">All languages</option><option value="en">English users</option><option value="es">Spanish users</option></select></label>
@@ -26,7 +27,7 @@
 <section class="panel">
   <h2>Recent polls</h2>
   {% if campaigns %}<div class="table-wrap"><table><thead><tr><th>Question</th><th>Status</th><th>Sent</th><th>Respondents</th><th>Failed</th><th></th></tr></thead><tbody>
-  {% for campaign in campaigns %}<tr><td>{{ campaign.question }}{% if campaign.results_unread %} <span class="nav-badge">New results</span>{% endif %}</td><td>{{ campaign.status }}{% if campaign.ends_at %}<br><small>Closes {{ campaign.deadline_text }}</small>{% endif %}</td><td>{{ campaign.stats.sent }}</td><td>{{ campaign.stats.voters }}</td><td>{{ campaign.stats.failed }}</td><td><a href="{{ url_for('user_poll_detail', campaign_id=campaign.campaign_id) }}">Open results</a></td></tr>{% endfor %}
+  {% for campaign in campaigns %}<tr><td>{{ campaign.question|message_emoji_text }}{% if campaign.results_unread %} <span class="nav-badge">New results</span>{% endif %}</td><td>{{ campaign.status }}{% if campaign.ends_at %}<br><small>Closes {{ campaign.deadline_text }}</small>{% endif %}</td><td>{{ campaign.stats.sent }}</td><td>{{ campaign.stats.voters }}</td><td>{{ campaign.stats.failed }}</td><td><a href="{{ url_for('user_poll_detail', campaign_id=campaign.campaign_id) }}">Open results</a></td></tr>{% endfor %}
   </tbody></table></div>{% else %}<p class="muted">No polls yet.</p>{% endif %}
 </section>
 <script>
@@ -36,7 +37,7 @@
     const options = [...box.children];
     options.forEach((row, index) => {
       row.querySelector('label').firstChild.textContent = 'Answer ' + (index + 1);
-      row.querySelector('button').disabled = options.length <= 2;
+      row.querySelector('.delete-poll-option').disabled = options.length <= 2;
     });
     add.disabled = options.length >= 10;
   }
@@ -55,4 +56,5 @@
 })();
 </script>
 {% include '_poll_timer_script.html' %}
+{% include '_message_emoji_picker.html' %}
 {% endblock %}

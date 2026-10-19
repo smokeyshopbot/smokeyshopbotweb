@@ -1,0 +1,12 @@
+<dialog class="message-emoji-picker" data-message-emoji-picker aria-labelledby="message-emoji-picker-title">
+  <h3 id="message-emoji-picker-title">Insert premium emoji</h3>
+  <p class="muted">Use any Telegram custom emoji ID here. It applies only to this message. Your premium emoji setting controls how it is sent.</p>
+  <p class="muted">The editor shows a placeholder until the message is sent.</p>
+  <label>Telegram emoji ID<input type="text" data-message-emoji-id inputmode="numeric" maxlength="20" autocomplete="off" placeholder="Enter the emoji ID"></label>
+  <label>Normal fallback emoji<input type="text" data-message-emoji-fallback value="⭐" maxlength="64" autocomplete="off" placeholder="Paste one normal emoji"></label>
+  <p class="muted">Paste any single normal emoji here. Skin tones, flags, and combined emojis are supported.</p>
+  <p class="muted">The fallback is shown when premium emojis are off or Telegram rejects the custom emoji.</p>
+  <p class="message-emoji-error" data-message-emoji-error role="alert" hidden></p>
+  <div class="message-emoji-actions"><button type="button" class="primary" data-message-emoji-insert>Insert emoji</button><button type="button" data-message-emoji-cancel>Cancel</button></div>
+</dialog>
+<script src="{{ url_for('static', filename='message_emojis.js') }}" defer></script>

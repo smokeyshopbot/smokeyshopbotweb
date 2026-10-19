@@ -11,6 +11,7 @@ from utils.wallet_events import change_wallet, event_id
 from utils.stock_reservations import reserve_stock, release_stock
 from werkzeug.exceptions import TooManyRequests
 from utils.extra_i18n import api_message
+from utils.message_emojis import plain_text
 
 
 def ensure_api_indexes(db):
@@ -127,6 +128,7 @@ def register_buyer_api_routes(app, shop):
             stock = int(product.get("available_stock", 0))
             sold = sold_counts.get(product['name'].casefold(), 0)
             description = product.get(f"description_{language}") or product.get("description_en") or product.get("description") or ""
+            description = plain_text(description)
             product_id = shop.public_api_product_id(product)
             rows.append({"_id": product_id, "product_id": product_id, "product_name": product["name"], "product_name_raw": product["name"],
                          "pricing": price, "description": description, "description_raw": description,

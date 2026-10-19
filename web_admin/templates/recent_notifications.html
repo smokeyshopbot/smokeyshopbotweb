@@ -30,9 +30,9 @@
           <td>{{ fmt_dt(row.last_sent_at) }}</td>
           <td><span class="badge">{{ notification_type_label(row.notification_type) }}</span></td>
           <td>
-            <strong>{{ row.title or notification_type_label(row.notification_type) }}</strong>
+            <strong>{{ (row.title or notification_type_label(row.notification_type))|message_emoji_text }}</strong>
             {% if row.product_name %}<br><span class="muted">Product: {{ row.product_name }}</span>{% endif %}
-            {% if row.text_preview %}<br><span class="muted">{{ row.text_preview }}</span>{% endif %}
+            {% if row.text_preview %}<br><span class="muted">{{ row.text_preview|message_emoji_text }}</span>{% endif %}
           </td>
           <td>{{ row.total_count or 0 }}</td>
           <td>

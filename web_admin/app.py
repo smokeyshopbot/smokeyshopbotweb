@@ -41,6 +41,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import requests
 from utils.premium_emojis import DEFAULTS as EMOJI_DEFAULTS, EMOJI_CHOICES, mapping as premium_mapping, form_settings as premium_form_settings, transform_payload, emoji_rejected, plain_product_payload, multipart_data, file_positions, rewind_files
+from utils.message_emojis import plain_text as message_emoji_text, validate as validate_message_emojis
 from bson import ObjectId
 from web_admin.vendor_catalog import register_vendor_catalog_routes
 from web_admin.group_announcements import DEFAULTS as GROUP_DEFAULTS, BOOL_KEYS as GROUP_BOOL_KEYS, validate as validate_group_announcements, enqueue_notice
@@ -801,6 +802,7 @@ def stock_manager_payout_paid_by_label(db, record: dict | None) -> str:
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    app.jinja_env.filters['message_emoji_text'] = message_emoji_text
     app.db = GuardedDatabase(_connect_db())  # type: ignore[attr-defined]
     remove_obsolete_state(app.db)
     app.db.wallet_ledger.create_index([("user_id", 1), ("currency", 1)])
@@ -3254,6 +3256,12 @@ def register_routes(app: Flask) -> None:
             return redirect(url_for("products"))
         description_en = (request.form.get("description_en", "") or request.form.get("description", "") or "").strip()
         description_es = (request.form.get("description_es", "") or "").strip()
+        try:
+            validate_message_emojis(description_en)
+            validate_message_emojis(description_es)
+        except ValueError as exc:
+            flash(str(exc), 'error')
+            return redirect(url_for('product_manage', name=product['name']))
         order_txt_instructions_en = (request.form.get("order_txt_instructions_en", "") or "").strip()
         order_txt_instructions_es = (request.form.get("order_txt_instructions_es", "") or "").strip()
         try:
@@ -5931,6 +5939,12 @@ def register_routes(app: Flask) -> None:
     def broadcast_submit():
         message_en = (request.form.get("message_en", "") or request.form.get("message", "")).strip()
         message_es = request.form.get("message_es", "").strip()
+        try:
+            validate_message_emojis(message_en)
+            validate_message_emojis(message_es)
+        except ValueError as exc:
+            flash(str(exc), 'error')
+            return redirect(url_for('broadcast_form'))
         if not message_en and not message_es:
             flash("Enter an English message, a Spanish message, or both.", "error")
             return redirect(url_for("broadcast_form"))
@@ -11340,7 +11354,7 @@ def _telegram_http_result(method, payload, files=None):
         kwargs = request_args(rendered)
         response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **kwargs)
         body = response.json() if response.content else {}
-        if changed and response.status_code == 400 and emoji_rejected(body.get('description', '')):
+        if changed and response.status_code in {400, 403} and emoji_rejected(body.get('description', '')):
             rewind_files(positions or [])
             response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **request_args(plain_product_payload(method, payload)))
             body = response.json() if response.content else {}

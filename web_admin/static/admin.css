@@ -123,6 +123,13 @@ button:hover { filter: brightness(1.1); }
 .danger { background: #dc2626; }
 .warning { color: #fbbf24; }
 .stacked-form { display: grid; gap: 14px; }
+.message-emoji-controls { display: flex; justify-content: flex-start; margin-top: 6px; }
+.message-emoji-controls button { width: auto; padding: 7px 10px; font-size: 12px; }
+.message-emoji-picker { width: min(440px, calc(100vw - 40px)); box-sizing: border-box; border: 1px solid var(--line); border-radius: 14px; padding: 22px; background: #111827; color: var(--text); }
+.message-emoji-picker::backdrop { background: rgb(0 0 0 / 65%); }
+.message-emoji-picker label { margin: 14px 0; }
+.message-emoji-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.message-emoji-error { color: #fca5a5; }
 .form-grid { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 14px; align-items: end; }
 .inline-form { display: inline-block; margin: 2px; }
 .mini-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; min-width: 310px; }
