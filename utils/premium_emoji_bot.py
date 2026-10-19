@@ -2,7 +2,7 @@
 import time
 from utils.update_context import record_timing
 from telegram.ext import ExtBot
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from utils.premium_emojis import OUTPUT_METHODS, transform_payload, emoji_rejected, plain_product_payload
 
 class PremiumEmojiBot(ExtBot):
@@ -20,10 +20,10 @@ class PremiumEmojiBot(ExtBot):
         payload, changed = transform_payload(endpoint, data, settings)
         try:
             return await super()._do_post(endpoint=endpoint, data=payload, **kwargs)
-        except BadRequest as error:
+        except (BadRequest, Forbidden) as error:
             if not changed or not emoji_rejected(error):
                 raise
-            # A Telegram 400 is a definite rejection, so this cannot duplicate
+            # An explicit Telegram 400/403 is a rejection, so this cannot duplicate
             # an acknowledged send. Timeouts and rate limits are never retried here.
             return await super()._do_post(endpoint=endpoint, data=plain_product_payload(endpoint, data), **kwargs)
 

@@ -232,10 +232,13 @@ def transform_payload(method, data, settings):
     if method not in OUTPUT_METHODS:
         return data, False
     from utils.product_emojis import render_payload
+    from utils.message_emojis import render_payload as render_message_emojis, markdown_text
     enabled = str(settings.get('premium_emojis_enabled', '0')) in {'1', 'True'}
-    prepared, product_changed = render_payload(data, enabled, _legacy_markdown)
+    converter = lambda text: markdown_text(text, _legacy_markdown)
+    prepared, product_changed = render_payload(data, enabled, converter)
+    prepared, message_changed = render_message_emojis(method, prepared, enabled, converter)
     rendered, standard_changed = _transform_standard_payload(method, prepared, settings)
-    return rendered, product_changed or standard_changed
+    return rendered, product_changed or message_changed or standard_changed
 
 
 def plain_product_payload(method, data):
@@ -244,7 +247,10 @@ def plain_product_payload(method, data):
 
 def emoji_rejected(error):
     text = str(error).casefold()
-    return any(term in text for term in ('custom emoji', 'custom_emoji', 'emoji_id', 'emoji id', 'emoji document', "can't parse entities", 'cannot parse entities'))
+    normalized = text.replace('_', ' ')
+    return (any(term in text for term in ('custom emoji', 'custom_emoji', 'emoji_id', 'emoji id', 'emoji document', "can't parse entities", 'cannot parse entities'))
+            or any(term in normalized for term in ('premium subscription required', 'premium subscription is required',
+                'premium account required', 'premium required', 'premium subscription expired', 'premium subscription has expired')))
 
 def multipart_data(payload):
     return {key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value

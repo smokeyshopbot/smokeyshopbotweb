@@ -1,17 +1,21 @@
 """Shared validation for native Telegram survey polls."""
 import re
+from utils.message_emojis import validate as validate_emojis, plain_text
 
 
 def validate_poll(question, options, multiple=False, *, max_option_length=100):
     question = str(question or "").strip()
     options = [str(option).strip() for option in options if str(option).strip()]
-    if not 1 <= len(question.encode('utf-16-le')) // 2 <= 300:
+    validate_emojis(question)
+    for option in options:
+        validate_emojis(option, max_icons=1)
+    if not 1 <= len(plain_text(question).encode('utf-16-le')) // 2 <= 300:
         raise ValueError("Question must contain 1–300 characters.")
     if not 2 <= len(options) <= 10:
         raise ValueError("Enter 2–10 separate answer options.")
-    if any(len(option.encode('utf-16-le')) // 2 > max_option_length for option in options):
+    if any(len(plain_text(option).encode('utf-16-le')) // 2 > max_option_length for option in options):
         raise ValueError(f"Each option must contain at most {max_option_length} characters.")
-    if len({option.casefold() for option in options}) != len(options):
+    if len({plain_text(option).casefold() for option in options}) != len(options):
         raise ValueError("Options must be different from each other.")
     return question, options, bool(multiple)
 
