@@ -30,15 +30,22 @@ class MongoMonitor(CommandListener):
         self.recent = deque(maxlen=4096)
 
     def started(self, event):
+        command = getattr(event, 'command', {}) or {}
+        name = event.command_name
+        collection = command.get('collection') if name == 'getMore' else command.get(name)
+        label = name + '/' + collection[:80] if isinstance(collection, str) else name
+        comment = command.get('comment')
+        if isinstance(comment, str) and comment.startswith('history_page:'):
+            label += ' [' + comment[:100] + ']'
         with self.lock:
-            self.running[(event.connection_id, event.request_id)] = current.get()
+            self.running[(event.connection_id, event.request_id)] = (current.get(), label)
             self.recent.append(time.monotonic())
 
     def _done(self, event):
         with self.lock:
-            profile = self.running.pop((event.connection_id, event.request_id), None)
+            profile, label = self.running.pop((event.connection_id, event.request_id), (None, event.command_name))
         if profile is not None:
-            profile.add(event.command_name, event.duration_micros / 1_000_000)
+            profile.add(label, event.duration_micros / 1_000_000)
 
     def succeeded(self, event):
         self._done(event)
