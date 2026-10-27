@@ -44,6 +44,8 @@ def _bulk_query(payload):
     query = {"blocked": {"$ne": True}}
     if payload.get("exclude_ids"):
         query["user_id"] = {"$nin": payload["exclude_ids"]}
+    if payload.get('api_audience'):
+        query.update(api_enabled={'$ne': False}, api_key_hash={'$type': 'string', '$ne': ''})
     return query
 
 
@@ -72,6 +74,10 @@ def _sale_unavailable(db, payload):
 def _expand_bulk(app, shop, job):
     db = app.db
     payload = job["payload"]
+    from web_admin.api_maintenance import notice_is_current
+    if not notice_is_current(db, payload):
+        _finish(db, job, {'status': 'cancelled', 'error': 'API availability changed again'})
+        return
     if _sale_unavailable(db, payload):
         _finish(db, job, {'status': 'cancelled', 'error': 'Sale ended or was replaced before delivery'})
         return
@@ -108,6 +114,8 @@ def _expand_bulk(app, shop, job):
                  "stock_notice_started_at": job["created_at"],
                  "maintenance_policy": payload.get("maintenance_policy", "continue"), "bulk_recipient": True,
                  "admin_recipient": uid in payload.get("admin_ids", [])}
+        if payload.get('api_status_version'):
+            child.update(api_status_version=payload['api_status_version'], api_audience=True)
         if payload.get('sale_id'):
             child.update(sale_id=payload['sale_id'], sale_expires_at=payload.get('sale_expires_at'))
         children.append({"job_id": f"{job['job_id']}:{uid}", "kind": "text", "payload": child,
@@ -166,6 +174,11 @@ def _deliver(app, shop, job):
     current_settings = snapshot.settings() if snapshot else shop.get_secret_settings(db)
     g.delivery_secret_settings = current_settings
     current_groups = group_settings(current_settings)
+    if payload.get('api_status_version') and not job.get('acknowledged_at'):
+        from web_admin.api_maintenance import notice_is_current
+        if not notice_is_current(db, payload, snapshot):
+            _finish(db, job, {'status': 'cancelled', 'error': 'API availability changed again'})
+            return
     if payload.get('api_low_balance_alert') and not job.get('acknowledged_at'):
         from web_admin.api_balance_alerts import validate_settings, eligible, alert_text
         alert_settings = validate_settings(current_settings)
@@ -265,6 +278,9 @@ def _deliver(app, shop, job):
     if (payload.get("bulk_recipient") or payload.get('group_recipient')) and not job.get("acknowledged_at"):
         user = snapshot.user(payload["chat_id"]) if snapshot else db.users.find_one({"user_id": payload["chat_id"]}) or {}
         g.delivery_user_profile = (payload["chat_id"], user)
+        if payload.get('api_audience') and (user.get('api_enabled') is False or not user.get('api_key_hash')):
+            _finish(db, job, {'status': 'cancelled', 'error': 'API access no longer enabled for this account'})
+            return
         if payload.get('bulk_recipient') and user.get("blocked") and not payload.get("admin_recipient"):
             _finish(db, job, {"status": "cancelled", "error": "User is blocked"})
             return

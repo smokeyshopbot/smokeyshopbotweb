@@ -63,6 +63,9 @@ def alert_text(user, settings):
 
 def process_alerts(app, shop, settings, limit=50):
     """A per-user outbox and deterministic job ID survive restarts and duplicate workers."""
+    runtime = getattr(app, "api_runtime", None)
+    if runtime is not None:
+        runtime.flush_usage_safely(app.logger)
     settings = validate_settings(settings)
     if settings["api_low_balance_alerts_enabled"] != "1":
         return

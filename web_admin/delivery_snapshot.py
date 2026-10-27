@@ -52,7 +52,8 @@ class DeliverySnapshot:
             if missing:
                 profiles = {r['user_id']: r for r in self.db.users.find({'user_id': {'$in': missing}}, {
                     'user_id': 1, 'blocked': 1, 'blocked_manually': 1, 'blocked_by_delivery': 1,
-                    'telegram_delivery_status': 1, 'last_message_delivered_at': 1})}
+                    'telegram_delivery_status': 1, 'last_message_delivered_at': 1,
+                    'api_enabled': 1, 'api_key_hash': 1})}
                 for uid in missing:
                     self.rows[('user', uid)] = (time.monotonic(), profiles.get(uid) or {})
 

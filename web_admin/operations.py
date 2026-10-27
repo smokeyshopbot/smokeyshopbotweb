@@ -1,4 +1,5 @@
 """Scheduled encrypted Telegram exports and background order services. No restore routes."""
+import atexit
 import base64
 import hashlib
 import json
@@ -19,6 +20,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from flask import Response, flash, redirect, url_for
 from pymongo import ReturnDocument
 from utils.data_guard import freeze_writes, raw_database, work_guard, as_utc
+from web_admin.api_runtime import DEFAULTS as API_RUNTIME_DEFAULTS
+from web_admin.api_maintenance import process_notices
 from web_admin.api_balance_alerts import DEFAULTS as API_BALANCE_DEFAULTS, validate_settings as validate_api_balance_settings, process_alerts
 from utils.stock_reservations import sweep_reservations
 from utils.wallet_credits import recover_credits
@@ -31,6 +34,7 @@ DEFAULTS = {
     "stock_reservations_enabled": "1",
     **STOCK_NOTICE_DEFAULTS,
     **BUYER_API_DEFAULTS,
+    **API_RUNTIME_DEFAULTS,
     **API_BALANCE_DEFAULTS,
     "api_key_requests_per_minute": "60", "api_ip_requests_per_minute": "180", "api_allow_legacy_query_keys": "1",
     "backup_enabled": "0", "backup_chat_id": "", "backup_schedule": "daily", "backup_time": "02:00",
@@ -42,6 +46,8 @@ BOOL_KEYS = {"backup_enabled", "api_allow_legacy_query_keys", "api_low_balance_a
 INTEGER_LIMITS = {
     "stock_available_again_delay_seconds": (0, 600),
     "stock_available_again_cooldown_minutes": (1, 10080),
+    "api_catalog_cache_seconds": (0, 30),
+    "api_key_burst_per_second": (1, 1000), "api_ip_burst_per_second": (1, 2000),
     "api_key_requests_per_minute": (1, 10000), "api_ip_requests_per_minute": (1, 100000),
     "backup_interval_hours": (1, 720), "backup_chunk_mb": (1, 18), "backup_timeout_minutes": (1, 30),
     "backup_max_mb": (1, 2048), "backup_retry_minutes": (5, 1440), "backup_temp_retention_hours": (1, 168),
@@ -268,6 +274,7 @@ def service_tick(app, shop):
     pulse = threading.Thread(target=heartbeat, daemon=True); pulse.start()
     try:
         with work_guard(db):
+            process_notices(db)
             recover_credits(db)
             from web_admin.promotions import process_sales, recover_coupons
             process_sales(db, shop)
@@ -304,10 +311,15 @@ def service_tick(app, shop):
 def start_operations_worker(app, shop):
     if app.config.get("OPERATIONS_WORKER_STARTED"): return
     app.config["OPERATIONS_WORKER_STARTED"] = True
+    atexit.register(app.api_runtime.flush_usage_safely, app.logger)
     def worker():
         while True:
             try:
-                with app.app_context(): service_tick(app, shop)
+                with app.app_context():
+                    # Every process owns its local statistics buffer, even if
+                    # another process holds the scheduled-services lease.
+                    app.api_runtime.flush_usage_safely(app.logger)
+                    service_tick(app, shop)
             except Exception as error: app.logger.error("Scheduled services unavailable (%s)", type(error).__name__)
             time.sleep(10)
     app.operations_thread = threading.Thread(target=worker, daemon=True, name="scheduled-shop-services")

@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets
@@ -47,8 +48,8 @@ def active_path(db, settings=None):
 
 
 class AdminPathMiddleware:
-    def __init__(self, application, db):
-        self.application, self.db = application, db
+    def __init__(self, application, db, api_runtime=None):
+        self.application, self.db, self.api_runtime = application, db, api_runtime
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
@@ -56,6 +57,15 @@ class AdminPathMiddleware:
         if path == "/healthz" and environ.get("REQUEST_METHOD") in {"GET", "HEAD"}:
             return Response("OK", content_type="text/plain", headers={"Cache-Control": "no-store"})(environ, start_response)
         is_api = path == PUBLIC_API or path.startswith(PUBLIC_API + "/")
+        if is_api and self.api_runtime is not None:
+            settings = self.api_runtime.limit_settings
+            delay = self.api_runtime.local_limit('ip:' + (environ.get('REMOTE_ADDR') or 'unknown'),
+                settings['api_ip_burst_per_second'], settings['api_ip_requests_per_minute'])
+            if delay:
+                spanish = environ.get('HTTP_ACCEPT_LANGUAGE', '').lower().startswith('es')
+                message = 'Demasiadas solicitudes. Inténtalo más tarde.' if spanish else 'Too many requests. Try again later.'
+                return Response(json.dumps({'success': False, 'code': 'rate_limited', 'message': message}),
+                    status=429, mimetype='application/json', headers={'Retry-After': str(delay), 'Cache-Control': 'no-store'})(environ, start_response)
         try:
             settings = routing_settings(self.db)
             if os.getenv(RECOVERY_ENV, "").strip() != "1" and settings.get("domain_separation_enabled", "0") != "0":
@@ -206,7 +216,7 @@ def install(app, shop):
         app.db[collection].create_index("expires_at", expireAfterSeconds=0)
     cipher(app)  # Invalid explicit encryption keys fail startup, never disable verification.
     active_path(app.db)  # Validate the override before serving requests.
-    app.wsgi_app = AdminPathMiddleware(app.wsgi_app, app.db)
+    app.wsgi_app = AdminPathMiddleware(app.wsgi_app, app.db, app.api_runtime)
     shop.COMMON_ADMIN_ENDPOINTS.update(COMMON_ENDPOINTS)
 
     @app.before_request

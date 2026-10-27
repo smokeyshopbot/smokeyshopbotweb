@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from web_admin.buyer_api import register_buyer_api_routes, ensure_api_indexes
 from web_admin.api_recovery import register_routes as register_api_recovery_routes
+from web_admin.api_runtime import ApiRuntime, invalidate as invalidate_api_runtime
+from web_admin.api_maintenance import status as api_status, register_routes as register_api_maintenance_routes
 from web_admin.promotions import register_promotions
 from web_admin.emoji_usage import EMOJI_USAGE
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
@@ -694,6 +696,7 @@ def set_secret_settings(db, settings: dict, *, preserve_routing=False) -> dict:
             {"$set": {"key": RUNTIME_BOT_TOKEN_KEY, "value": token, "updated_at": now}},
             upsert=True,
         )
+    invalidate_api_runtime(db)
     return cleaned
 
 
@@ -842,13 +845,14 @@ def create_app() -> Flask:
     if os.getenv("ADMIN_PANEL_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}:
         app.config["SESSION_COOKIE_SECURE"] = True
 
+    app.api_runtime = ApiRuntime(app.db)
     install_admin_security(app, sys.modules[__name__])
 
     app._last_expiry_cleanup = 0  # type: ignore[attr-defined]
 
     @app.before_request
     def coordinate_database_work():
-        if request.endpoint == "static": return None
+        if request.endpoint == "static" or (request.endpoint or "").startswith("buyer_api_"): return None
         if request.method == "GET" and request.endpoint in {"secret_settings_form"}:
             g.read_only_backup_status = True
             return None
@@ -866,8 +870,9 @@ def create_app() -> Flask:
 
     @app.before_request
     def clear_cached_counts_before_mutations():
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not (request.endpoint or "").startswith("buyer_api_"):
             clear_admin_cache()
+            app.api_runtime.catalog.clear()
         return None
 
     @app.before_request
@@ -885,7 +890,7 @@ def create_app() -> Flask:
 
     @app.before_request
     def expire_stale_unpaid_request_cleanup():
-        if g.get("read_only_backup_status"): return
+        if g.get("read_only_backup_status") or (request.endpoint or "").startswith("buyer_api_"): return
         if not session.get("admin_logged_in"):
             return
         now = time.time()
@@ -1011,6 +1016,7 @@ def create_app() -> Flask:
     register_routes(app)
     register_buyer_api_routes(app, sys.modules[__name__])
     register_api_recovery_routes(app, sys.modules[__name__])
+    register_api_maintenance_routes(app, sys.modules[__name__])
     register_poll_routes(app, login_required, owner_required, csrf_required, log_admin_action, shop=sys.modules[__name__])
     register_delivery_routes(app, sys.modules[__name__])
     register_operations_routes(app, sys.modules[__name__])
@@ -1502,13 +1508,12 @@ def authenticate_buyer_api_key(db, api_key: str) -> tuple[dict | None, str]:
         "api_key_hash": buyer_api_key_hash(clean),
         "api_enabled": {"$ne": False},
         "blocked": {"$ne": True},
-    })
+    }, {"user_id": 1, "username": 1, "language": 1, "language_code": 1,
+        "pricing_group": 1, "wallet_usdt": 1, "api_enabled": 1, "blocked": 1})
     if not user:
         return None, "Invalid API key"
-    db.users.update_one(
-        {"_id": user["_id"]},
-        {"$set": {"api_last_used_at": utcnow()}, "$inc": {"api_request_count": 1}},
-    )
+    # Live authentication only. Accepted-request statistics are batched by
+    # the API runtime, after rate limiting, outside the request write path.
     return user, ""
 
 
@@ -1990,6 +1995,7 @@ def register_routes(app: Flask) -> None:
             settings=settings,
             language_settings=language_settings,
             backup_state=app.db.operational_control.find_one({"_id": "backup"}) or {},
+            api_status=api_status(app.db),
             emoji_choices=EMOJI_CHOICES,
             premium_mapping=premium_mapping(settings),
             emoji_usage=EMOJI_USAGE,
@@ -2090,11 +2096,11 @@ def register_routes(app: Flask) -> None:
             for error in validation_errors:
                 flash(error, "error")
             return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
-                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE), 400
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE, api_status=api_status(app.db)), 400
         if not settings.get("bot_token"):
             flash("Telegram bot token is required before the bot can start.", "error")
             return render_template("secret_settings.html", settings=settings, language_settings={"default_language": "en", "enabled_languages": enabled_languages},
-                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE), 400
+                                   emoji_choices=EMOJI_CHOICES, premium_mapping=premium_mapping(settings), emoji_usage=EMOJI_USAGE, api_status=api_status(app.db)), 400
         if not settings.get("admin_panel_username") and not os.getenv("ADMIN_PANEL_USERNAME"):
             settings["admin_panel_username"] = "admin"
         set_secret_settings(app.db, settings, preserve_routing=True)

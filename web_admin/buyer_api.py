@@ -9,9 +9,11 @@ from pymongo.errors import DuplicateKeyError
 from web_admin.api_security import request_key, rate_limit, ensure_security_indexes
 from utils.wallet_events import change_wallet, event_id
 from utils.stock_reservations import reserve_stock, release_stock
-from werkzeug.exceptions import TooManyRequests
+from werkzeug.exceptions import TooManyRequests, ServiceUnavailable
+from web_admin.api_runtime import CacheBusy
 from utils.extra_i18n import api_message
 from utils.message_emojis import plain_text
+from utils.data_guard import work_guard
 
 
 def ensure_api_indexes(db):
@@ -40,6 +42,12 @@ def ensure_api_indexes(db):
 
 
 def register_buyer_api_routes(app, shop):
+    @app.after_request
+    def buyer_api_private_responses(response):
+        if (request.endpoint or '').startswith('buyer_api_'):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
+
     @app.post("/orders/<order_id>/retry-api-receipt")
     @shop.login_required
     @shop.owner_required
@@ -56,14 +64,24 @@ def register_buyer_api_routes(app, shop):
         def wrapped(*args, **kwargs):
             g.buyer_api_lang = request.accept_languages.best_match(["en", "es"], default="en")
             try:
-                settings = shop.get_secret_settings(app.db)
-                delay = rate_limit(app.db, "ip:" + (request.remote_addr or "unknown"), int(settings.get("api_ip_requests_per_minute") or 180))
+                runtime = app.api_runtime
+                settings = runtime.settings()
+                g.buyer_api_settings = settings
+                if not runtime.status()['enabled']:
+                    message = ('La API está deshabilitada por mantenimiento hasta nuevo aviso.' if g.buyer_api_lang == 'es'
+                               else 'The API is disabled for maintenance until further notice.')
+                    return jsonify({'success': False, 'code': 'api_maintenance', 'retryable': True,
+                                    'message': message}), 503, {'Retry-After': '60', 'Cache-Control': 'no-store'}
+                ip_identity = 'ip:' + (request.remote_addr or 'unknown')
+                delay = rate_limit(app.db, ip_identity, int(settings.get('api_ip_requests_per_minute') or 180))
                 if delay:
+                    runtime.block(ip_identity, delay)
                     response = jsonify({"success": False, "code": "rate_limited", "message": api_message("Too many requests. Try again later.", g.buyer_api_lang)})
                     response.status_code = 429
                     response.headers["Retry-After"] = str(delay)
                     return response
                 response = make_response(fn(*args, **kwargs))
+                response.headers['Cache-Control'] = 'no-store'
                 data = response.get_json(silent=True)
                 if isinstance(data, dict) and isinstance(data.get("message"), str):
                     data["message"] = api_message(data["message"], g.buyer_api_lang)
@@ -75,22 +93,49 @@ def register_buyer_api_routes(app, shop):
                 response.status_code = 429
                 response.headers["Retry-After"] = str(error.retry_after)
                 return response
+            except CacheBusy:
+                return jsonify({'success': False, 'code': 'api_busy', 'retryable': True,
+                    'message': 'Los datos de la API se están actualizando. Inténtalo de nuevo en breve.' if g.buyer_api_lang == 'es' else 'API data is refreshing. Retry shortly.'}), 503, {'Retry-After': '1'}
+            except ServiceUnavailable as error:
+                return jsonify({'success': False, 'code': 'temporarily_unavailable', 'retryable': True,
+                    'message': api_message(error.description, g.buyer_api_lang)}), 503, {'Retry-After': str(error.retry_after or 30)}
             except Exception:
                 app.logger.exception("Buyer API request failed")
                 return shop.buyer_api_error(api_message("Service temporarily unavailable. Retry using the same client_order_id.", g.buyer_api_lang), 503)
+            finally:
+                guard = g.pop('buyer_api_write_guard', None)
+                if guard:
+                    try:
+                        guard.__exit__(None, None, None)
+                    finally:
+                        app.api_runtime.catalog.clear()
         return wrapped
 
     def auth(payload=None):
-        settings = shop.get_secret_settings(app.db)
-        key = request_key(payload, str(settings.get("api_allow_legacy_query_keys", "1")) == "1")
+        settings = g.buyer_api_settings
+        key = request_key(payload, str(settings.get('api_allow_legacy_query_keys', '1')) == '1')
         if not isinstance(key, str):
-            return None, "Invalid API key"
+            return None, 'Invalid API key'
+        runtime = app.api_runtime
+        identity = 'key:' + shop.buyer_api_key_hash(key)
+        delay = runtime.local_limit(identity, settings['api_key_burst_per_second'], settings['api_key_requests_per_minute'])
+        if delay:
+            raise TooManyRequests(retry_after=delay)
         user, error = shop.authenticate_buyer_api_key(app.db, key)
         if user:
             g.buyer_api_lang = shop.lang_from_user(user)
-            delay = rate_limit(app.db, "key:" + shop.buyer_api_key_hash(key), int(settings.get("api_key_requests_per_minute") or 60))
+            delay = rate_limit(app.db, identity, int(settings.get('api_key_requests_per_minute') or 60))
             if delay:
+                runtime.block(identity, delay)
                 raise TooManyRequests(retry_after=delay)
+            if request.endpoint == 'buyer_api_purchase':
+                guard = work_guard(app.db, wait=False)
+                try:
+                    guard.__enter__()
+                except RuntimeError:
+                    raise ServiceUnavailable(description='Scheduled backup is exporting. Please try again shortly.', retry_after=30) from None
+                g.buyer_api_write_guard = guard
+            runtime.touch(user)
         return user, error
 
     def cached_order(order):
@@ -107,36 +152,50 @@ def register_buyer_api_routes(app, shop):
         if not user:
             return shop.buyer_api_error(error, 401)
         language = shop.lang_from_user(user)
-        custom_prices = {}
-        for custom in app.db.user_product_prices.find({'user_id': int(user['user_id'])}):
-            if custom.get('product_key'):
-                custom_prices.setdefault(custom['product_key'], custom)
-        sold_counts = {}
-        for row in app.db.orders.aggregate([
-            {'$match': {'status': 'delivered', 'is_replacement': {'$ne': True}}},
-            {'$group': {'_id': '$product_name', 'count': {'$sum': 1}}}
-        ]):
-            key = str(row['_id'] or '').casefold()
-            sold_counts[key] = sold_counts.get(key, 0) + row['count']
-        rows = []
-        for product in shop.get_products_with_availability(app.db):
-            if product.get("api_enabled") is False:
-                continue
-            priced = shop.product_effective_price(product, user,
-                custom_prices.get(shop.product_name_key(product['name']))) or product
-            price = round(max(0, shop.safe_float(priced.get("price_usdt"), 0)), 6)
-            stock = int(product.get("available_stock", 0))
-            sold = sold_counts.get(product['name'].casefold(), 0)
-            description = product.get(f"description_{language}") or product.get("description_en") or product.get("description") or ""
-            description = plain_text(description)
-            product_id = shop.public_api_product_id(product)
-            rows.append({"_id": product_id, "product_id": product_id, "product_name": product["name"], "product_name_raw": product["name"],
-                         "pricing": price, "description": description, "description_raw": description,
-                         "walletCurrency": "USDT", "walletPricing": price, "walletPricingText": shop.api_money_usdt(price), "usdPricing": price,
-                         "isSlotProduct": False, "slotDurations": [], "requiresCustomerEmail": False, "requiresSlotMonths": False,
-                         "quantityFixed": None, "slotPricingMode": None, "promotions": [], "stats": {"total": sold + stock, "sold": sold, "available": stock}})
-        return jsonify({"success": True, "lang": language, "botSource": "primary", "walletCurrency": "USDT",
-                        "requester": {"chatId": user["user_id"], "name": user.get("username", "")}, "products": rows})
+        runtime = app.api_runtime
+        seconds = int(g.buyer_api_settings['api_catalog_cache_seconds'])
+
+        def build_base():
+            sold_counts = {}
+            for row in app.db.orders.aggregate([
+                {'$match': {'status': 'delivered', 'is_replacement': {'$ne': True}}},
+                {'$group': {'_id': '$product_name', 'count': {'$sum': 1}}}
+            ]):
+                key = str(row['_id'] or '').casefold()
+                sold_counts[key] = sold_counts.get(key, 0) + row['count']
+            return shop.get_products_with_availability(app.db), sold_counts
+
+        def build_custom_prices():
+            custom_prices = {}
+            for custom in app.db.user_product_prices.find({'user_id': int(user['user_id'])}):
+                if custom.get('product_key'):
+                    custom_prices.setdefault(custom['product_key'], custom)
+            return custom_prices
+
+        def build_catalog():
+            custom_prices = runtime.catalog.get(('prices', user['user_id']), seconds, build_custom_prices)
+            products, sold_counts = runtime.catalog.get(('base',), seconds, build_base)
+            rows = []
+            for product in products:
+                if product.get('api_enabled') is False:
+                    continue
+                priced = shop.product_effective_price(product, user,
+                    custom_prices.get(shop.product_name_key(product['name']))) or product
+                price = round(max(0, shop.safe_float(priced.get('price_usdt'), 0)), 6)
+                stock = int(product.get('available_stock', 0))
+                sold = sold_counts.get(product['name'].casefold(), 0)
+                description = plain_text(product.get(f'description_{language}') or product.get('description_en') or product.get('description') or '')
+                product_id = shop.public_api_product_id(product)
+                rows.append({'_id': product_id, 'product_id': product_id, 'product_name': product['name'], 'product_name_raw': product['name'],
+                             'pricing': price, 'description': description, 'description_raw': description,
+                             'walletCurrency': 'USDT', 'walletPricing': price, 'walletPricingText': shop.api_money_usdt(price), 'usdPricing': price,
+                             'isSlotProduct': False, 'slotDurations': [], 'requiresCustomerEmail': False, 'requiresSlotMonths': False,
+                             'quantityFixed': None, 'slotPricingMode': None, 'promotions': [], 'stats': {'total': sold + stock, 'sold': sold, 'available': stock}})
+            return rows
+
+        rows = build_catalog()
+        return jsonify({'success': True, 'lang': language, 'botSource': 'primary', 'walletCurrency': 'USDT',
+                        'requester': {'chatId': user['user_id'], 'name': user.get('username', '')}, 'products': rows})
 
     @app.get("/api/telegram-buyer/balance")
     @guarded

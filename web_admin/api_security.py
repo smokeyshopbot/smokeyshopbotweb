@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from flask import request
 from pymongo import ReturnDocument
+from utils.data_guard import raw_database
 
 
 def request_key(payload=None, allow_legacy=True):
@@ -29,7 +30,9 @@ def rate_limit(db, identity, limit, window=60):
     seconds = time.time()
     bucket = int(seconds // window)
     identifier = hashlib.sha256(f"{identity}:{bucket}".encode()).hexdigest()
-    doc = db.api_rate_limits.find_one_and_update({"_id": identifier},
+    # Transient counters are excluded from backups; they must not acquire a
+    # shared financial write lease for every API request.
+    doc = raw_database(db).api_rate_limits.find_one_and_update({"_id": identifier},
         {"$inc": {"count": 1}, "$setOnInsert": {"expires_at": datetime.fromtimestamp((bucket + 2) * window, timezone.utc)}},
         upsert=True, return_document=ReturnDocument.AFTER)
     return max(1, math.ceil((bucket + 1) * window - seconds)) if doc["count"] > limit else 0
