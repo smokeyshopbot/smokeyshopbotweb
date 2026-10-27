@@ -22,6 +22,7 @@ from web_admin.admin_security import install as install_admin_security, DEFAULT_
 from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
 from web_admin.delivery_queue import enqueue_job, enqueue_bulk, bulk_count, ensure_delivery_indexes, register_delivery_routes, start_delivery_worker
+from utils.performance import monitor
 from utils.stock_subscriptions import ensure_indexes as ensure_stock_subscription_indexes
 import functools
 import html
@@ -71,7 +72,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
 from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amount_from_error
 from utils.channel_gate_settings import validate_channel_settings
-from utils.data_guard import GuardedDatabase, work_guard
+from utils.data_guard import GuardedDatabase, work_guard, sync_update_unit, DatabaseWritesPaused, raw_database
 from utils.wallet_events import change_wallet, event_id
 from utils.runtime_upgrade import remove_obsolete_state
 from utils.wallet_credits import WalletCreditReview, credit_topup, ensure_indexes as ensure_wallet_credit_indexes
@@ -650,7 +651,11 @@ def clean_secret_settings(settings: dict | None) -> dict:
 def get_runtime_bot_token_record(db=None) -> dict:
     if db is None:
         db = current_app.db  # type: ignore[attr-defined]
-    doc = db.runtime_config.find_one({"key": RUNTIME_BOT_TOKEN_KEY}) or {}
+    if has_request_context() and g.get('request_runtime_token') is not None:
+        return dict(g.request_runtime_token)
+    doc = db.runtime_config.find_one({'key': RUNTIME_BOT_TOKEN_KEY}) or {}
+    if has_request_context():
+        g.request_runtime_token = doc
     return doc if isinstance(doc, dict) else {}
 
 
@@ -664,6 +669,8 @@ def get_secret_settings(db=None) -> dict:
         db = current_app.db  # type: ignore[attr-defined]
     if has_app_context() and getattr(g, "delivery_secret_settings", None) is not None:
         return g.delivery_secret_settings
+    if has_request_context() and g.get("request_secret_settings") is not None:
+        return dict(g.request_secret_settings)
     doc = db.settings.find_one({"key": SECRET_SETTINGS_KEY}) or {}
     value = doc.get("value") if isinstance(doc, dict) else {}
     cleaned = clean_secret_settings(value if isinstance(value, dict) else None)
@@ -675,6 +682,8 @@ def get_secret_settings(db=None) -> dict:
         cleaned["bot_token"] = runtime_token
         cleaned["bot_token_runtime_updated_at"] = runtime_token_doc.get("updated_at")
     cleaned["secret_settings_updated_at"] = doc.get("updated_at") if isinstance(doc, dict) else None
+    if has_request_context():
+        g.request_secret_settings = dict(cleaned)
     return cleaned
 
 
@@ -696,6 +705,9 @@ def set_secret_settings(db, settings: dict, *, preserve_routing=False) -> dict:
             {"$set": {"key": RUNTIME_BOT_TOKEN_KEY, "value": token, "updated_at": now}},
             upsert=True,
         )
+    if has_request_context():
+        g.pop("request_secret_settings", None)
+        g.pop("request_runtime_token", None)
     invalidate_api_runtime(db)
     return cleaned
 
@@ -803,6 +815,22 @@ def stock_manager_payout_paid_by_label(db, record: dict | None) -> str:
     return admin_role_label_for_username(db, record.get("paid_by"))
 
 
+def ensure_browsing_indexes(db):
+    """Ensure hot read prefixes even when optional dashboard indexes are off.
+
+    Existing unique indexes are preserved; these indexes never change data or
+    enforce a new constraint on legacy rows.
+    """
+    for collection, keys in (
+        ('user_product_prices', [('user_id', 1), ('product_key', 1)]),
+        ('orders', [('status', 1)]),
+        ('pending_payments', [('status', 1), ('created_at', -1)]),
+    ):
+        present = db[collection].index_information().values()
+        if not any(list(row.get('key', []))[:len(keys)] == keys for row in present):
+            db[collection].create_index(keys)
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.jinja_env.filters['message_emoji_text'] = message_emoji_text
@@ -810,6 +838,10 @@ def create_app() -> Flask:
     remove_obsolete_state(app.db)
     app.db.wallet_ledger.create_index([("user_id", 1), ("currency", 1)])
     ensure_api_indexes(app.db)
+    try:
+        ensure_browsing_indexes(app.db)
+    except Exception as error:
+        app.logger.warning('Could not ensure browsing query indexes (%s).', type(error).__name__)
     ensure_wallet_credit_indexes(app.db)
     ensure_poll_indexes(app.db)
     ensure_delivery_indexes(app.db)
@@ -856,17 +888,19 @@ def create_app() -> Flask:
         if request.method == "GET" and request.endpoint in {"secret_settings_form"}:
             g.read_only_backup_status = True
             return None
-        guard = work_guard(app.db, wait=False)
-        try:
-            guard.__enter__()
-        except RuntimeError:
-            return jsonify({"success": False, "message": "Scheduled backup is exporting. Please try again shortly."}), 503, {"Retry-After": "30"}
-        g.database_work_guard = guard
+        unit = sync_update_unit(app.db, wait=False)
+        unit.__enter__()
+        g.database_work_unit = unit
 
     @app.teardown_request
     def finish_database_work(error=None):
-        guard = g.pop("database_work_guard", None)
-        if guard: guard.__exit__(None, None, None)
+        unit = g.pop('database_work_unit', None)
+        if unit:
+            unit.__exit__(None, None, None)
+
+    @app.errorhandler(DatabaseWritesPaused)
+    def writes_paused(error):
+        return jsonify({'success': False, 'message': 'Scheduled backup is exporting. Please try again shortly.'}), 503, {'Retry-After': '30'}
 
     @app.before_request
     def clear_cached_counts_before_mutations():
@@ -887,23 +921,6 @@ def create_app() -> Flask:
         if not can_access_endpoint(endpoint):
             abort(403)
         return None
-
-    @app.before_request
-    def expire_stale_unpaid_request_cleanup():
-        if g.get("read_only_backup_status") or (request.endpoint or "").startswith("buyer_api_"): return
-        if not session.get("admin_logged_in"):
-            return
-        now = time.time()
-        if now - float(getattr(app, "_last_expiry_cleanup", 0) or 0) < 30:
-            return
-        try:
-            result = expire_stale_unpaid_payments_and_orders(app.db)
-            if any(result.values()):
-                app.logger.info("Expired stale unpaid orders/payments from WebAdmin: %s", result)
-        except Exception as exc:
-            app.logger.warning("Could not expire stale unpaid orders/payments: %s", exc)
-        finally:
-            app._last_expiry_cleanup = now  # type: ignore[attr-defined]
 
     @app.context_processor
     def inject_globals():
@@ -1035,6 +1052,7 @@ def _connect_db():
     db_name = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
     client = MongoClient(
         mongo_uri,
+        event_listeners=[monitor],
         tls=True,
         tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
         serverSelectionTimeoutMS=_env_int("MONGO_SERVER_SELECTION_TIMEOUT_MS", 10000, minimum=3000, maximum=60000),
@@ -1666,6 +1684,7 @@ def supplier_response_items(payload: dict) -> list[str]:
 _SUPPLIER_HTTP_POOL = ThreadPoolExecutor(max_workers=4)
 _SUPPLIER_HTTP_LOCK = threading.Lock()
 _SUPPLIER_HTTP_CACHE = {}
+_SUPPLIER_LAST_GOOD = {}
 
 
 def _supplier_stock_future(supplier):
@@ -1685,20 +1704,25 @@ def _supplier_stock_future(supplier):
                     headers={'Authorization': 'Bearer ' + api_key},
                     params={'key': api_key} if supplier.get('legacy_query_auth', True) else {}, timeout=(2, 3))
                 if getattr(response, 'status_code', 200) != 200:
-                    return {}
+                    return None
                 data = response.json()
                 if not isinstance(data, dict) or data.get('success') is False:
-                    return {}
-                return {str(row.get('product_id') or row.get('_id') or ''): max(0, int((row.get('stats') or {}).get('available') or 0))
+                    return None
+                counts = {str(row.get('product_id') or row.get('_id') or ''): max(0, int((row.get('stats') or {}).get('available') or 0))
                         for row in data.get('products', []) if isinstance(row, dict)}
+                with _SUPPLIER_HTTP_LOCK:
+                    _SUPPLIER_LAST_GOOD[key] = (time.monotonic(), counts)
+                    while len(_SUPPLIER_LAST_GOOD) > 1024:
+                        _SUPPLIER_LAST_GOOD.pop(next(iter(_SUPPLIER_LAST_GOOD)))
+                return counts
             except Exception:
-                return {}
+                return None
         future = _SUPPLIER_HTTP_POOL.submit(fetch)
         _SUPPLIER_HTTP_CACHE[key] = (time.monotonic(), future)
         return future
 
 
-def get_external_supplier_available_stock(db, product_or_name: Any, *, cache_seconds: int = 30, _suppliers=None, _deadline=None) -> int:
+def get_external_supplier_available_stock(db, product_or_name: Any, *, cache_seconds: int = 30, _suppliers=None, _deadline=None, display_only=False) -> int:
     product = product_or_name if isinstance(product_or_name, dict) else db.products.find_one({'name': name_regex(str(product_or_name or ''))})
     fallbacks = normalize_supplier_fallbacks(product)
     if not fallbacks:
@@ -1710,13 +1734,23 @@ def get_external_supplier_available_stock(db, product_or_name: Any, *, cache_sec
         supplier = (_suppliers.get(row['supplier_id']) if _suppliers is not None else
                     db.supplier_apis.find_one({'_id': ObjectId(row['supplier_id']), 'enabled': {'$ne': False}}))
         if supplier:
-            requests_pending.append((row['supplier_product_id'], _supplier_stock_future(supplier)))
+            key = (str(supplier['_id']), str(supplier.get('base_url')), buyer_api_key_hash(supplier.get('api_key', '')))
+            requests_pending.append((row['supplier_product_id'], key, _supplier_stock_future(supplier)))
     deadline = _deadline if _deadline is not None else time.monotonic() + 3.5
     best = 0
-    for product_id, future in requests_pending:
+    for product_id, key, future in requests_pending:
         try:
-            counts = future.result(timeout=max(0, deadline - time.monotonic()))
-            best = max(best, int(counts.get(product_id, 0)))
+            if display_only and not future.done():
+                with _SUPPLIER_HTTP_LOCK:
+                    previous = _SUPPLIER_LAST_GOOD.get(key)
+                counts = previous[1] if previous and time.monotonic() - previous[0] <= 120 else {}
+            else:
+                counts = future.result(timeout=max(0, deadline - time.monotonic()))
+                if counts is None and display_only:
+                    with _SUPPLIER_HTTP_LOCK:
+                        previous = _SUPPLIER_LAST_GOOD.get(key)
+                    counts = previous[1] if previous and time.monotonic() - previous[0] <= 120 else {}
+            best = max(best, int((counts or {}).get(product_id, 0)))
         except Exception:
             pass
     return best
@@ -2944,6 +2978,7 @@ def register_routes(app: Flask) -> None:
             include_disabled=True,
             include_stock_items=include_stock_items,
             product_query=product_query,
+            display_only=True,
         )
         if q:
             q_lower = q.lower()
@@ -2964,9 +2999,12 @@ def register_routes(app: Flask) -> None:
                 product["pending_replacement_report_ids"] = list(pending_replacement_row.get("report_ids") or [])[:4]
 
         rows, total_pages = paginate(products, page, PAGE_SIZE)
-        if is_owner_role():
+        if is_owner_role() and rows:
+            counts = {product_name_key(row['_id']): row['count'] for row in app.db.stock_upload_rejections.aggregate([
+                {'$match': {'$or': [{'product_name': name_regex(p['name'])} for p in rows]}},
+                {'$group': {'_id': '$product_name', 'count': {'$sum': 1}}}])}
             for product_row in rows:
-                product_row["rejected_upload_count"] = app.db.stock_upload_rejections.count_documents({"product_name": name_regex(product_row.get("name", ""))})
+                product_row['rejected_upload_count'] = counts.get(product_name_key(product_row['name']), 0)
 
         payment_currencies = get_active_payment_currencies(app.db)
         return render_template(
@@ -2993,10 +3031,9 @@ def register_routes(app: Flask) -> None:
         if not require_stock_manager_product_access(app.db, product.get("name")):
             flash("This product is not assigned to your stock-manager account.", "error")
             return redirect(url_for("products"))
-        product["total_stock"] = get_stock_count(app.db, product["name"])
-        product["available_stock"] = get_available_stock_count(app.db, product["name"])
+        product["total_stock"] = len(product.get("stock") or [])
         product["pending_stock_quantity"] = get_pending_stock_quantity(app.db, product["name"])
-        product['external_supplier_stock'] = get_external_supplier_available_stock(app.db, product) if normalize_supplier_fallbacks(product) and not is_stock_manager_role() else 0
+        product['external_supplier_stock'] = get_external_supplier_available_stock(app.db, product, display_only=True) if normalize_supplier_fallbacks(product) and not is_stock_manager_role() else 0
         product['available_stock'] = max(0, product['total_stock'] + product['external_supplier_stock'] - product['pending_stock_quantity'])
         product["min_order_quantity"] = parse_positive_int(product.get("min_order_quantity"), 1, minimum=1)
         product["max_order_quantity"] = parse_positive_int(product.get("max_order_quantity"), 100, minimum=1)
@@ -6389,6 +6426,8 @@ def filter_stock_against_approved_pool(product: dict, items: list[str]) -> tuple
 
 def approved_stock_pool_stats(db, product: dict) -> dict[str, int]:
     pool = approved_stock_pool_items(product)
+    if not pool:
+        return {"total": 0, "current": 0, "sold_or_used": 0, "remaining": 0}
     pool_set = set(pool)
     current = {normalize_approved_stock_item(item) for item in (product.get("stock", []) or []) if normalize_approved_stock_item(item)}
     used = {normalize_approved_stock_item(item) for item in get_used_stock_items(db, product.get("name", "")) if normalize_approved_stock_item(item)}
@@ -8973,11 +9012,21 @@ def paginate(items: list[Any], page: int, page_size: int) -> tuple[list[Any], in
 
 
 def get_setting(db, key: str, default=None):
-    doc = db.settings.find_one({"key": key})
-    return doc.get("value", default) if doc else default
+    cache_key = (id(raw_database(db)), key)
+    if has_request_context():
+        rows = g.setdefault('request_settings', {})
+        if cache_key in rows:
+            doc = rows[cache_key]
+            return doc.get('value', default) if doc else default
+    doc = db.settings.find_one({'key': key})
+    if has_request_context():
+        g.request_settings[cache_key] = doc
+    return doc.get('value', default) if doc else default
 
 
 def set_setting(db, key: str, value: Any) -> None:
+    if has_request_context():
+        g.pop("request_settings", None)
     db.settings.update_one({"key": key}, {"$set": {"key": key, "value": value, "updated_at": utcnow()}}, upsert=True)
 
 
@@ -9110,12 +9159,13 @@ def clean_payment_settings(settings: dict | None) -> dict:
 
 
 def get_payment_settings(db) -> dict:
-    doc = db.settings.find_one({"key": PAYMENT_SETTINGS_KEY})
-    value = doc.get("value") if doc else None
+    value = get_setting(db, PAYMENT_SETTINGS_KEY)
     return clean_payment_settings(value if isinstance(value, dict) else None)
 
 
 def set_payment_settings(db, settings: dict) -> dict:
+    if has_request_context():
+        g.pop("request_settings", None)
     cleaned = clean_payment_settings(settings)
     db.settings.update_one(
         {"key": PAYMENT_SETTINGS_KEY},
@@ -9805,6 +9855,7 @@ def get_products_with_availability(
     *,
     include_stock_items: bool = False,
     product_query: dict[str, Any] | None = None,
+    display_only: bool = False,
 ) -> list[dict]:
     visibility_query = {} if include_disabled else {"$or": [{"enabled": True}, {"enabled": {"$exists": False}}]}
     if product_query and visibility_query:
@@ -9841,7 +9892,7 @@ def get_products_with_availability(
         product["external_supplier_available"] = bool(normalize_supplier_fallbacks(product))
         product["external_supplier_stock"] = 0
         if product["external_supplier_available"]:
-            supplier_available = get_external_supplier_available_stock(db, product, _suppliers=vendors, _deadline=vendor_deadline)
+            supplier_available = get_external_supplier_available_stock(db, product, _suppliers=vendors, _deadline=vendor_deadline, display_only=display_only)
             product["external_supplier_stock"] = supplier_available
             product["available_stock"] = max(0, actual + supplier_available - pending)
     return products

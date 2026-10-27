@@ -275,6 +275,9 @@ def service_tick(app, shop):
     try:
         with work_guard(db):
             process_notices(db)
+            if time.monotonic() - getattr(app, '_last_background_expiry', float('-inf')) >= 30:
+                shop.expire_stale_unpaid_payments_and_orders(db)
+                app._last_background_expiry = time.monotonic()
             recover_credits(db)
             from web_admin.promotions import process_sales, recover_coupons
             process_sales(db, shop)

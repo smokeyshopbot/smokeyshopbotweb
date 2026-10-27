@@ -6,10 +6,13 @@ import hashlib
 import hmac
 import io
 import json
+import logging
+from utils.performance import current as performance_current, Profile as PerformanceProfile
 import os
 import re
 import secrets
 import time
+from time import monotonic as request_clock
 from datetime import datetime, timedelta, timezone
 
 import pyotp
@@ -52,6 +55,20 @@ class AdminPathMiddleware:
         self.application, self.db, self.api_runtime = application, db, api_runtime
 
     def __call__(self, environ, start_response):
+        profile = PerformanceProfile()
+        token = performance_current.set(profile)
+        started = request_clock()
+        try:
+            return self._serve(environ, start_response)
+        finally:
+            performance_current.reset(token)
+            elapsed = request_clock() - started
+            if elapsed > 2:
+                logging.getLogger(__name__).warning(
+                    'Slow web request: %.2fs; MongoDB %s commands / %.2fs; slowest %s %.2fs.',
+                    elapsed, profile.commands, profile.database_seconds, profile.slowest[0] or 'none', profile.slowest[1])
+
+    def _serve(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
         # Unbranded process-liveness probe for Railway's internal healthcheck host.
         if path == "/healthz" and environ.get("REQUEST_METHOD") in {"GET", "HEAD"}:

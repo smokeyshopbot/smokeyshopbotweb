@@ -163,7 +163,7 @@ def register_buyer_api_routes(app, shop):
             ]):
                 key = str(row['_id'] or '').casefold()
                 sold_counts[key] = sold_counts.get(key, 0) + row['count']
-            return shop.get_products_with_availability(app.db), sold_counts
+            return shop.get_products_with_availability(app.db, display_only=True), sold_counts
 
         def build_custom_prices():
             custom_prices = {}

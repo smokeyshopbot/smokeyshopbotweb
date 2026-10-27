@@ -2,6 +2,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from utils.data_guard import work_guard, raw_database
+from utils.performance import monitor
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -438,6 +439,8 @@ def process_delivery_jobs(app, shop, *, limit=1, recover=True):
     for _ in range(limit):
         token = uuid.uuid4().hex
         query = {"status": "queued", "next_attempt_at": {"$lte": now()}}
+        if g.get("delivery_background_busy") or (g.get("delivery_snapshot") is not None and monitor.background_busy()):
+            query["priority"] = {"$lte": 5}
         snapshot = getattr(g, "delivery_snapshot", None)
         pause = snapshot.pause() if snapshot else db.delivery_control.find_one({"key": "telegram_pause"}) or {}
         if pause.get("until") and pause["until"].replace(tzinfo=timezone.utc) > now():
@@ -482,12 +485,14 @@ class DeliveryPool:
         self.pending = set()
         self.last_recovery = 0.0
         self.last_probe = -1.0
+        self.poll_interval = 0.25
         from web_admin.delivery_snapshot import DeliverySnapshot
         self.snapshot = DeliverySnapshot(app.db, shop)
 
     def _run_one(self):
         with self.app.app_context(), work_guard(self.app.db):
             g.delivery_snapshot = self.snapshot
+            g.delivery_background_busy = monitor.background_busy()
             return process_delivery_jobs(self.app, self.shop, recover=False, limit=3)
 
     def tick(self):
@@ -498,20 +503,32 @@ class DeliveryPool:
                     future.result()
                 except Exception:
                     self.app.logger.exception("Delivery worker failed")
+        # Avoid exhausting Atlas Free with background claims/retry churn. All
+        # admitted deliveries finish normally; queued jobs remain durable.
+        busy = monitor.background_busy()
         if time.monotonic() - self.last_recovery >= 10:
-            with self.app.app_context(), work_guard(self.app.db, wait=False):
-                _recover_expired_jobs(self.app.db)
+            expired = self.app.db.delivery_jobs.find_one({'status': 'working', 'lease_until': {'$lt': now()}}, {'_id': 1})
+            if expired:
+                with self.app.app_context(), work_guard(self.app.db, wait=False):
+                    _recover_expired_jobs(self.app.db)
             self.last_recovery = time.monotonic()
         room = self.workers - len(self.pending)
-        if room <= 0 or time.monotonic() - self.last_probe < 0.25:
+        if room <= 0 or time.monotonic() - self.last_probe < (max(1, self.poll_interval) if busy else self.poll_interval):
             return
         self.last_probe = time.monotonic()
         query = {"status": "queued", "next_attempt_at": {"$lte": now()}}
-        pause = self.app.db.delivery_control.find_one({"key": "telegram_pause"}) or {}
-        if pause.get("until") and pause["until"].replace(tzinfo=timezone.utc) > now():
-            query["kind"] = {"$in": ["bulk", "stock_work"]}
-        # Probe once while idle instead of making every worker poll MongoDB.
-        ready = list(self.app.db.delivery_jobs.find(query, {"kind": 1, "payload.chat_id": 1}).limit(room * 3))
+        if busy:
+            # Paid delivery/stock work keeps progressing; routine bulk children
+            # wait for database headroom instead of competing with navigation.
+            query['priority'] = {'$lte': 5}
+        ready = list(self.app.db.delivery_jobs.find(query, {'kind': 1, 'payload.chat_id': 1}).limit(room * 3))
+        if not ready:
+            self.poll_interval = min(2.0, self.poll_interval * 2)
+            return
+        self.poll_interval = 0.25
+        pause = self.snapshot.pause()
+        if pause.get('until') and pause['until'].replace(tzinfo=timezone.utc) > now():
+            ready = [job for job in ready if job['kind'] in {'bulk', 'stock_work'}]
         self.snapshot.prefetch_users(ready)
         for _ in range(min(room, (len(ready) + 2) // 3)):
             self.pending.add(self.executor.submit(self._run_one))
