@@ -61,7 +61,7 @@
         {% set display_status = 'revoked' if order.get('delivery_revoked') else order.status %}
         <td class="center-cell status-cell"><span class="{{ status_badge_class(display_status) }}">{{ status_label(display_status) }}</span></td>
         <td class="center-cell order-action-cell">
-          {% if order.status == 'delivered' and order.get('items') and not order.get('delivery_revoked') %}
+          {% if order.status == 'delivered' and order.get('has_items') and not order.get('delivery_revoked') %}
             <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <input type="hidden" name="next" value="{{ request.full_path }}">

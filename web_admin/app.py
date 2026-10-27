@@ -18,6 +18,7 @@ from web_admin.api_runtime import ApiRuntime, invalidate as invalidate_api_runti
 from web_admin.api_maintenance import status as api_status, register_routes as register_api_maintenance_routes
 from web_admin.promotions import register_promotions
 from web_admin.emoji_usage import EMOJI_USAGE
+from web_admin.history_pages import page as history_page
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
@@ -602,6 +603,8 @@ def current_telegram_username(db, user_id: int | str | None, fallback: str | Non
     username = str(fallback or "").strip().lstrip("@")
     if not uid:
         return username
+    if has_request_context() and uid in g.get('display_usernames', {}):
+        return g.display_usernames[uid] or username
     try:
         user = db.users.find_one({"user_id": uid}, {"username": 1}) or {}
         current = str(user.get("username") or "").strip().lstrip("@")
@@ -824,6 +827,10 @@ def ensure_browsing_indexes(db):
     for collection, keys in (
         ('user_product_prices', [('user_id', 1), ('product_key', 1)]),
         ('orders', [('status', 1)]),
+        ('orders', [('created_at', -1), ('_id', -1)]),
+        ('orders', [('user_id', 1), ('created_at', -1), ('_id', -1)]),
+        ('replacement_reports', [('created_at', -1), ('_id', -1)]),
+        ('pending_payments', [('created_at', -1), ('_id', -1)]),
         ('pending_payments', [('status', 1), ('created_at', -1)]),
     ):
         present = db[collection].index_information().values()
@@ -1895,11 +1902,11 @@ def register_routes(app: Flask) -> None:
             user_ids.append(user_id)
         if not user_ids:
             return rows
-        users = app.db.users.find({"user_id": {"$in": sorted(set(user_ids))}}, {"user_id": 1, "username": 1})
-        username_by_id = {int(u.get("user_id")): (u.get("username") or "") for u in users if u.get("user_id") is not None}
+        username_by_id = prefetch_display_usernames(app.db, user_ids)
         for row in rows:
             try:
-                row["username"] = username_by_id.get(int(row.get("user_id")), row.get("username") or "")
+                name = username_by_id.get(int(row.get("user_id")))
+                row["username"] = name if name is not None else row.get("username") or ""
             except (TypeError, ValueError):
                 row["username"] = row.get("username") or ""
         return rows
@@ -1950,14 +1957,13 @@ def register_routes(app: Flask) -> None:
     @app.get("/")
     @login_required
     def dashboard():
-        expire_stale_unpaid_payments_and_orders(app.db)
 
         def build_dashboard_state() -> dict[str, Any]:
             stats = get_bot_stats(app.db)
             low_stock_rows = get_low_stock_products(app.db, limit=8)
             recent_orders = _attach_order_display_status(
-                recent_created_rows(
-                    app.db.orders.find({"is_replacement": {"$ne": True}}),
+                recent_collection_rows(
+                    app.db.orders, {"is_replacement": {"$ne": True}}, order_summary=True,
                     limit=5,
                 )
             )
@@ -2466,8 +2472,8 @@ def register_routes(app: Flask) -> None:
         query: dict[str, Any] = status_queries[status]
         page = int_arg("page", 1, minimum=1)
         total = app.db.replacement_reports.count_documents(query)
-        reports = recent_created_rows(
-            app.db.replacement_reports.find(query),
+        reports = recent_collection_rows(
+            app.db.replacement_reports, query,
             skip=(page - 1) * PAGE_SIZE,
             limit=PAGE_SIZE,
         )
@@ -2503,7 +2509,7 @@ def register_routes(app: Flask) -> None:
         query: dict[str, Any] = status_queries[status]
         page = 1
         total = app.db.replacement_reports.count_documents(query)
-        reports = recent_created_rows(app.db.replacement_reports.find(query), limit=PAGE_SIZE)
+        reports = recent_collection_rows(app.db.replacement_reports, query, limit=PAGE_SIZE)
         total_pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
         counts = {key: app.db.replacement_reports.count_documents(q) for key, q in status_queries.items()}
         manual_lookup = None
@@ -3921,18 +3927,18 @@ def register_routes(app: Flask) -> None:
         replacements_page = min(replacements_page, replacements_total_pages)
         wallet_page = min(wallet_page, wallet_logs_total_pages)
 
-        orders = recent_created_rows(
-            app.db.orders.find(orders_query),
+        orders = recent_collection_rows(
+            app.db.orders, orders_query, order_summary=True,
             skip=(orders_page - 1) * per_page,
             limit=per_page,
         )
-        recent_replacements = recent_created_rows(
-            app.db.orders.find(replacements_query),
+        recent_replacements = recent_collection_rows(
+            app.db.orders, replacements_query, order_summary=True,
             skip=(replacements_page - 1) * per_page,
             limit=per_page,
         )
-        logs = recent_created_rows(
-            app.db.pending_payments.find(wallet_logs_query),
+        logs = recent_collection_rows(
+            app.db.pending_payments, wallet_logs_query,
             skip=(wallet_page - 1) * per_page,
             limit=per_page,
         )
@@ -5099,7 +5105,6 @@ def register_routes(app: Flask) -> None:
     @app.get("/orders")
     @login_required
     def orders():
-        expire_stale_unpaid_payments_and_orders(app.db)
         query: dict[str, Any] = {"is_replacement": {"$ne": True}}
         q = request.args.get("q", "").strip()
         combined_filter = request.args.get("filter", "").strip().lower()
@@ -5155,8 +5160,8 @@ def register_routes(app: Flask) -> None:
         page = int_arg("page", 1, minimum=1)
         total = app.db.orders.count_documents(query)
         rows = _attach_order_display_status(
-            recent_created_rows(
-                app.db.orders.find(query),
+            recent_collection_rows(
+                app.db.orders, query, order_summary=True,
                 skip=(page - 1) * PAGE_SIZE,
                 limit=PAGE_SIZE,
             )
@@ -5689,8 +5694,8 @@ def register_routes(app: Flask) -> None:
             query["$or"] = ors
         page = int_arg("page", 1, minimum=1)
         total = app.db.orders.count_documents(query)
-        rows = recent_created_rows(
-            app.db.orders.find(query),
+        rows = recent_collection_rows(
+            app.db.orders, query, order_summary=True,
             skip=(page - 1) * PAGE_SIZE,
             limit=PAGE_SIZE,
         )
@@ -5748,8 +5753,8 @@ def register_routes(app: Flask) -> None:
             query = {"$or": manual_review_query()} if current_admin_role() == ADMIN_ROLE_PAYMENT_MANAGER else {}
         page = int_arg("page", 1, minimum=1)
         total = app.db.pending_payments.count_documents(query)
-        rows = recent_created_rows(
-            app.db.pending_payments.find(query),
+        rows = recent_collection_rows(
+            app.db.pending_payments, query,
             skip=(page - 1) * PAGE_SIZE,
             limit=PAGE_SIZE,
         )
@@ -5859,8 +5864,8 @@ def register_routes(app: Flask) -> None:
         query = {"$and": filters} if len(filters) > 1 else filters[0]
         page = int_arg("page", 1, minimum=1)
         total = app.db.pending_payments.count_documents(query)
-        rows = recent_created_rows(
-            app.db.pending_payments.find(query),
+        rows = recent_collection_rows(
+            app.db.pending_payments, query,
             skip=(page - 1) * PAGE_SIZE,
             limit=PAGE_SIZE,
         )
@@ -10183,7 +10188,8 @@ def get_bot_stats(db) -> dict[str, Any]:
 
 
 def get_user_order_stats(db, user_id: int) -> dict[str, Any]:
-    orders = list(db.orders.find({"user_id": user_id, "is_replacement": {"$ne": True}}))
+    orders = list(db.orders.find({'user_id': user_id, 'is_replacement': {'$ne': True}},
+        {'status': 1, 'payment_method': 1, 'refund_status': 1, 'amount_inr': 1, 'amount_usdt': 1}))
     paid_orders = [
         o for o in orders
         if o.get("status") in {"delivered", "pending_stock"}
@@ -11968,6 +11974,30 @@ def sort_dt(value: Any) -> float:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def prefetch_display_usernames(db, user_ids):
+    parsed = set()
+    for uid in user_ids:
+        try:
+            parsed.add(int(uid))
+        except (TypeError, ValueError):
+            continue
+    ids = sorted(parsed)
+    cached = g.setdefault('display_usernames', {}) if has_request_context() else {}
+    missing = [uid for uid in ids if uid not in cached]
+    if missing:
+        found = {int(row['user_id']): str(row.get('username') or '') for row in db.users.find(
+            {'user_id': {'$in': missing}}, {'user_id': 1, 'username': 1})}
+        cached.update({uid: found.get(uid) for uid in missing})
+    return {uid: cached[uid] for uid in ids}
+
+
+def recent_collection_rows(collection, query=None, *, skip=0, limit=20, order_summary=False):
+    rows = history_page(collection, query, skip=skip, limit=limit, order_summary=order_summary)
+    if has_request_context():
+        prefetch_display_usernames(current_app.db, [row.get('user_id') for row in rows])
+    return rows
 
 
 def recent_created_rows(rows: Any, *, skip: int = 0, limit: int | None = None) -> list[dict]:

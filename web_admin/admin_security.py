@@ -65,8 +65,8 @@ class AdminPathMiddleware:
             elapsed = request_clock() - started
             if elapsed > 2:
                 logging.getLogger(__name__).warning(
-                    'Slow web request: %.2fs; MongoDB %s commands / %.2fs; slowest %s %.2fs.',
-                    elapsed, profile.commands, profile.database_seconds, profile.slowest[0] or 'none', profile.slowest[1])
+                    'Slow web request [%s]: %.2fs; MongoDB %s commands / %.2fs; slowest %s %.2fs.',
+                    environ.get('shop.endpoint', 'routing'), elapsed, profile.commands, profile.database_seconds, profile.slowest[0] or 'none', profile.slowest[1])
 
     def _serve(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
@@ -265,6 +265,7 @@ def install(app, shop):
 
     @app.after_request
     def private_admin_responses(response):
+        request.environ['shop.endpoint'] = request.endpoint or 'unknown'
         if not (request.endpoint or "").startswith("buyer_api_"):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Referrer-Policy"] = "no-referrer"

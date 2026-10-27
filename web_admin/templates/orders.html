@@ -66,7 +66,7 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="danger small-button">Expire</button>
             </form>
-          {% elif order.status == 'delivered' and order.get('items') and not order.get('delivery_revoked') %}
+          {% elif order.status == 'delivered' and order.get('has_items') and not order.get('delivery_revoked') %}
             <form method="post" action="{{ url_for('resend_order', order_id=order.order_id) }}" data-confirm-order-action data-order-action="resend" data-order-ref="{{ order.order_id }}">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <input type="hidden" name="next" value="{{ request.full_path }}">
