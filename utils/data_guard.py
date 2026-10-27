@@ -32,13 +32,43 @@ def raw_database(db):
 def _control(db): return raw_database(db)["operational_control"]
 
 
+class DatabaseWritesPaused(RuntimeError):
+    pass
+
+
 @contextmanager
-def work_guard(db, wait=True):
+def sync_update_unit(db, wait=False):
+    """Start one request lease lazily, on its first database mutation."""
+    previous = getattr(_local, 'unit', None)
+    if previous is not None:
+        yield
+        return
+    unit = {'guard': None, 'db': raw_database(db), 'wait': wait}
+    _local.unit = unit
+    try:
+        yield
+    finally:
+        _local.unit = previous
+        if unit['guard'] is not None:
+            unit['guard'].__exit__(None, None, None)
+
+
+@contextmanager
+def work_guard(db, wait=True, *, _use_unit=True):
     if getattr(_local, "active", False):
         lease = _local.lease
         if lease["lost"] or utcnow() - lease["touched"] > timedelta(minutes=2):
             raise RuntimeError("Write lease heartbeat stalled; operation requires review")
         yield
+        return
+    unit = getattr(_local, 'unit', None)
+    if _use_unit and unit is not None and unit['db'] is raw_database(db):
+        if unit['guard'] is None:
+            guard = work_guard(db, wait=unit['wait'], _use_unit=False)
+            guard.__enter__()
+            unit['guard'] = guard
+        with work_guard(db, _use_unit=False):
+            yield
         return
     control = _control(db)
     token = uuid.uuid4().hex
@@ -49,7 +79,7 @@ def work_guard(db, wait=True):
             control.update_one({"_id": "writes"}, {"$setOnInsert": {"active": {}}}, upsert=True)
             initialized = True
             continue
-        if not wait: raise RuntimeError("Database writes paused for a scheduled backup")
+        if not wait: raise DatabaseWritesPaused("Database writes paused for a scheduled backup")
         time.sleep(0.25)
     _local.active = True
     lease = {"touched": utcnow(), "lost": False}
