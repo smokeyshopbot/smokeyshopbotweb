@@ -1,5 +1,6 @@
 """Persistent, bounded Telegram delivery outside Gunicorn request threads."""
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from utils.data_guard import work_guard, raw_database
 from utils.performance import monitor
@@ -12,6 +13,14 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, BulkWriteError
 from utils.notification_limits import NotificationDeferred, notification_slot
 
+STOCK_NOTICE_PRIORITY = 10
+JOB_SORT = [("priority", 1), ("created_at", 1), ("recipient_rank", 1)]
+
+
+def is_stock_notice(payload):
+    return bool(payload.get("cleanup_previous_stock") or
+                (payload.get("notification") or {}).get("notification_type") in {"new_stock", "stock_available_again"})
+
 
 def now():
     return datetime.now(timezone.utc)
@@ -20,6 +29,7 @@ def now():
 def ensure_delivery_indexes(db):
     db.delivery_jobs.create_index("job_id", unique=True)
     db.delivery_jobs.create_index([("status", 1), ("next_attempt_at", 1), ("priority", 1)])
+    db.delivery_jobs.create_index([("status", 1), *JOB_SORT])
     db.delivery_jobs.create_index([("parent_id", 1), ("status", 1)])
     db.delivery_jobs.create_index([("lease_until", 1)])
     db.delivery_jobs.create_index("expires_at", expireAfterSeconds=0)
@@ -38,7 +48,7 @@ def enqueue_job(db, kind, payload, *, job_id=None, parent_id=None, priority=5):
 
 
 def enqueue_bulk(db, payload):
-    return enqueue_job(db, "bulk", payload, priority=10)
+    return enqueue_job(db, "bulk", payload, priority=8 if is_stock_notice(payload) else 15)
 
 
 def _bulk_query(payload):
@@ -103,7 +113,10 @@ def _expand_bulk(app, shop, job):
         query["$and"] = [{"user_id": {"$gt": cursor}}]
         users = list(db.users.find(query, {"user_id": 1, "language": 1, "language_code": 1}).sort("user_id", 1).limit(100))
     children = []
-    created = now()
+    stock_notice = is_stock_notice(payload)
+    # All pages in a restock share one creation time, so their random ranks
+    # compete together rather than always notifying the first user-ID page.
+    created = job["created_at"] if stock_notice else now()
     for user in users:
         uid = int(user["user_id"])
         language = shop.lang_from_user(user)
@@ -120,8 +133,9 @@ def _expand_bulk(app, shop, job):
         if payload.get('sale_id'):
             child.update(sale_id=payload['sale_id'], sale_expires_at=payload.get('sale_expires_at'))
         children.append({"job_id": f"{job['job_id']}:{uid}", "kind": "text", "payload": child,
-                         "parent_id": job["job_id"], "priority": 20, "attempts": 0,
-                         "status": "queued" if text else "cancelled", "created_at": created,
+                         "parent_id": job["job_id"], "priority": STOCK_NOTICE_PRIORITY if stock_notice else 20, "attempts": 0,
+                         "recipient_rank": hashlib.sha256(f"{job['job_id']}:{uid}".encode()).hexdigest() if stock_notice else "",
+                         "status": ("preparing" if stock_notice else "queued") if text else "cancelled", "created_at": created,
                          "next_attempt_at": created, **({"error": "No message for this user's language",
                              "expires_at": created + timedelta(days=30)} if not text else {})})
     if children:
@@ -134,6 +148,11 @@ def _expand_bulk(app, shop, job):
             if details.get("writeConcernErrors") or any(e.get("code") != 11000 for e in details.get("writeErrors", [])):
                 raise
 
+    if stock_notice and len(users) < 100:
+        # Persist all candidates before releasing a stock campaign. Replays use
+        # the same job IDs/ranks, and never requeue delivered/cancelled children.
+        db.delivery_jobs.update_many({"parent_id": job["job_id"], "status": "preparing"},
+                                    {"$set": {"status": "queued"}})
     _finish(db, job, {"status": "queued" if len(users) == 100 else "expanded",
                      "recipient_cursor": max([cursor] + [int(u["user_id"]) for u in users]),
                      "next_attempt_at": now()})
@@ -326,7 +345,9 @@ def _deliver(app, shop, job):
     if job.get("acknowledged_at"):
         return _send_delivery(app, shop, job)
     try:
-        with notification_slot(db, payload["chat_id"], group=bool(payload.get("group_recipient"))):
+        snapshot = getattr(g, "delivery_snapshot", None)
+        with notification_slot(db, payload["chat_id"], group=bool(payload.get("group_recipient")),
+                               pause_loader=snapshot.pause if snapshot else None):
             return _send_delivery(app, shop, job)
     except NotificationDeferred as error:
         _finish(db, job, {"status": "queued", "next_attempt_at": now() + timedelta(seconds=error.retry_after)})
@@ -358,10 +379,22 @@ def _send_delivery(app, shop, job):
         # Message. Only Message objects have chat and message_id fields.
         result = status.get("result") if isinstance(status.get("result"), dict) else {}
         # Save the acknowledgement before optional bookkeeping/cleanup.
-        db.delivery_jobs.update_one({"job_id": job["job_id"], "claim_token": job["claim_token"]}, {"$set": {"telegram_result": result, "acknowledged_at": now()}})
+        if not job.get("acknowledged_at"):
+            acknowledged = now()
+            db.delivery_jobs.update_one({"job_id": job["job_id"], "claim_token": job["claim_token"]},
+                {"$set": {"telegram_result": result, "acknowledged_at": acknowledged}})
+            job.update(telegram_result=result, acknowledged_at=acknowledged)
         if job.get("stock_subscription_delivery"):
             from web_admin.stock_notifications import acknowledge_delivery
             acknowledge_delivery(db, job)
+        snapshot = getattr(g, "delivery_snapshot", None)
+        if (snapshot and job['kind'] == 'text' and payload.get('bulk_recipient')
+                and not payload.get('group_recipient') and not meta.get('order_id')):
+            checked = getattr(g, 'delivery_user_profile', None)
+            if checked and checked[0] == payload['chat_id']:
+                job['_notice_user'] = checked[1]
+            snapshot.defer_bookkeeping(job)
+            return
         if payload.get('group_recipient') and (result.get('chat') or {}).get('id'):
             payload['chat_id'] = result['chat']['id']
             db.delivery_jobs.update_one({'job_id': job['job_id']}, {'$set': {'payload.chat_id': payload['chat_id']}})
@@ -386,12 +419,14 @@ def _send_delivery(app, shop, job):
         if payload.get("cleanup_previous_stock"):
             previous = shop._last_product_notification(db, payload["chat_id"], payload["product_name"])
             mid = shop._telegram_result_message_id(result)
-            if mid:
+            previous_at = shop._parse_utc_dt((previous or {}).get('delivery_sent_at') or (previous or {}).get('updated_at'))
+            sent_at = shop._parse_utc_dt(job.get('acknowledged_at')) or now()
+            if mid and (not previous_at or previous_at <= sent_at):
                 if previous and previous.get("message_id") != mid:
                     enqueue_job(db, "delete", {"chat_id": payload["chat_id"], "message_id": previous["message_id"],
                                 'group_recipient': bool(payload.get('group_recipient'))},
                                 job_id=f"stock-cleanup:{payload['chat_id']}:{previous['message_id']}", priority=25)
-                shop._save_product_notification(db, payload["chat_id"], payload["product_name"], mid)
+                shop._save_product_notification(db, payload["chat_id"], payload["product_name"], mid, sent_at=sent_at)
         if payload.get("notification_record_id"):
             db.sent_notifications.update_one({"_id": payload["notification_record_id"]}, {"$set": {
                 "deleted": True, "deleted_at": now(), "deleted_by": payload.get("deleted_by", "owner"), "deletion_pending": False}})
@@ -447,7 +482,7 @@ def process_delivery_jobs(app, shop, *, limit=1, recover=True):
             query["kind"] = {"$in": ["bulk", "stock_work"]}
         job = db.delivery_jobs.find_one_and_update(query,
             {"$set": {"status": "working", "claim_token": token, "lease_until": now() + timedelta(minutes=5)}},
-            sort=[("priority", 1), ("created_at", 1)], return_document=ReturnDocument.AFTER)
+            sort=JOB_SORT, return_document=ReturnDocument.AFTER)
         if not job:
             break
         processed += 1
@@ -486,6 +521,10 @@ class DeliveryPool:
         self.last_recovery = 0.0
         self.last_probe = -1.0
         self.poll_interval = 0.25
+        self.bookkeeping_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="notice-records")
+        self.bookkeeping_future = None
+        self.bookkeeping_jobs = []
+        self.last_bookkeeping = 0.0
         from web_admin.delivery_snapshot import DeliverySnapshot
         self.snapshot = DeliverySnapshot(app.db, shop)
 
@@ -495,7 +534,37 @@ class DeliveryPool:
             g.delivery_background_busy = monitor.background_busy()
             return process_delivery_jobs(self.app, self.shop, recover=False, limit=3)
 
+    def _record_notices(self, jobs):
+        from web_admin.notification_bookkeeping import finish_notices
+        with self.app.app_context(), work_guard(self.app.db):
+            g.delivery_snapshot = self.snapshot
+            g.delivery_secret_settings = self.snapshot.settings()
+            missing_profiles = [dict(j, payload={'chat_id': j['payload']['chat_id']})
+                                for j in jobs if '_notice_user' not in j]
+            if missing_profiles:
+                self.snapshot.prefetch_users(missing_profiles)
+            finish_notices(self.app.db, self.shop, jobs)
+
+    def _bookkeeping_tick(self):
+        if self.bookkeeping_future is not None:
+            if not self.bookkeeping_future.done():
+                return
+            try:
+                self.bookkeeping_future.result()
+            except Exception:
+                for job in self.bookkeeping_jobs:
+                    self.snapshot.defer_bookkeeping(job)
+                self.app.logger.exception("Notification records will retry; acknowledged messages are not resent")
+                self.last_bookkeeping = time.monotonic() + 5
+            self.bookkeeping_future = None
+            self.bookkeeping_jobs = []
+        if self.snapshot.bookkeeping_count() and time.monotonic() - self.last_bookkeeping >= 1.0:
+            self.bookkeeping_jobs = self.snapshot.take_bookkeeping()
+            self.bookkeeping_future = self.bookkeeping_executor.submit(self._record_notices, self.bookkeeping_jobs)
+            self.last_bookkeeping = time.monotonic()
+
     def tick(self):
+        self._bookkeeping_tick()
         for future in list(self.pending):
             if future.done():
                 self.pending.remove(future)
@@ -505,7 +574,7 @@ class DeliveryPool:
                     self.app.logger.exception("Delivery worker failed")
         # Avoid exhausting Atlas Free with background claims/retry churn. All
         # admitted deliveries finish normally; queued jobs remain durable.
-        busy = monitor.background_busy()
+        busy = monitor.background_busy() or self.snapshot.bookkeeping_count() >= 200
         if time.monotonic() - self.last_recovery >= 10:
             expired = self.app.db.delivery_jobs.find_one({'status': 'working', 'lease_until': {'$lt': now()}}, {'_id': 1})
             if expired:
@@ -521,7 +590,9 @@ class DeliveryPool:
             # Paid delivery/stock work keeps progressing; routine bulk children
             # wait for database headroom instead of competing with navigation.
             query['priority'] = {'$lte': 5}
-        ready = list(self.app.db.delivery_jobs.find(query, {'kind': 1, 'payload.chat_id': 1}).limit(room * 3))
+        ready = list(self.app.db.delivery_jobs.find(query, {'kind': 1, 'payload.chat_id': 1,
+            'payload.product_name': 1, 'payload.cleanup_previous_stock': 1, 'payload.stock_subscription_id': 1})
+            .sort(JOB_SORT).limit(room * 3))
         if not ready:
             self.poll_interval = min(2.0, self.poll_interval * 2)
             return
@@ -535,6 +606,19 @@ class DeliveryPool:
 
     def shutdown(self):
         self.executor.shutdown(wait=True)
+        if self.bookkeeping_future is not None:
+            try:
+                self.bookkeeping_future.result()
+            except Exception:
+                for job in self.bookkeeping_jobs:
+                    self.snapshot.defer_bookkeeping(job)
+        self.bookkeeping_executor.shutdown(wait=True)
+        while self.snapshot.bookkeeping_count():
+            try:
+                self._record_notices(self.snapshot.take_bookkeeping())
+            except Exception:
+                self.app.logger.exception("Notification records remain in durable acknowledged jobs for recovery")
+                break
 
 
 def start_delivery_worker(app, shop):

@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 from utils.stock_subscriptions import DEFAULTS, subscription_id
-from web_admin.delivery_queue import enqueue_job
+from web_admin.delivery_queue import enqueue_job, STOCK_NOTICE_PRIORITY
 
 
 def now():
@@ -43,7 +43,7 @@ def process_subscriptions(app, shop, settings, limit=200):
             if not job:
                 # The durable outbox was saved before enqueueing. Reuse its ID
                 # after a crash, so the same watch cannot send two jobs.
-                enqueue_job(db, "text", row["pending_payload"], job_id=row["pending_job"], priority=20)
+                enqueue_job(db, "text", row["pending_payload"], job_id=row["pending_job"], priority=STOCK_NOTICE_PRIORITY)
             elif job.get("acknowledged_at") or job["status"] == "done":
                 complete(db, row["_id"], row["token"])
                 continue
@@ -88,7 +88,7 @@ def process_subscriptions(app, shop, settings, limit=200):
         changed = db.stock_subscriptions.update_one({**match, "pending_job": {"$exists": False}}, {"$set": {
             "pending_job": job_id, "pending_payload": payload, "next_check_at": next_check}})
         if changed.modified_count:
-            enqueue_job(db, "text", payload, job_id=job_id, priority=20)
+            enqueue_job(db, "text", payload, job_id=job_id, priority=STOCK_NOTICE_PRIORITY)
 
 
 def _claim_delivery(db, row, job):
@@ -144,7 +144,10 @@ def prepare_delivery(db, shop, job):
         from web_admin.delivery_snapshot import cached_product
         product = cached_product(db, shop, payload["product_name"])
         if product:
-            row = db.stock_subscriptions.find_one({"_id": subscription_id(product["_id"], payload["chat_id"])})
+            from flask import g
+            snapshot = getattr(g, "delivery_snapshot", None)
+            record_id = subscription_id(product["_id"], payload["chat_id"])
+            row = snapshot.subscription(record_id) if snapshot else db.stock_subscriptions.find_one({"_id": record_id})
             started = payload.get("stock_notice_started_at") or job["created_at"]
             if row and row.get("last_notice_kind") == "stock_available_again" and row.get("last_notified_at") and utc(row["last_notified_at"]) >= utc(started):
                 return "This availability was already announced to this user"
@@ -162,3 +165,7 @@ def acknowledge_delivery(db, job):
     receipt = job.get("stock_subscription_delivery")
     if receipt:
         complete(db, receipt["id"], receipt["token"], kind=job["payload"].get("stock_notice_key", "fresh_stock_added"))
+        from flask import g
+        snapshot = getattr(g, "delivery_snapshot", None)
+        if snapshot:
+            snapshot.invalidate(("subscription", receipt["id"]))

@@ -19,6 +19,8 @@ from web_admin.api_maintenance import status as api_status, register_routes as r
 from web_admin.promotions import register_promotions
 from web_admin.emoji_usage import EMOJI_USAGE
 from web_admin.history_pages import page as history_page
+from web_admin.telegram_http import post as telegram_post
+from utils.notification_limits import RATE_KEY, BACKGROUND_MESSAGES_PER_SECOND, validate_rate, invalidate_rate
 from web_admin.admin_security import install as install_admin_security, DEFAULT_PATH as DEFAULT_ADMIN_PATH
 from web_admin.domain_routing import DEFAULTS as DOMAIN_DEFAULTS, ROUTING_KEYS
 from web_admin.polls import register_poll_routes, ensure_poll_indexes
@@ -67,7 +69,7 @@ from flask import (
     session,
     url_for,
 )
-from pymongo import MongoClient, ReturnDocument
+from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
@@ -330,6 +332,7 @@ SECRET_SETTINGS_KEY = "secret_settings"
 RUNTIME_BOT_TOKEN_KEY = "telegram_bot_token"
 
 SECRET_DEFAULTS: dict[str, Any] = {
+    RATE_KEY: str(BACKGROUND_MESSAGES_PER_SECOND),
     **EMOJI_DEFAULTS,
     **OPERATIONS_DEFAULTS,
     **GROUP_DEFAULTS,
@@ -712,6 +715,7 @@ def set_secret_settings(db, settings: dict, *, preserve_routing=False) -> dict:
         g.pop("request_secret_settings", None)
         g.pop("request_runtime_token", None)
     invalidate_api_runtime(db)
+    invalidate_rate(db)
     return cleaned
 
 
@@ -2051,6 +2055,7 @@ def register_routes(app: Flask) -> None:
             flash("Use Save domain settings or Save admin path with owner verification to change routing.", "error")
             return redirect(url_for("secret_settings_form") + "#secret-security")
         settings = dict(existing)
+        settings[RATE_KEY] = request.form.get(RATE_KEY, str(existing.get(RATE_KEY, BACKGROUND_MESSAGES_PER_SECOND))).strip()
         enabled_languages = ["en"]
         if request.form.get("spanish_enabled") == "1":
             enabled_languages.append("es")
@@ -2084,6 +2089,10 @@ def register_routes(app: Flask) -> None:
         if new_password.strip():
             settings["admin_panel_password_hash"] = generate_password_hash(new_password.strip())
         validation_errors = []
+        try:
+            settings[RATE_KEY] = str(validate_rate(settings[RATE_KEY]))
+        except ValueError as error:
+            validation_errors.append(str(error))
         if (settings.get("admin_panel_secret_key") != existing.get("admin_panel_secret_key")
                 and not os.getenv("ADMIN_2FA_ENCRYPTION_KEY", "").strip()
                 and app.db.admin_security.count_documents({"enabled": True})):
@@ -2146,7 +2155,7 @@ def register_routes(app: Flask) -> None:
         set_secret_settings(app.db, settings, preserve_routing=True)
         set_language_settings(app.db, enabled_languages)
         saved_token_preview = mask_bot_token(settings.get("bot_token"))
-        flash(f"Secret settings saved. Bot token now saved as {saved_token_preview}. Restart the bot after changing bot token/timing settings.", "success")
+        flash(f"Secret settings saved. Bot token now saved as {saved_token_preview}. Notification speed updates automatically within a few seconds. Restart the bot after changing its token or other timing settings.", "success")
         return redirect(url_for("secret_settings_form"))
 
 
@@ -10803,6 +10812,7 @@ def record_sent_notification(
     product_name: str = "",
     parse_mode: str | None = None,
     target_kind: str = "customer",
+    operations: list | None = None,
 ) -> None:
     """Store Telegram message IDs so WebAdmin can delete recent outbound notices.
 
@@ -10856,6 +10866,10 @@ def record_sent_notification(
     try:
         set_fields = {key: value for key, value in doc.items() if key not in {"created_at", "deleted"}}
         set_fields["updated_at"] = utcnow()
+        if operations is not None:
+            operations.append(UpdateOne({"chat_id": cid, "message_id": int(msg_id)}, {
+                "$set": set_fields, "$setOnInsert": {"created_at": doc["created_at"], "deleted": False}}, upsert=True))
+            return
         db.sent_notifications.update_one(
             {"chat_id": cid, "message_id": int(msg_id)},
             {
@@ -11083,7 +11097,7 @@ def flush_maintenance_notifications(db) -> dict[str, int]:
     return {"processed": processed, "sent": sent}
 
 
-def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") -> None:
+def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram", operations: list | None = None) -> None:
     if has_request_context():
         return
     """Mark a user reachable after a successful Telegram send.
@@ -11106,16 +11120,15 @@ def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") ->
                 and not profile.get("blocked") and delivered
                 and (now - delivered.replace(tzinfo=timezone.utc)).total_seconds() < 60):
             return
-    db.users.update_one(
-        {
+    query = {
             "user_id": uid,
             "$or": [
                 {"blocked_manually": {"$ne": True}},
                 {"blocked_by_delivery": True},
                 {"blocked_reason": "delivery_failed"},
             ],
-        },
-        {
+        }
+    update = {
             "$set": {
                 "blocked": False,
                 "blocked_by_delivery": False,
@@ -11124,8 +11137,11 @@ def mark_user_delivery_success(db, user_id: int, *, source: str = "telegram") ->
                 "last_delivery_source": str(source or "telegram"),
             },
             "$unset": {"blocked_reason": "", "last_delivery_error": ""},
-        },
-    )
+        }
+    if operations is not None:
+        operations.append(UpdateOne(query, update))
+    else:
+        db.users.update_one(query, update)
 
 
 def mark_user_delivery_failure(db, user_id: int, *, source: str = "telegram", error: str = "") -> None:
@@ -11221,11 +11237,11 @@ def _last_product_notification(db, user_id: int, product_name: str, kind: str = 
         return None
     return db.user_product_notifications.find_one(
         {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
-        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1},
+        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1, "delivery_sent_at": 1},
     )
 
 
-def _save_product_notification(db, user_id: int, product_name: str, message_id: int, kind: str = "new_stock") -> None:
+def _save_product_notification(db, user_id: int, product_name: str, message_id: int, kind: str = "new_stock", *, sent_at=None) -> None:
     try:
         uid = int(user_id or 0)
         mid = int(message_id or 0)
@@ -11236,19 +11252,15 @@ def _save_product_notification(db, user_id: int, product_name: str, message_id: 
     if not uid or not mid or not key:
         return
     now = datetime.now(timezone.utc)
+    sent_at = _parse_utc_dt(sent_at) or now
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    newer = {"$lte": [{"$ifNull": ["$delivery_sent_at", {"$ifNull": ["$updated_at", epoch]}]}, sent_at]}
+    fields = {"user_id": uid, "product_name": str(product_name or "").strip(), "product_key": key,
+              "kind": str(kind or "new_stock"), "message_id": mid, "updated_at": now, "delivery_sent_at": sent_at}
     db.user_product_notifications.update_one(
         {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
-        {
-            "$set": {
-                "user_id": uid,
-                "product_name": str(product_name or "").strip(),
-                "product_key": key,
-                "kind": str(kind or "new_stock"),
-                "message_id": mid,
-                "updated_at": now,
-            },
-            "$setOnInsert": {"created_at": now},
-        },
+        [{"$set": {**{name: {"$cond": [newer, {"$literal": value}, "$" + name]}
+                      for name, value in fields.items()}, "created_at": {"$ifNull": ["$created_at", now]}}}],
         upsert=True,
     )
 
@@ -11415,11 +11427,11 @@ def _telegram_http_result(method, payload, files=None):
                 return {'json': data}
             return {'data': multipart_data(data), 'files': files}
         kwargs = request_args(rendered)
-        response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **kwargs)
+        response = telegram_post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **kwargs)
         body = response.json() if response.content else {}
         if changed and response.status_code in {400, 403} and emoji_rejected(body.get('description', '')):
             rewind_files(positions or [])
-            response = requests.post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **request_args(plain_product_payload(method, payload)))
+            response = telegram_post(f"https://api.telegram.org/bot{token}/{method}", timeout=30 if files else 15, **request_args(plain_product_payload(method, payload)))
             body = response.json() if response.content else {}
         if response.ok and body.get("ok"):
             return {"ok": True, "result": body.get("result") or {}, "blocked": False}

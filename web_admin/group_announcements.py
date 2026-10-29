@@ -3,7 +3,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 
-from web_admin.delivery_queue import enqueue_job
+from web_admin.delivery_queue import enqueue_job, STOCK_NOTICE_PRIORITY, is_stock_notice
 
 from utils.group_notifications import DEFAULTS as GROUP_DEFAULTS
 
@@ -61,7 +61,8 @@ def enqueue_notice(db, shop, payload, category):
         if product:
             recipient['deep_link_product_id'] = str(product['_id'])
     batch = notification.get('notification_batch_id') or hashlib.sha256(text.encode()).hexdigest()
-    return enqueue_job(db, 'text', recipient, job_id='group:' + batch, priority=15)
+    return enqueue_job(db, 'text', recipient, job_id='group:' + batch,
+                       priority=STOCK_NOTICE_PRIORITY if is_stock_notice(recipient) else 20)
 
 
 def enqueue_poll(db, shop, campaign):
