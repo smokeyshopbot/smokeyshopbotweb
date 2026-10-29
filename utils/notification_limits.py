@@ -21,9 +21,72 @@ except ValueError:
 _ticket_lock = threading.Lock()
 _ticket_pools = {}
 _async_ticket_pools = {}
+_rate_cache = {}
+_rate_lock = threading.Lock()
+RATE_KEY = "background_messages_per_second"
+RATE_CACHE_SECONDS = 2.0
 CHAT_INTERVAL_SECONDS = 1.05
 GROUP_INTERVAL_SECONDS = 3.1
 GLOBAL_KEY = "background_send_slot"
+
+
+def validate_rate(value):
+    try:
+        rate = int(str(value).strip())
+    except (ValueError, TypeError):
+        raise ValueError("Background messages per second must be a whole number between 1 and 25.") from None
+    if not 1 <= rate <= 25:
+        raise ValueError("Background messages per second must be between 1 and 25.")
+    return rate
+
+
+def _saved_rate(row):
+    try:
+        return validate_rate((row.get("value") or {}).get(RATE_KEY))
+    except (ValueError, AttributeError):
+        return BACKGROUND_MESSAGES_PER_SECOND
+
+
+def _cached_rate(database):
+    from utils.data_guard import raw_database
+    raw = raw_database(database)
+    with _rate_lock:
+        entry = _rate_cache.get(id(raw))
+        if entry and entry[0] is raw and time.monotonic() - entry[1] < RATE_CACHE_SECONDS:
+            return entry[2]
+    return None
+
+
+def invalidate_rate(database):
+    from utils.data_guard import raw_database
+    with _rate_lock:
+        _rate_cache.pop(id(raw_database(database)), None)
+
+
+def _remember_rate(database, rate):
+    from utils.data_guard import raw_database
+    raw = raw_database(database)
+    with _rate_lock:
+        if len(_rate_cache) >= 64:
+            _rate_cache.clear()
+        _rate_cache[id(raw)] = (raw, time.monotonic(), rate)
+    return rate
+
+
+def effective_rate(database):
+    rate = _cached_rate(database)
+    if rate is None:
+        row = database.settings.find_one({"key": "secret_settings"}, {"value." + RATE_KEY: 1}) or {}
+        rate = _remember_rate(database, _saved_rate(row))
+    return rate
+
+
+async def effective_rate_async(database):
+    rate = _cached_rate(database)
+    if rate is None:
+        row = await database.settings.find_one({"key": "secret_settings"}, {"value." + RATE_KEY: 1}) or {}
+        rate = _remember_rate(database, _saved_rate(row))
+    return rate
 
 
 def now():
@@ -81,7 +144,7 @@ def _chat_delay(row):
     return max(0.01, (retry - current).total_seconds())
 
 
-def _global_reservation(row, count=1):
+def _global_reservation(row, count=1, rate=None):
     current = now()
     previous = row.get("next_at")
     slot = max(current, utc(previous)) if previous else current
@@ -89,7 +152,7 @@ def _global_reservation(row, count=1):
         raise NotificationDeferred(0.1)
     query = {"key": GLOBAL_KEY, "next_at": previous} if previous else {
         "key": GLOBAL_KEY, "next_at": {"$exists": False}}
-    return query, {"$set": {"next_at": slot + timedelta(seconds=count / BACKGROUND_MESSAGES_PER_SECOND)}}, slot
+    return query, {"$set": {"next_at": slot + timedelta(seconds=count / (rate or BACKGROUND_MESSAGES_PER_SECOND))}}, slot
 
 
 def _cooldown(chat_id, group):
@@ -112,17 +175,18 @@ def _tickets(database):
 
 def _reserve_start(database):
     with _ticket_lock:
+        rate = effective_rate(database)
         tickets = _tickets(database)
-        while tickets and tickets[0] < now():
+        while tickets and (tickets[0][0] < now() or tickets[0][1] != rate):
             tickets.popleft()  # Unused old tickets cannot turn into a later burst.
         if tickets:
-            return tickets.popleft()
+            return tickets.popleft()[0]
         for _ in range(50):
             row = database.delivery_control.find_one({"key": GLOBAL_KEY}) or {}
-            query, update, slot = _global_reservation(row, 4)
+            query, update, slot = _global_reservation(row, 4, rate)
             try:
                 database.delivery_control.update_one(query, update, upsert=True)
-                tickets.extend(slot + timedelta(seconds=i / BACKGROUND_MESSAGES_PER_SECOND) for i in range(1, 4))
+                tickets.extend((slot + timedelta(seconds=i / rate), rate) for i in range(1, 4))
                 return slot
             except DuplicateKeyError:
                 continue
@@ -137,25 +201,26 @@ async def _reserve_start_async(database):
         _async_ticket_pools.clear()
     lock, tickets = _async_ticket_pools.setdefault(key, (asyncio.Lock(), deque()))
     async with lock:
-        while tickets and tickets[0] < now():
+        rate = await effective_rate_async(database)
+        while tickets and (tickets[0][0] < now() or tickets[0][1] != rate):
             tickets.popleft()
         if tickets:
-            return tickets.popleft()
+            return tickets.popleft()[0]
         for _ in range(50):
             row = await database.delivery_control.find_one({"key": GLOBAL_KEY}) or {}
-            query, update, slot = _global_reservation(row, 4)
+            query, update, slot = _global_reservation(row, 4, rate)
             try:
                 await database.delivery_control.update_one(query, update, upsert=True)
-                tickets.extend(slot + timedelta(seconds=i / BACKGROUND_MESSAGES_PER_SECOND) for i in range(1, 4))
+                tickets.extend((slot + timedelta(seconds=i / rate), rate) for i in range(1, 4))
                 return slot
             except DuplicateKeyError:
                 continue
         raise NotificationDeferred(0.1)
 
 @contextmanager
-def notification_slot(database, chat_id, *, group=False):
+def notification_slot(database, chat_id, *, group=False, pause_loader=None):
     """Keep one delivery in flight per chat; reserve a globally paced start."""
-    delay = pause_delay(database.delivery_control.find_one({"key": "telegram_pause"}))
+    delay = pause_delay(pause_loader() if pause_loader else database.delivery_control.find_one({"key": "telegram_pause"}))
     if delay:
         raise NotificationDeferred(delay)
     key, owner, entered = _chat_key(chat_id), uuid.uuid4().hex, False
