@@ -8,7 +8,7 @@ from web_admin.delivery_queue import enqueue_job, STOCK_NOTICE_PRIORITY, is_stoc
 from utils.group_notifications import DEFAULTS as GROUP_DEFAULTS
 
 DEFAULTS = {**GROUP_DEFAULTS, 'required_channel_cache_seconds': '30'}
-BOOL_KEYS = {key for key in GROUP_DEFAULTS if key not in {'group_notifications_chat_id', 'group_notifications_language'}}
+BOOL_KEYS = {key for key in GROUP_DEFAULTS if key not in {'group_notifications_chat_id', 'group_notifications_join_url', 'group_notifications_language'}}
 
 
 def validate(settings):
@@ -27,6 +27,10 @@ def validate(settings):
         raise ValueError('Enter an announcement group before enabling group notifications.')
     if result['group_notifications_language'] not in {'en', 'es'}:
         raise ValueError('Choose English or Spanish for group announcements.')
+    if result['group_notifications_join_url']:
+        from utils.channel_gate_settings import validate_channel_settings
+        checked = validate_channel_settings(False, group if group.startswith('@') else '', result['group_notifications_join_url'])
+        result['group_notifications_join_url'] = checked['required_channel_join_url']
     return result
 
 

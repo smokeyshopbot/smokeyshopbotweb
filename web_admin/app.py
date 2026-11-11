@@ -74,7 +74,7 @@ from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
 from utils.i18n import tr, lang_from_user, normalize_lang, LANGUAGE_NAMES
 from utils.usdt_errors import public_usdt_error_text, extract_usdt_received_amount_from_error
-from utils.channel_gate_settings import validate_channel_settings
+from utils.channel_gate_settings import validate_channel_settings, validate_join_settings
 from utils.data_guard import GuardedDatabase, work_guard, sync_update_unit, DatabaseWritesPaused, raw_database
 from utils.wallet_events import change_wallet, event_id
 from utils.runtime_upgrade import remove_obsolete_state
@@ -343,6 +343,9 @@ SECRET_DEFAULTS: dict[str, Any] = {
     "required_channel_enabled": "0",
     "required_channel_id": "",
     "required_channel_join_url": "",
+    "required_channel_button_text": "",
+    "required_channel_button_text_es": "",
+    "required_join_chats": [],
     "bscscan_api_key": "",
     "polygonscan_api_key": "",
     "etherscan_api_key": "",
@@ -647,6 +650,9 @@ def clean_secret_settings(settings: dict | None) -> dict:
                 continue
             if key == "admin_accounts":
                 cleaned[key] = clean_admin_accounts(settings.get(key))
+            elif key == "required_join_chats":
+                value = settings.get(key)
+                cleaned[key] = [dict(row) if isinstance(row, dict) else row for row in value] if isinstance(value, list) else value
             else:
                 cleaned[key] = str(settings.get(key) or "").strip()
     cleaned["admin_accounts"] = clean_admin_accounts(cleaned.get("admin_accounts"))
@@ -2077,6 +2083,17 @@ def register_routes(app: Flask) -> None:
         settings["required_channel_enabled"] = "1" if request.form.get("required_channel_enabled") == "1" else "0"
         settings["required_channel_id"] = request.form.get("required_channel_id", "").strip()
         settings["required_channel_join_url"] = request.form.get("required_channel_join_url", "").strip()
+        for key in ("required_channel_button_text", "required_channel_button_text_es"):
+            settings[key] = request.form.get(key, str(existing.get(key) or "")).strip()
+        join_form_error = None
+        if request.form.get("required_join_list_present") == "1":
+            fields = [request.form.getlist(key) for key in (
+                "required_join_chat_id", "required_join_url", "required_join_button_text", "required_join_button_text_es")]
+            if len({len(values) for values in fields}) != 1:
+                join_form_error = "Each required group/channel needs its own ID, join link and button text fields."
+            else:
+                settings['required_join_chats'] = [dict(zip(
+                    ('chat_id', 'join_url', 'button_text', 'button_text_es'), values)) for values in zip(*fields)]
         for key in OPERATIONS_DEFAULTS:
             if key == "backup_encryption_key" or key in ROUTING_KEYS: continue
             settings[key] = ("1" if request.form.get(key) == "1" else "0") if key in OPERATIONS_BOOL_KEYS else request.form.get(key, str(existing.get(key, OPERATIONS_DEFAULTS[key]))).strip()
@@ -2089,6 +2106,8 @@ def register_routes(app: Flask) -> None:
         if new_password.strip():
             settings["admin_panel_password_hash"] = generate_password_hash(new_password.strip())
         validation_errors = []
+        if join_form_error:
+            validation_errors.append(join_form_error)
         try:
             settings[RATE_KEY] = str(validate_rate(settings[RATE_KEY]))
         except ValueError as error:
@@ -2110,9 +2129,7 @@ def register_routes(app: Flask) -> None:
         except ValueError as error:
             validation_errors.append(str(error))
         try:
-            settings.update(validate_channel_settings(
-                settings["required_channel_enabled"], settings["required_channel_id"], settings["required_channel_join_url"],
-            ))
+            settings.update(validate_join_settings(settings))
         except ValueError as error:
             validation_errors.append(str(error))
         for int_key, label, minimum in [

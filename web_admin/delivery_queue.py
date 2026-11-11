@@ -767,7 +767,7 @@ def start_delivery_worker(app, shop):
     app.config["DELIVERY_WORKER_STARTED"] = True
     pool = DeliveryPool(app, shop)
     app.delivery_pool = pool
-    app.logger.info("Notification delivery build46 enabled; shared cap=%s messages/second", effective_rate(app.db))
+    app.logger.info("Notification delivery build47 enabled; shared cap=%s messages/second", effective_rate(app.db))
     def worker():
         while True:
             try:
