@@ -218,17 +218,23 @@ async def _reserve_start_async(database):
         raise NotificationDeferred(0.1)
 
 @contextmanager
-def notification_slot(database, chat_id, *, group=False, pause_loader=None):
+def notification_slot(database, chat_id, *, group=False, pause_loader=None, reservation=None):
     """Keep one delivery in flight per chat; reserve a globally paced start."""
     delay = pause_delay(pause_loader() if pause_loader else database.delivery_control.find_one({"key": "telegram_pause"}))
     if delay:
         raise NotificationDeferred(delay)
     key, owner, entered = _chat_key(chat_id), uuid.uuid4().hex, False
-    try:
-        database.delivery_control.update_one(_chat_query(key, now()), _chat_fields(owner, now()), upsert=True)
-    except DuplicateKeyError:
-        row = database.delivery_control.find_one({"key": key}) or {}
-        raise NotificationDeferred(_chat_delay(row)) from None
+    if reservation is not None:
+        if reservation.chat_id != chat_id:
+            raise RuntimeError("Chat reservation does not match its notification")
+        if not reservation.valid():
+            raise NotificationDeferred(.1)
+    else:
+        try:
+            database.delivery_control.update_one(_chat_query(key, now()), _chat_fields(owner, now()), upsert=True)
+        except DuplicateKeyError:
+            row = database.delivery_control.find_one({"key": key}) or {}
+            raise NotificationDeferred(_chat_delay(row)) from None
     try:
         slot = _reserve_start(database)
         delay = max(0.0, (slot - now()).total_seconds())
@@ -237,13 +243,18 @@ def notification_slot(database, chat_id, *, group=False, pause_loader=None):
         delay = pause_delay(database.delivery_control.find_one({"key": "telegram_pause"}))
         if delay:
             raise NotificationDeferred(delay)
+        if reservation is not None and not reservation.valid():
+            raise NotificationDeferred(.1)
         entered = True
         yield
     finally:
         fields = {"$unset": {"owner": "", "lease_until": ""}}
         if entered:
             fields["$set"] = {"next_at": now() + timedelta(seconds=_cooldown(chat_id, group))}
-        database.delivery_control.update_one({"key": key, "owner": owner}, fields)
+        if reservation is not None:
+            reservation.release(entered)
+        else:
+            database.delivery_control.update_one({"key": key, "owner": owner}, fields)
 
 
 @asynccontextmanager
