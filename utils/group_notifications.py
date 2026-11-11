@@ -1,5 +1,6 @@
 """Group announcement preferences, including migration from the former channel relay."""
 DEFAULTS = {'group_notifications_enabled': '0', 'group_notifications_chat_id': '',
+            'group_notifications_join_url': '',
             'group_notifications_language': 'en', 'group_notifications_stock': '1',
             'group_notifications_broadcast': '1', 'group_notifications_polls': '1',
             'group_notifications_products': '1', 'group_notifications_prices': '1'}

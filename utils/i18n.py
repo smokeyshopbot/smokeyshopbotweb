@@ -33,6 +33,15 @@ def language_name(lang: str | None) -> str:
 
 TEXT = {
     "en": {
+        "join_chats_required": "📢 Please join the groups/channels below to use this bot.\n\nAfter joining all of them, tap ‘I’ve joined’. Stay joined to keep access.",
+        "join_chats_not_joined": "Please join every required group/channel first. If a join request is pending, wait for approval and try again.",
+        "join_chats_check_unavailable": "We couldn’t verify all required memberships right now. Please try again shortly. If this continues, contact support.",
+        "btn_join_chat": "📢 Join group/channel",
+        "stock_group_title": "📢 <b>Stock notification group</b>",
+        "stock_group_description": "Join our group for stock announcements.",
+        "stock_group_unavailable": "The stock notification group link is not available yet. Please contact support.",
+        "btn_stock_group": "📢 Join stock alerts group",
+        "group_help": "\n\n📢 *Stock alerts group*\nUse /group to get the stock notification group link.",
         "channel_join_required": "📢 Please join our channel to use this bot.\n\nAfter joining, tap ‘I’ve joined’ below. Stay subscribed to keep access.",
         "btn_join_channel": "📢 Join channel",
         "btn_check_channel_join": "✅ I’ve joined",
@@ -362,6 +371,15 @@ TEXT = {
         "commands_text": "📋 *Commands*\n\nHere are the available user commands and how to use the bot:\n\n🛍 *Shopping*\nUse /shop or the Shop button to browse available products. Select a product, enter quantity, choose payment method and follow the steps.\n\n📦 *Orders*\nUse /orders to view your previous purchase orders, 10 per page. Each order includes a tappable /getorder shortcut so you can receive old order items again. Use /replacements to view replacement deliveries separately.\n\n🎁 *Replacements*\nUse /replacements to view replacement delivery history. You can still use the /getorder shortcut there to receive replacement items again.\n\n⭐ *Favorites*\nUse /favorites or the Favorite Products button to quickly open products you buy often.\n\n🌐 *Language*\nUse /language or the Language button to switch between English and Spanish.\n\n👛 *Wallet*\nUse /wallet to check your INR and USDT balance. Use /wallethistory to view wallet top-up logs, 10 per page. Use the Top-up Wallet button to top up via UPI, USDT (BEP20), USDT (POLYGON), or Binance Pay. Once topped up, you can checkout instantly.\n\n📞 *Support*\nUse /support or the Support button to contact support.\n\n🛠 *Reports / Replacements*\nUse /report or the Report button if a delivered account/item is damaged or not working. The bot will verify the item belongs to your delivered orders and submit a report to admin.\n\n💳 *Payment Methods*\n• *USDT (BEP20) / USDT (POLYGON)* — Send the exact amount to the wallet. The bot checks it automatically. If it still does not verify, use Manual Verify and submit your TxHash.\n• *UPI* — Pay via QR or UPI ID, submit payer/account holder name + UTR + screenshot, admin confirms.\n• *Binance Pay* — Pay through the Binance app. The bot checks it automatically; Manual Verify is available if needed. For wallet top-ups, approved Binance Pay adds to your USDT balance.\n• *Wallet* — Instant, no verification needed.\n\n📦 *After Payment*\nItems are delivered automatically once payment is confirmed. Unpaid payments get a reminder and expire after the configured time. If stock runs out after payment, your paid order waits for stock and is auto-delivered when admin adds stock.\n\nNeed support? Use /support.",
     },
     "es": {
+        "join_chats_required": "📢 Únete a los grupos/canales de abajo para usar este bot.\n\nDespués de unirte a todos, pulsa «Ya me uní». Permanece en ellos para conservar el acceso.",
+        "join_chats_not_joined": "Primero debes unirte a todos los grupos/canales obligatorios. Si una solicitud está pendiente, espera a que la aprueben y vuelve a intentarlo.",
+        "join_chats_check_unavailable": "No pudimos verificar todas las membresías obligatorias. Inténtalo de nuevo en unos momentos. Si el problema continúa, contacta con soporte.",
+        "btn_join_chat": "📢 Unirme al grupo/canal",
+        "stock_group_title": "📢 <b>Grupo de avisos de stock</b>",
+        "stock_group_description": "Únete a nuestro grupo para recibir avisos de stock.",
+        "stock_group_unavailable": "El enlace al grupo de avisos de stock todavía no está disponible. Contacta con soporte.",
+        "btn_stock_group": "📢 Unirme al grupo de avisos",
+        "group_help": "\n\n📢 *Grupo de avisos de stock*\nUsa /group para obtener el enlace al grupo de avisos de stock.",
         "channel_join_required": "📢 Únete a nuestro canal para usar este bot.\n\nDespués de unirte, pulsa «Ya me uní» abajo. Mantén tu suscripción para conservar el acceso.",
         "btn_join_channel": "📢 Unirme al canal",
         "btn_check_channel_join": "✅ Ya me uní",
