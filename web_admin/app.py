@@ -6029,7 +6029,6 @@ def register_routes(app: Flask) -> None:
     @login_required
     def recent_notifications():
         page = int_arg("page", 1, minimum=1)
-        backfill_legacy_product_notifications(app.db)
         rows, page, total_pages = recent_notification_batches(app.db, page=page)
         total = len(list(app.db.sent_notifications.distinct(
             "batch_id",
@@ -10886,16 +10885,24 @@ def record_sent_notification(
 
 
 def delete_telegram_message_status(chat_id: int, message_id: int) -> dict:
-    if not chat_id or not message_id:
+    return delete_telegram_messages_status(chat_id, [message_id])
+
+
+def delete_telegram_messages_status(chat_id: int, message_ids: list[int]) -> dict:
+    from web_admin.notification_cleanup import permanent_refusal
+    ids = sorted({int(mid) for mid in message_ids})
+    if not chat_id or not ids:
         return {"ok": False, "error": "Missing chat ID or message ID", "status_code": 400}
-    result = _telegram_http_result("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
+    result = (_telegram_http_result("deleteMessage", {"chat_id": int(chat_id), "message_id": ids[0]}) if len(ids) == 1 else
+              _telegram_http_result("deleteMessages", {"chat_id": int(chat_id), "message_ids": ids}))
     if not result.get("ok") and "message to delete not found" in str(result.get("error", "")).lower():
         return {"ok": True}
+    if not result.get('ok') and result.get('status_code') == 400 and permanent_refusal(result.get('error')):
+        result['cleanup_skipped'] = True
     return result
 
 
-
-def backfill_legacy_product_notifications(db) -> None:
+def backfill_legacy_product_notifications(db, *, limit=100) -> None:
     """Expose stock notifications saved by the older per-product cleanup log.
 
     Older code already kept the latest stock notification message ID per user so
@@ -10903,14 +10910,21 @@ def backfill_legacy_product_notifications(db) -> None:
     makes those messages visible in Recent Notifications even if they were sent
     shortly before this update was deployed.
     """
+    state = db.delivery_control.find_one({'key': 'notification_backfill_v45'}) or {}
+    if state.get('complete'):
+        return
     cutoff = utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
+    query = {"updated_at": {"$gte": cutoff}, "message_id": {"$exists": True}}
+    if state.get('cursor') is not None:
+        query['_id'] = {'$gt': state['cursor']}
     try:
-        rows = db.user_product_notifications.find(
-            {"updated_at": {"$gte": cutoff}, "message_id": {"$exists": True}},
-            {"user_id": 1, "message_id": 1, "product_name": 1, "product_key": 1, "kind": 1, "updated_at": 1},
-        ).limit(5000)
+        rows = list(db.user_product_notifications.find(query,
+            {"user_id": 1, "message_id": 1, "product_name": 1, "product_key": 1, "kind": 1,
+             "updated_at": 1, 'telegram_sent_at': 1, 'delivery_sent_at': 1}).sort('_id', 1).limit(limit))
     except Exception:
         return
+    admin_ids = set(get_admin_ids(db))
+    operations = []
     for row in rows:
         try:
             uid = int(row.get("user_id") or 0)
@@ -10920,17 +10934,17 @@ def backfill_legacy_product_notifications(db) -> None:
         if not uid or not mid:
             continue
         try:
-            if uid in set(get_admin_ids(db)):
+            if uid in admin_ids:
                 continue
         except Exception:
             pass
         kind = str(row.get("kind") or "new_stock").strip().lower() or "new_stock"
         product_name = str(row.get("product_name") or "").strip()
         product_key = str(row.get("product_key") or product_name).strip().lower()
-        sent_at = _parse_utc_dt(row.get("updated_at")) or utcnow()
+        sent_at = _parse_utc_dt(row.get('telegram_sent_at') or row.get('delivery_sent_at') or row.get("updated_at")) or utcnow()
         batch_id = f"legacy_product:{kind}:{product_key}:{int(sent_at.timestamp() // 300)}"
         try:
-            db.sent_notifications.update_one(
+            operations.append(UpdateOne(
                 {"chat_id": uid, "message_id": mid},
                 {
                     "$setOnInsert": {
@@ -10954,9 +10968,15 @@ def backfill_legacy_product_notifications(db) -> None:
                     "$set": {"updated_at": utcnow()},
                 },
                 upsert=True,
-            )
+            ))
         except Exception:
             continue
+    if operations:
+        db.sent_notifications.bulk_write(operations, ordered=False)
+    fields = {'complete': len(rows) < limit}
+    if rows:
+        fields['cursor'] = rows[-1]['_id']
+    db.delivery_control.update_one({'key': 'notification_backfill_v45'}, {'$set': fields}, upsert=True)
 
 
 def recent_notification_match() -> dict:
@@ -10994,10 +11014,16 @@ def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, 
                 "expires_at": {"$min": "$expires_at"},
                 "total_count": {"$sum": 1},
                 "deleted_count": {"$sum": {"$cond": [{"$eq": ["$deleted", True]}, 1, 0]}},
+                "skipped_delete_count": {"$sum": {"$cond": [{"$and": [
+                    {"$ne": ["$deleted", True]}, {"$eq": ["$deletion_skipped", True]}]}, 1, 0]}},
+                "pending_delete_count": {"$sum": {"$cond": [{"$and": [
+                    {"$ne": ["$deleted", True]}, {"$ne": ["$deletion_skipped", True]},
+                    {"$eq": ["$deletion_pending", True]}]}, 1, 0]}},
                 "failed_delete_count": {
                     "$sum": {
                         "$cond": [
-                            {"$and": [{"$ne": ["$deleted", True]}, {"$gt": [{"$strLenCP": {"$ifNull": ["$deletion_error", ""]}}, 0]}]},
+                            {"$and": [{"$ne": ["$deleted", True]}, {"$ne": ["$deletion_skipped", True]},
+                                {"$gt": [{"$strLenCP": {"$ifNull": ["$deletion_error", ""]}}, 0]}]},
                             1,
                             0,
                         ]
@@ -11005,7 +11031,8 @@ def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, 
                 },
             }
         },
-        {"$addFields": {"deletable_count": {"$subtract": ["$total_count", "$deleted_count"]}}},
+        {"$addFields": {"deletable_count": {"$subtract": ["$total_count", {"$add": [
+            "$deleted_count", "$skipped_delete_count", "$pending_delete_count"]}]}}},
         {"$sort": {"last_sent_at": -1}},
         {"$skip": (safe_page - 1) * RECENT_NOTIFICATIONS_PAGE_SIZE},
         {"$limit": RECENT_NOTIFICATIONS_PAGE_SIZE},
@@ -11015,16 +11042,40 @@ def recent_notification_batches(db, *, page: int = 1) -> tuple[list[dict], int, 
 
 
 def delete_recent_notification_batch(db, batch_id: str, *, deleted_by: str = "") -> dict[str, int]:
+    from web_admin.notification_cleanup import CleanupBatch
     cutoff = utcnow() - timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS)
     query = {"batch_id": str(batch_id), "deleted": {"$ne": True}, "sent_at": {"$gte": cutoff},
+             "deletion_skipped": {"$ne": True}, "deletion_pending": {"$ne": True},
              "$or": [{"target_kind": "customer"}, {"target_kind": {"$exists": False}}, {"target_kind": None}, {"target_kind": ""}]}
-    queued = 0
-    for row in db.sent_notifications.find(query, {"chat_id": 1, "message_id": 1}):
-        enqueue_job(db, "delete", {"chat_id": row["chat_id"], "message_id": row["message_id"],
-                    "notification_record_id": row["_id"], "deleted_by": deleted_by},
-                    job_id=f"delete:{row['_id']}", priority=25)
-        db.sent_notifications.update_one({"_id": row["_id"]}, {"$set": {"deletion_pending": True}})
-        queued += 1
+    def flush(rows):
+        batch, groups, job_ids = CleanupBatch(), {}, []
+        for row in rows:
+            groups.setdefault(row['chat_id'], []).append(row)
+        for uid, records in groups.items():
+            mids = sorted({int(row['message_id']) for row in records})
+            token = hashlib.sha256(f'{batch_id}:{uid}:{mids}'.encode()).hexdigest()[:24]
+            jid = 'delete-batch:' + token
+            job_ids.append(jid)
+            batch.add(source='manual:' + str(batch_id), title='Delete notification messages', chat_id=uid,
+                message_ids=mids, job_id=jid, record_ids=[row['_id'] for row in records],
+                sent_at=min(_parse_utc_dt(row['sent_at']) for row in records), deleted_by=deleted_by,
+                targets=[{'message_id': int(row['message_id']), 'record_id': row['_id'],
+                          'sent_at': _parse_utc_dt(row['sent_at'])} for row in records])
+        db.delivery_jobs.bulk_write(batch.operations, ordered=False)
+        db.delivery_jobs.update_many({'job_id': {'$in': job_ids}, 'status': {'$in': ['failed', 'review']},
+            'cleanup_unavailable': {'$ne': True}}, {'$set': {'status': 'queued', 'attempts': 0, 'next_attempt_at': utcnow()},
+            '$unset': {'send_started_at': '', 'error': '', 'claim_token': '', 'lease_until': ''}})
+        db.sent_notifications.update_many({'_id': {'$in': [row['_id'] for row in rows]}}, {'$set': {'deletion_pending': True}})
+    queued, page = 0, []
+    for row in db.sent_notifications.find(query, {"chat_id": 1, "message_id": 1, 'sent_at': 1}).sort('_id', 1):
+        page.append(row)
+        if len(page) == 100:
+            flush(page)
+            queued += len(page)
+            page = []
+    if page:
+        flush(page)
+        queued += len(page)
     return {"attempted": queued, "queued": queued, "deleted": 0, "failed": 0, "expired": 0}
 
 
@@ -11237,11 +11288,11 @@ def _last_product_notification(db, user_id: int, product_name: str, kind: str = 
         return None
     return db.user_product_notifications.find_one(
         {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
-        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1, "delivery_sent_at": 1},
+        {"_id": 0, "message_id": 1, "product_name": 1, "updated_at": 1, "delivery_sent_at": 1, "telegram_sent_at": 1},
     )
 
 
-def _save_product_notification(db, user_id: int, product_name: str, message_id: int, kind: str = "new_stock", *, sent_at=None) -> None:
+def _save_product_notification(db, user_id: int, product_name: str, message_id: int, kind: str = "new_stock", *, sent_at=None, telegram_sent_at=None) -> None:
     try:
         uid = int(user_id or 0)
         mid = int(message_id or 0)
@@ -11256,7 +11307,8 @@ def _save_product_notification(db, user_id: int, product_name: str, message_id: 
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     newer = {"$lte": [{"$ifNull": ["$delivery_sent_at", {"$ifNull": ["$updated_at", epoch]}]}, sent_at]}
     fields = {"user_id": uid, "product_name": str(product_name or "").strip(), "product_key": key,
-              "kind": str(kind or "new_stock"), "message_id": mid, "updated_at": now, "delivery_sent_at": sent_at}
+              "kind": str(kind or "new_stock"), "message_id": mid, "updated_at": now, "delivery_sent_at": sent_at,
+              "telegram_sent_at": _parse_utc_dt(telegram_sent_at) or sent_at}
     db.user_product_notifications.update_one(
         {"user_id": uid, "product_key": key, "kind": str(kind or "new_stock")},
         [{"$set": {**{name: {"$cond": [newer, {"$literal": value}, "$" + name]}

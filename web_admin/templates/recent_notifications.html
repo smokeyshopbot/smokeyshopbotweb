@@ -37,6 +37,8 @@
           <td>{{ row.total_count or 0 }}</td>
           <td>
             <span class="status-badge status-green">Deleted: {{ row.deleted_count or 0 }}</span>
+            {% if row.pending_delete_count %}<br><span class="muted">Queued: {{ row.pending_delete_count }}</span>{% endif %}
+            {% if row.skipped_delete_count %}<br><span class="muted">Unavailable: {{ row.skipped_delete_count }}</span>{% endif %}
             {% if row.failed_delete_count %}<br><span class="status-badge status-red">Failed: {{ row.failed_delete_count }}</span>{% endif %}
             {% if remaining %}<br><span class="muted">Remaining: {{ remaining }}</span>{% endif %}
           </td>

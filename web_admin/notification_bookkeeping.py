@@ -8,10 +8,12 @@ from datetime import datetime, timezone, timedelta
 
 from flask import g
 from pymongo import UpdateOne
+from web_admin.notification_cleanup import CleanupBatch
 
 
 def finish_notices(db, shop, jobs):
-    logs, users, products, cleanup, finished = [], [], [], [], []
+    logs, users, products, finished = [], [], [], []
+    cleanup = CleanupBatch()
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     current = datetime.now(timezone.utc)
     def stamp(value):
@@ -49,13 +51,10 @@ def finish_notices(db, shop, jobs):
             if old_at <= sent_at:
                 old_mid = old.get('message_id')
                 if old_mid and old_mid != mid:
-                    jid = f'stock-cleanup:{uid}:{old_mid}'
-                    cleanup.append(UpdateOne({'job_id': jid}, {'$setOnInsert': {
-                        'job_id': jid, 'kind': 'delete', 'payload': {'chat_id': uid, 'message_id': old_mid,
-                            'group_recipient': False}, 'status': 'queued', 'priority': 25, 'attempts': 0,
-                        'created_at': current, 'next_attempt_at': current}}, upsert=True))
+                    cleanup.add_stock(job, old)
                 fields = {'user_id': uid, 'product_name': payload['product_name'], 'product_key': product_key,
-                          'kind': 'new_stock', 'message_id': mid, 'updated_at': current, 'delivery_sent_at': sent_at}
+                          'kind': 'new_stock', 'message_id': mid, 'updated_at': current, 'delivery_sent_at': sent_at,
+                          'telegram_sent_at': shop._parse_utc_dt(result.get('date')) or sent_at}
                 newer = {'$lte': [{'$ifNull': ['$delivery_sent_at', {'$ifNull': ['$updated_at', epoch]}]}, sent_at]}
                 products.append(UpdateOne({'user_id': uid, 'product_key': product_key, 'kind': 'new_stock'},
                     [{'$set': {**{name: {'$cond': [newer, {'$literal': value}, '$' + name]}
@@ -70,7 +69,7 @@ def finish_notices(db, shop, jobs):
     # acknowledged delivery unfinished, so retry/recovery only repeats records.
     for collection, operations, ordered in [
             (db.sent_notifications, logs, False), (db.users, users, False),
-            (db.delivery_jobs, cleanup, False), (db.user_product_notifications, products, True),
+            (db.delivery_jobs, cleanup.operations, False), (db.user_product_notifications, products, True),
             (db.delivery_jobs, finished, False)]:
         if operations:
             collection.bulk_write(operations, ordered=ordered)

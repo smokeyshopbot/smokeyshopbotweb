@@ -1,6 +1,7 @@
 """Bounded availability checks and durable Telegram jobs for opted-in users."""
 import uuid
 from datetime import datetime, timezone, timedelta
+from pymongo import UpdateOne
 
 from utils.stock_subscriptions import DEFAULTS, subscription_id
 from web_admin.delivery_queue import enqueue_job, STOCK_NOTICE_PRIORITY
@@ -23,8 +24,15 @@ def complete(db, record_id, token, *, kind="stock_available_again"):
 
 
 def _stock_products(db, shop, ids):
-    return {p["_id"]: p for p in shop.get_products_with_availability(
-        db, product_query={"_id": {"$in": list(ids)}})}
+    from flask import g, has_app_context
+    snapshot = getattr(g, 'delivery_snapshot', None) if has_app_context() else None
+    def load(keys):
+        products = {p['_id']: p for p in shop.get_products_with_availability(
+            db, product_query={'_id': {'$in': [key[1] for key in keys]}})}
+        return {key: products.get(key[1]) for key in keys}
+    keys = [('available_product', product_id) for product_id in ids]
+    rows = snapshot.get_many(keys, load) if snapshot else load(keys)
+    return {key[1]: product for key, product in rows.items() if product is not None}
 
 
 def process_subscriptions(app, shop, settings, limit=200):
@@ -34,12 +42,21 @@ def process_subscriptions(app, shop, settings, limit=200):
     cooldown = timedelta(minutes=int(settings.get("stock_available_again_cooldown_minutes", DEFAULTS["stock_available_again_cooldown_minutes"])))
     rows = list(db.stock_subscriptions.find({"active": True, "next_check_at": {"$lte": current}})
                 .sort([("next_check_at", 1), ("_id", 1)]).limit(limit))
-    products = _stock_products(db, shop, {r["product_id"] for r in rows}) if rows else {}
+    fresh = [row for row in rows if not row.get('pending_job')]
+    products = _stock_products(db, shop, {r["product_id"] for r in fresh}) if fresh else {}
+    users = {row['user_id']: row for row in db.users.find(
+        {'user_id': {'$in': list({row['user_id'] for row in fresh})}},
+        {'user_id': 1, 'blocked': 1, 'language': 1, 'language_code': 1})} if fresh else {}
+    pending_ids = list({row['pending_job'] for row in rows if row.get('pending_job')})
+    pending = {row['job_id']: row for row in db.delivery_jobs.find(
+        {'job_id': {'$in': pending_ids}}, {'job_id': 1, 'status': 1, 'acknowledged_at': 1})} if pending_ids else {}
+    deferred = []
     for row in rows:
         match = {"_id": row["_id"], "token": row["token"], "active": True}
         next_check = current + timedelta(seconds=30)
         if row.get("pending_job"):
-            job = db.delivery_jobs.find_one({"job_id": row["pending_job"]})
+            match['pending_job'] = row['pending_job']
+            job = pending.get(row['pending_job'])
             if not job:
                 # The durable outbox was saved before enqueueing. Reuse its ID
                 # after a crash, so the same watch cannot send two jobs.
@@ -48,30 +65,30 @@ def process_subscriptions(app, shop, settings, limit=200):
                 complete(db, row["_id"], row["token"])
                 continue
             elif job["status"] in {"failed", "cancelled"}:
-                db.stock_subscriptions.update_one(match, {"$unset": {
+                deferred.append(UpdateOne(match, {"$unset": {
                     "pending_job": "", "pending_payload": "", "available_since": ""},
-                    "$set": {"next_check_at": next_check}})
+                    "$set": {"next_check_at": next_check}}))
                 continue
             # Unknown Telegram outcomes stay in the existing review queue.
-            db.stock_subscriptions.update_one(match, {"$set": {"next_check_at": next_check}})
+            deferred.append(UpdateOne(match, {"$set": {"next_check_at": next_check}}))
             continue
         product = products.get(row["product_id"])
-        user = db.users.find_one({"user_id": row["user_id"]})
+        user = users.get(row['user_id'])
         if not product or not user or user.get("blocked"):
-            db.stock_subscriptions.update_one(match, {"$set": {
-                "active": False, "expires_at": current + timedelta(days=30)}})
+            deferred.append(UpdateOne(match, {"$set": {
+                "active": False, "expires_at": current + timedelta(days=30)}}))
             continue
         if int(product.get("available_stock") or 0) <= 0:
-            db.stock_subscriptions.update_one(match, {"$set": {"next_check_at": next_check},
-                                                    "$unset": {"available_since": ""}})
+            deferred.append(UpdateOne(match, {"$set": {"next_check_at": next_check},
+                                                    "$unset": {"available_since": ""}}))
             continue
         first_available = utc(row.get("available_since") or current)
         due = first_available + delay
         if row.get("last_notified_at"):
             due = max(due, utc(row["last_notified_at"]) + cooldown)
         if current < due:
-            db.stock_subscriptions.update_one(match, {"$set": {
-                "available_since": first_available, "next_check_at": due}})
+            deferred.append(UpdateOne(match, {"$set": {
+                "available_since": first_available, "next_check_at": due}}))
             continue
         language = shop.lang_from_user(user)
         payload = {"chat_id": row["user_id"], "text": "", "parse_mode": "HTML",
@@ -89,6 +106,10 @@ def process_subscriptions(app, shop, settings, limit=200):
             "pending_job": job_id, "pending_payload": payload, "next_check_at": next_check}})
         if changed.modified_count:
             enqueue_job(db, "text", payload, job_id=job_id, priority=STOCK_NOTICE_PRIORITY)
+    if deferred:
+        # Scheduling and preferences only. New-send outboxes above are still
+        # persisted individually before enqueueing, and all updates match token.
+        db.stock_subscriptions.bulk_write(deferred, ordered=False)
 
 
 def _claim_delivery(db, row, job):
@@ -129,7 +150,10 @@ def prepare_delivery(db, shop, job):
         product = _stock_products(db, shop, [row["product_id"]]).get(row["product_id"])
         if not product or int(product.get("available_stock") or 0) <= 0:
             return "Stock is no longer available"
-        user = db.users.find_one({"user_id": row["user_id"]})
+        from flask import g
+        snapshot = getattr(g, 'delivery_snapshot', None)
+        user = snapshot.user(row['user_id']) if snapshot else db.users.find_one(
+            {'user_id': row['user_id']}, {'user_id': 1, 'blocked': 1, 'language': 1, 'language_code': 1})
         if not user or user.get("blocked"):
             return "User is unavailable or blocked"
         payload.update(product_name=product["name"], language=shop.lang_from_user(user),
